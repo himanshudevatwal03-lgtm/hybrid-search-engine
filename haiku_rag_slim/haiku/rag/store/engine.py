@@ -1,0 +1,1313 @@
+import asyncio
+import json
+import logging
+from collections.abc import AsyncIterator, Callable, Coroutine
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from enum import Enum
+from importlib import metadata
+from pathlib import Path
+from time import monotonic
+from typing import Any, NamedTuple, cast
+
+import lance
+import lancedb
+from lancedb.index import IvfPq
+from opentelemetry import trace
+from packaging.version import parse
+
+from haiku.rag.config import AppConfig, get_config
+from haiku.rag.embeddings import get_embedder
+from haiku.rag.store.exceptions import (
+    MigrationRequiredError,
+    ReadOnlyError,
+    TagError,
+    UpgradeRequiredError,
+)
+from haiku.rag.store.schema import (
+    INCOMPLETE_REBUILD_TABLE,
+    REQUIRED_TABLES,
+    ChunkRecordBase,
+    DocumentMetaRecord,
+    SettingsRecord,
+    create_chunk_model,
+    ensure_indexes,
+    get_document_items_arrow_schema,
+    get_documents_arrow_schema,
+    has_payload_columns,
+    query_to_pydantic,
+    rebuild_indexes,
+)
+
+logger = logging.getLogger(__name__)
+
+REBUILD_COMMANDS = {
+    "full": "rebuild",
+    "rechunk": "rebuild --rechunk",
+    "descriptions": "rebuild --descriptions",
+    "embed_only": "rebuild --embed-only",
+}
+
+
+class ConnectionMode(Enum):
+    LOCAL = "local"
+    CLOUD = "cloud"
+    OBJECT_STORAGE = "object_storage"
+
+    @staticmethod
+    def of(location: Path | str) -> "ConnectionMode":
+        """How a location is connected to: a path is local, `db://` is LanceDB
+        Cloud, any other scheme is object storage."""
+        if isinstance(location, Path) or "://" not in location:
+            return ConnectionMode.LOCAL
+        if location.startswith("db://"):
+            return ConnectionMode.CLOUD
+        return ConnectionMode.OBJECT_STORAGE
+
+
+_sessions: dict[tuple[int | None, int | None], lancedb.Session] = {}
+
+
+def _session(config: AppConfig) -> lancedb.Session:
+    """The process's session for these cache sizes.
+
+    Sessions hold the index and metadata caches. Sharing one across connections
+    is what keeps a cached index from being refetched per connection, which on
+    object storage is the dominant cost of the first query.
+    """
+    key = (
+        config.lancedb.index_cache_size_bytes,
+        config.lancedb.metadata_cache_size_bytes,
+    )
+    if key not in _sessions:
+        kwargs = {}
+        if key[0] is not None:
+            kwargs["index_cache_size_bytes"] = key[0]
+        if key[1] is not None:
+            kwargs["metadata_cache_size_bytes"] = key[1]
+        _sessions[key] = lancedb.Session(**kwargs)
+    return _sessions[key]
+
+
+async def connect_lancedb(
+    location: Path | str, config: AppConfig
+) -> lancedb.AsyncConnection:
+    """Connect to the database at `location`, with the connection settings
+    (credentials, storage options, caches, consistency) from `config`."""
+    interval = config.lancedb.read_consistency_interval_seconds
+    kwargs: dict[str, Any] = {
+        "session": _session(config),
+        "read_consistency_interval": (
+            timedelta(seconds=interval) if interval is not None else None
+        ),
+    }
+    mode = ConnectionMode.of(location)
+    if mode == ConnectionMode.CLOUD:
+        return await lancedb.connect_async(
+            uri=str(location),
+            api_key=config.lancedb.api_key,
+            region=config.lancedb.region,
+            **kwargs,
+        )
+    if mode == ConnectionMode.OBJECT_STORAGE:
+        if config.lancedb.storage_options:
+            kwargs["storage_options"] = config.lancedb.storage_options
+        return await lancedb.connect_async(uri=str(location), **kwargs)
+    return await lancedb.connect_async(Path(location).absolute(), **kwargs)
+
+
+def _stored_vector_dim(settings: dict) -> int | None:
+    """The vector dimension a database's chunks were written at."""
+    return settings.get("embeddings", {}).get("model", {}).get("vector_dim")
+
+
+class EmbedderIdentity(NamedTuple):
+    """The embedder that wrote a database's chunks."""
+
+    provider: str | None
+    name: str | None
+    vector_dim: int | None
+    query_prefix: str = ""
+    document_prefix: str = ""
+
+    @classmethod
+    def recorded_in(cls, settings: dict) -> "EmbedderIdentity | None":
+        """The identity recorded in a settings blob, or None when it records none."""
+        model = settings.get("embeddings", {}).get("model", {})
+        if not model:
+            return None
+        return cls(
+            model.get("provider"),
+            model.get("name"),
+            model.get("vector_dim"),
+            model.get("query_prefix", ""),
+            model.get("document_prefix", ""),
+        )
+
+
+_RECORDED_EMBEDDING_KEYS = EmbedderIdentity._fields
+_PREFIX_KEYS = ("query_prefix", "document_prefix")
+
+
+def recorded_settings(settings: dict) -> dict:
+    """What a database records of `settings`: its versions and embedder identity.
+    An empty prefix is not recorded."""
+    recorded: dict = {}
+    for key in ("version", "schema_version"):
+        if key in settings:
+            recorded[key] = settings[key]
+    model = settings.get("embeddings", {}).get("model", {})
+    if model:
+        recorded["embeddings"] = {
+            "model": {
+                key: model[key]
+                for key in _RECORDED_EMBEDDING_KEYS
+                if key in model and (key not in _PREFIX_KEYS or model[key])
+            }
+        }
+    return recorded
+
+
+def embedder_drift(stored: dict, current: dict) -> list[str]:
+    """The fields, except vector_dim, on which `current` differs from the embedder
+    recorded in `stored`. Fields missing from the record are not compared."""
+    recorded = EmbedderIdentity.recorded_in(stored)
+    configured = EmbedderIdentity.recorded_in(current)
+    if recorded is None or configured is None:
+        return []
+    return [
+        f"{field}: '{was}' -> '{now}'"
+        for field, was, now in zip(EmbedderIdentity._fields, recorded, configured)
+        if field != "vector_dim" and was is not None and was != now
+    ]
+
+
+def compaction_target_rows(
+    dataset: "lance.LanceDataset", target_bytes: int
+) -> int | None:
+    """Rows per fragment sized so one compaction task reads about `target_bytes`.
+
+    Taken from the widest fragment's bytes per row rather than the table
+    average: document payloads span kilobytes to hundreds of megabytes, so an
+    average lets a task pick up many outsized rows. Sizes come from the
+    manifest, so no payload is read.
+
+    This sizes fragments compaction *writes*; it does not shrink fragments that
+    are already larger, which lance rewrites whole. Returns None when any
+    fragment cannot be measured, which means leave the table alone rather than
+    fall back to lance's unbounded default: sizing from the fragments that do
+    carry metadata would still hand an unmeasured one to compaction whole.
+    """
+    widest = 0.0
+    for fragment in dataset.get_fragments():
+        rows = fragment.physical_rows
+        if not rows:
+            continue
+        sizes = [f.file_size_bytes for f in fragment.data_files()]
+        if not all(sizes):
+            return None
+        widest = max(widest, sum(cast(list[int], sizes)) / rows)
+    if widest <= 0:
+        return None
+    return max(1, int(target_bytes // widest))
+
+
+# Restore order for multi-table restore and its rollback. documents restores
+# last: writes land in it last on the ingest path, making it the closest
+# available database commit point.
+RESTORE_TABLE_ORDER: tuple[str, ...] = tuple(
+    name for name in REQUIRED_TABLES if name != "documents"
+) + ("documents",)
+
+
+async def _wait_protected[T](coro: Coroutine[Any, Any, T]) -> tuple[T, bool]:
+    """Await a coroutine that a cancellation cannot interrupt.
+
+    Runs the coroutine as a task and keeps waiting for it even if this
+    coroutine is cancelled, so a Ctrl-C cannot leave half-applied state behind.
+    Used for rollback, which is bounded, and for lance maintenance, which is
+    not: a shielded compaction can hold its caller for minutes.
+    Returns the result and whether a cancellation was absorbed; the caller
+    must re-deliver an absorbed cancellation.
+    """
+    task = asyncio.ensure_future(coro)
+    cancelled = False
+    while True:
+        try:
+            return await asyncio.shield(task), cancelled
+        except asyncio.CancelledError:
+            if task.cancelled():
+                # The recovery coroutine itself ended cancelled; there is
+                # nothing left to wait for. A task that completed (even in
+                # the same tick as the cancellation) still returns its
+                # result on the next pass.
+                raise
+            cancelled = True
+
+
+def _safety_tag_name(existing: set[str]) -> str:
+    """Collision-resistant name for the pre-restore safety tag."""
+    base = f"before-restore-{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}"
+    if base not in existing:
+        return base
+    n = 2
+    while f"{base}-{n}" in existing:
+        n += 1
+    return f"{base}-{n}"
+
+
+@dataclass
+class TagInfo:
+    """A database-level tag aggregated across all tables.
+
+    A complete tag names the same tag on every table; a partial one (created
+    outside haiku.rag or left behind by a failure) lists the tables it is
+    missing from.
+    """
+
+    tables: dict[str, int]
+    missing_tables: list[str]
+
+    @property
+    def complete(self) -> bool:
+        return not self.missing_tables
+
+
+async def _aggregate_tags(tables: dict[str, lancedb.AsyncTable]) -> dict[str, TagInfo]:
+    """Per-table tags as database-level tags, missing tables counted against
+    every required table."""
+    tags: dict[str, TagInfo] = {}
+    for table_name, table in tables.items():
+        for tag_name, tag in (await table.tags.list()).items():
+            info = tags.setdefault(tag_name, TagInfo(tables={}, missing_tables=[]))
+            info.tables[table_name] = tag["version"]
+    for info in tags.values():
+        info.missing_tables = [t for t in REQUIRED_TABLES if t not in info.tables]
+    return tags
+
+
+def require_current_tag(name: str, db_version: str) -> None:
+    """Raise `MigrationRequiredError` when the tag, recorded at `db_version`,
+    needs a migration to be read."""
+    from haiku.rag.store.upgrades import get_pending_upgrades
+
+    pending = get_pending_upgrades(db_version)
+    if pending:
+        raise MigrationRequiredError(
+            f"Tag '{name}' was taken at {db_version} and needs "
+            f"{len(pending)} migration(s) to be read by "
+            f"{metadata.version('haiku.rag-slim')}. A tag cannot be migrated "
+            "in place: restore it in a copy of the database with "
+            "`haiku-rag tag restore`, then migrate the copy."
+        )
+
+
+def newer_schema(settings: dict) -> str | None:
+    """The recorded `schema_version` when it is newer than this release's."""
+    from haiku.rag.store.upgrades import latest_schema_version
+
+    stored = settings.get("schema_version")
+    if stored is None or parse(stored) <= parse(latest_schema_version()):
+        return None
+    return stored
+
+
+def upgrade_required_message(schema_version: str) -> str:
+    from haiku.rag.store.upgrades import latest_schema_version
+
+    return (
+        f"Database schema {schema_version} was written by a newer haiku.rag "
+        f"release. haiku.rag {metadata.version('haiku.rag-slim')} knows schemas "
+        f"up to {latest_schema_version()}. Upgrade haiku.rag."
+    )
+
+
+def require_known_schema(settings: dict) -> None:
+    """Raise `UpgradeRequiredError` when a newer release wrote `settings`."""
+    newer = newer_schema(settings)
+    if newer is not None:
+        raise UpgradeRequiredError(upgrade_required_message(newer))
+
+
+async def read_settings(table: lancedb.AsyncTable) -> dict:
+    """The settings blob in `table`, or {} if it is absent or not a JSON object.
+
+    Only decoding failures are tolerated. A storage failure must propagate:
+    read as empty settings it would look like version 0.0.0, and the
+    migration check would declare every migration pending.
+    """
+    rows = (
+        await table.query().where("id = 'settings'").limit(1).to_arrow()
+    ).to_pylist()
+    if not rows or not rows[0].get("settings"):
+        return {}
+    try:
+        decoded = json.loads(rows[0]["settings"])
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    return decoded if isinstance(decoded, dict) else {}
+
+
+def _restorable_tag(tags: dict[str, TagInfo], name: str) -> TagInfo:
+    """The complete tag `name`, raising `ValueError` when it is missing or partial."""
+    info = tags.get(name)
+    if info is None:
+        raise ValueError(f"Tag '{name}' does not exist")
+    if not info.complete:
+        raise ValueError(
+            f"Tag '{name}' is partial (missing tables: "
+            f"{', '.join(info.missing_tables)}) and cannot be "
+            "restored; delete it with delete_tag"
+        )
+    return info
+
+
+async def require_complete_tag(
+    tables: dict[str, lancedb.AsyncTable], name: str
+) -> None:
+    """Raise `TagError` unless the tag exists on every required table."""
+    info = (await _aggregate_tags(tables)).get(name)
+    if info is None:
+        raise TagError(f"Tag '{name}' does not exist")
+    if not info.complete:
+        raise TagError(
+            f"Tag '{name}' is partial (missing tables: "
+            f"{', '.join(info.missing_tables)}) and cannot be read"
+        )
+
+
+class Store:
+    def __init__(
+        self,
+        location: Path | str,
+        config: AppConfig | None = None,
+        skip_validation: bool = False,
+        create: bool = False,
+        read_only: bool = False,
+        skip_migration_check: bool = False,
+        tag: str | None = None,
+    ):
+        """A store over the database at `location`, a local path or a URI.
+
+        `config` supplies connection settings; where the database is comes
+        from `location` alone. With `tag`, every table is read at that tag and
+        the store is read-only.
+        """
+        if tag is not None and create:
+            raise ValueError("a store at a tag cannot create the database")
+        self._location: Path | str = location
+        self._tag = tag
+        self.db_path: Path | None = (
+            Path(location)
+            if ConnectionMode.of(location) == ConnectionMode.LOCAL
+            else None
+        )
+        self._config = config if config is not None else get_config()
+        self._read_only = read_only or tag is not None
+        self._create = create
+        self._skip_validation = skip_validation
+        self._skip_migration_check = skip_migration_check
+        self._vacuum_lock = asyncio.Lock()
+        self._write_lock = asyncio.Lock()
+        # Held by rebuild_database and create_vector_index for their whole run.
+        # Tag operations fail fast while it is held.
+        self._rebuild_lock = asyncio.Lock()
+        self._is_new_db = False
+
+        if self.db_path is not None:
+            if not self.db_path.exists():
+                if not create:
+                    raise FileNotFoundError(
+                        f"Database does not exist at {self.db_path.absolute()}. "
+                        "Use 'haiku-rag init' to create a new database."
+                    )
+                self._is_new_db = True
+                # Ensure parent directories exist for new databases
+                if not self.db_path.parent.exists():
+                    Path.mkdir(self.db_path.parent, parents=True)
+
+        # Create embedder (sync — no LanceDB needed)
+        self.embedder = get_embedder(config=self._config)
+        # The settings blob as of open, and the embedder it records, so
+        # reporting on a database and comparing it against another cost no
+        # second read. Neither follows a later write.
+        self.stored_settings: dict = {}
+        self.stored_embedding: EmbedderIdentity | None = None
+
+    def _remember_settings(self, settings: dict) -> None:
+        """Hold the settings blob and the embedder it records.
+
+        Together, so nothing reports on one reading while comparing the other.
+        """
+        self.stored_settings = settings
+        self.stored_embedding = EmbedderIdentity.recorded_in(settings)
+
+    async def _initialize(self):
+        """Perform async initialization: connect to LanceDB, init tables, validate."""
+        self.db: lancedb.AsyncConnection = await connect_lancedb(
+            self.location, self._config
+        )
+
+        # Read once and thread onward: on object storage each of these is a
+        # round trip. A local path that exists with no tables is a failed init,
+        # so treat it as new.
+        existing_tables = (await self.db.list_tables()).tables
+        is_new_db = self._is_new_db or not existing_tables
+
+        # The settings read below and the migration check must see the tagged
+        # state, so the tag is checked and settings checked out first.
+        if self._tag is not None:
+            await self._require_complete_tag(self._tag, existing_tables)
+
+        if not is_new_db and "settings" in existing_tables:
+            self.settings_table = await self.db.open_table("settings")
+            if self._tag is not None:
+                await self.settings_table.checkout(self._tag)
+            self._remember_settings(await self._read_stored_settings())
+
+        # An existing database's chunks can only be read with the dimension they
+        # were written at.
+        stored_vector_dim = _stored_vector_dim(self.stored_settings)
+        chunk_vector_dim = stored_vector_dim or self.embedder._vector_dim
+        self.ChunkRecord: type[ChunkRecordBase] = create_chunk_model(chunk_vector_dim)
+
+        self._check_schema_version(existing_tables)
+
+        # Initialize tables (creates them if they don't exist). For an existing
+        # DB this raises MigrationRequiredError up front when migrations are
+        # pending, before creating any newly-introduced table.
+        await self._init_tables(is_new_db, existing_tables, self.stored_settings)
+
+        if self._tag is not None:
+            for table in self._tables().values():
+                await table.checkout(self._tag)
+
+        # Set version for new databases.
+        if is_new_db and not self._read_only:
+            await self._set_initial_version()
+            # Creating wrote the settings this database will be read with, so
+            # both readings of them are taken again together.
+            self._remember_settings(await self._read_stored_settings())
+
+        # Validate config compatibility after connection is established
+        if not self._skip_validation:
+            await self._validate_configuration(self.stored_settings)
+
+        # The record describes the live chunks table, not a tagged one.
+        if self._tag is None and INCOMPLETE_REBUILD_TABLE in existing_tables:
+            await self._warn_incomplete_rebuild()
+
+    def _check_schema_version(self, existing_tables: list[str]) -> None:
+        """Refuse writes to a schema written by a newer release. Reading it warns.
+
+        `migrate` and `restore_tag` open with `skip_migration_check` and check
+        for themselves. No open creates a missing table in such a schema.
+        """
+        newer = newer_schema(self.stored_settings)
+        if newer is None:
+            return
+        message = upgrade_required_message(newer)
+        if set(REQUIRED_TABLES) - set(existing_tables):
+            raise UpgradeRequiredError(message)
+        if self._read_only:
+            logger.warning(message)
+        elif not self._skip_migration_check:
+            raise UpgradeRequiredError(message)
+
+    async def _require_complete_tag(
+        self, name: str, existing_tables: list[str]
+    ) -> None:
+        """Raise unless the tag exists on every table."""
+        tables = {
+            table_name: await self.db.open_table(table_name)
+            for table_name in REQUIRED_TABLES
+            if table_name in existing_tables
+        }
+        await require_complete_tag(tables, name)
+
+    async def __aenter__(self):
+        # If _initialize connects to LanceDB but then fails (e.g. migration
+        # check, config validation), close the connection so it doesn't
+        # leak — __aexit__ won't run because the `async with` never entered.
+        try:
+            await self._initialize()
+        except BaseException:
+            self.close()
+            raise
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):  # noqa: ARG002
+        self.close()
+        return False
+
+    @property
+    def is_read_only(self) -> bool:
+        """Whether the store is in read-only mode."""
+        return self._read_only
+
+    @property
+    def tag(self) -> str | None:
+        """The tag every table is read at, or None for the live state."""
+        return self._tag
+
+    async def _read_stored_settings(self) -> dict:
+        """The settings blob."""
+        return await read_settings(self.settings_table)
+
+    async def _warn_incomplete_rebuild(self) -> None:
+        table = await self.db.open_table(INCOMPLETE_REBUILD_TABLE)
+        rows = (await table.query().select(["mode"]).to_arrow()).to_pylist()
+        logger.warning(
+            "Database incomplete: an interrupted 'haiku-rag %s' left documents "
+            "without chunks. Run it again to finish.",
+            REBUILD_COMMANDS[rows[0]["mode"]],
+        )
+
+    def _assert_writable(self) -> None:
+        """Raise ReadOnlyError if the store is in read-only mode."""
+        if self._read_only:
+            raise ReadOnlyError("Cannot modify database in read-only mode")
+
+    def _assert_not_rebuilding(self) -> None:
+        """Raise if a rebuild or vector index build is in progress in this process."""
+        if self._rebuild_lock.locked():
+            raise ValueError(
+                "Rebuild or vector index build in progress; tag operations are "
+                "unavailable until it completes"
+            )
+
+    async def rebuild_indexes(self) -> dict[str, list[str]]:
+        """Rebuild every declared index of every table. Returns the columns per table."""
+        self._assert_writable()
+        async with self._write_lock:
+            return {
+                name: await rebuild_indexes(
+                    table, name, self._config.search.fts_language
+                )
+                for name, table in self._tables().items()
+            }
+
+    async def vacuum(self, retention_seconds: int | None = None) -> bool:
+        """Optimize and clean up old versions across all tables to reduce disk usage.
+        Returns whether the pass ran to completion.
+
+        Args:
+            retention_seconds: Retention threshold in seconds. Only versions older
+                              than this will be removed. If None, uses config.storage.vacuum_retention_seconds.
+
+        Note:
+            If vacuum is already running, this method returns immediately without blocking.
+            Use asyncio.create_task(store.vacuum()) for non-blocking background execution.
+
+        Raises:
+            ReadOnlyError: If the store is in read-only mode.
+            RuntimeError: On lance errors during maintenance; only OSError
+                (resource pressure) skips the pass.
+        """
+        self._assert_writable()
+
+        if self._connection_mode == ConnectionMode.CLOUD:
+            return False
+
+        # Skip if already running (non-blocking)
+        if self._vacuum_lock.locked():
+            return False
+
+        async with self._vacuum_lock, self._write_lock:
+            try:
+                # Evaluate config at runtime to allow dynamic changes
+                if retention_seconds is None:
+                    retention_seconds = self._config.storage.vacuum_retention_seconds
+                retention = timedelta(seconds=retention_seconds)
+                for table in self._tables().values():
+                    if has_payload_columns(await table.schema()):
+                        await self._compact_to_target(table)
+                    else:
+                        await self._run_lance_maintenance(
+                            table, lambda ds: ds.optimize.compact_files()
+                        )
+                        await self._run_lance_maintenance(
+                            table, lambda ds: ds.optimize.optimize_indices()
+                        )
+                    # Tagged versions are kept and every other version older
+                    # than the retention is removed with its files.
+                    await self._run_lance_maintenance(
+                        table,
+                        lambda ds: ds.cleanup_old_versions(
+                            older_than=retention, error_if_tagged_old_versions=False
+                        ),
+                    )
+            except OSError as e:
+                # Resource errors (e.g. disk pressure) skip the pass; lance
+                # errors surface as RuntimeError and must not be swallowed —
+                # a silently skipped cleanup hides tag-interaction bugs.
+                logger.debug(f"Vacuum skipped due to resource constraints: {e}")
+                return False
+        return True
+
+    async def _run_lance_maintenance(
+        self, table: lancedb.AsyncTable, step: "Callable[[lance.LanceDataset], Any]"
+    ) -> None:
+        """Run one lance maintenance step against `table`, then refresh it.
+
+        The step mutates the dataset behind the open handle, so the refresh has
+        to happen whether or not it succeeded: a step that commits and then
+        fails would otherwise leave the handle on a superseded version. The
+        dataset comes from `to_lance()` so object-storage credentials travel
+        with it, and it is re-obtained per step because each commit supersedes
+        the version the previous one pinned.
+
+        A worker thread cannot be cancelled, so the step and the refresh that
+        follows it are shielded as one unit and awaited to completion rather
+        than abandoned while they still hold `_write_lock`. Protecting only the
+        thread would leave a cancellation arriving after the commit but before
+        the refresh with a stale handle. An absorbed cancellation is raised once
+        the step has finished.
+        """
+
+        async def step_and_refresh() -> None:
+            dataset = await table.to_lance()
+            try:
+                await asyncio.to_thread(step, dataset)
+            finally:
+                await table.checkout_latest()
+
+        _, cancelled = await _wait_protected(step_and_refresh())
+        if cancelled:
+            raise asyncio.CancelledError
+
+    async def _compact_to_target(self, table: lancedb.AsyncTable) -> None:
+        """Compact a table of inline payloads to an explicit fragment target.
+
+        `AsyncTable.optimize` exposes no compaction options, and its default row
+        target is never reached by a table of multi-megabyte rows, so every pass
+        re-merges the whole table and its peak memory tracks the table rather
+        than the delta. Going through lance directly is the only way to size it.
+        """
+        dataset = await table.to_lance()
+        target = compaction_target_rows(
+            dataset, self._config.storage.compaction_target_bytes
+        )
+        if target is None:
+            if dataset.get_fragments():
+                logger.warning(
+                    f"{table.name}: fragment sizes are absent from the manifest, "
+                    "so compaction cannot be sized and is skipped; old versions "
+                    "are still pruned"
+                )
+            return
+        # A compaction cannot be cancelled once it reaches the worker
+        # thread, so a close waits it out. Say what is running, or an
+        # operator cannot tell a long pass from a wedge.
+        logger.info(
+            f"{table.name}: compacting to {target} rows per fragment "
+            f"({len(dataset.get_fragments())} fragments)"
+        )
+        started = monotonic()
+        await self._run_lance_maintenance(
+            table,
+            lambda ds: ds.optimize.compact_files(target_rows_per_fragment=target),
+        )
+        logger.info(f"{table.name}: compacted in {monotonic() - started:.1f}s")
+        # compact_files leaves indices covering the pre-compaction fragments.
+        await self._run_lance_maintenance(
+            table, lambda ds: ds.optimize.optimize_indices()
+        )
+
+    @property
+    def location(self) -> Path | str:
+        """Where this store connected: a local path, or a URI."""
+        return self._location
+
+    @property
+    def _connection_mode(self) -> ConnectionMode:
+        return ConnectionMode.of(self._location)
+
+    async def create_vector_index(self) -> bool:
+        """Create or retrain the IVF_PQ index on the chunks table.
+
+        Returns whether it built one: never below 256 chunks or on LanceDB
+        Cloud, which indexes on its own. Holds the rebuild and write locks for
+        the whole build, so every write through this store waits for it, for
+        minutes on a large table. Another store or process is not excluded.
+
+        Raises:
+            ReadOnlyError: If the store is in read-only mode.
+        """
+        self._assert_writable()
+        async with self._rebuild_lock, self._write_lock:
+            return await self._ensure_vector_index()
+
+    async def _ensure_vector_index(self) -> bool:
+        """Create or rebuild vector index on chunks table. Returns whether it built one.
+
+        Cloud deployments auto-create indexes, so we skip for those.
+        For self-hosted, creates an IVF_PQ index. If an index exists,
+        it will be replaced (using replace=True parameter).
+        Note: Index creation requires sufficient training data.
+        """
+        if self._connection_mode == ConnectionMode.CLOUD:
+            return False
+
+        # Check if table has enough data (indexes require training data)
+        row_count = await self.chunks_table.count_rows()
+        if row_count < 256:
+            logger.debug(
+                f"Skipping vector index creation: need at least 256 rows, have {row_count}"
+            )
+            return False
+
+        # Create or replace index (replace=True is the default)
+        logger.info("Creating vector index on chunks table...")
+        await self.chunks_table.create_index(
+            "vector",
+            config=IvfPq(
+                distance_type=self._config.search.vector_index_metric,
+            ),
+            replace=True,
+        )
+
+        # Wait for index creation to complete
+        # Index name is column_name + "_idx"
+        await self.chunks_table.wait_for_index(
+            ["vector_idx"], timeout=timedelta(hours=1)
+        )
+
+        logger.info("Vector index created successfully")
+        return True
+
+    async def _validate_configuration(
+        self, stored_settings: dict | None = None
+    ) -> None:
+        """Validate that the configuration is compatible with the database."""
+        from haiku.rag.store.repositories.settings import SettingsRepository
+
+        settings_repo = SettingsRepository(self)
+        await settings_repo.validate_config_compatibility(stored_settings)
+
+    async def _init_tables(
+        self, is_new_db: bool, existing_tables: list[str], stored_settings: dict
+    ):
+        """Initialize database tables (create if they don't exist)."""
+
+        # Surface pending migrations BEFORE creating any newly-introduced table.
+        # Otherwise opening a legacy DB would either mutate it (creating an empty
+        # document_meta on open) or raise the wrong ReadOnlyError instead of
+        # telling the user to run `haiku-rag migrate`. The settings table exists
+        # on any non-new DB, which is all _check_migrations needs.
+        if (
+            not is_new_db
+            and not self._skip_migration_check
+            and "settings" in existing_tables
+        ):
+            await self._check_migrations(stored_settings.get("version", "0.0.0"))
+
+        missing_tables = set(REQUIRED_TABLES) - set(existing_tables)
+
+        if missing_tables and self._read_only:
+            raise ReadOnlyError(
+                "Cannot create tables in read-only mode. "
+                "Use 'haiku-rag init' to create a new database."
+            )
+
+        # Create or open documents table
+        if "documents" in existing_tables:
+            self.documents_table = await self.db.open_table("documents")
+        else:
+            self.documents_table = await self.db.create_table(
+                "documents", schema=get_documents_arrow_schema()
+            )
+            await ensure_indexes(
+                self.documents_table, "documents", self._config.search.fts_language
+            )
+
+        # Create or open document_meta table (mutable attributes kept out of the
+        # blob-bearing documents row).
+        if "document_meta" in existing_tables:
+            self.document_meta_table = await self.db.open_table("document_meta")
+        else:
+            self.document_meta_table = await self.db.create_table(
+                "document_meta", schema=DocumentMetaRecord
+            )
+            await ensure_indexes(
+                self.document_meta_table,
+                "document_meta",
+                self._config.search.fts_language,
+            )
+
+        # Create or open chunks table
+        if "chunks" in existing_tables:
+            self.chunks_table = await self.db.open_table("chunks")
+        else:
+            self.chunks_table = await self.db.create_table(
+                "chunks", schema=self.ChunkRecord
+            )
+            await ensure_indexes(
+                self.chunks_table, "chunks", self._config.search.fts_language
+            )
+
+        # Create or open document_items table
+        if "document_items" in existing_tables:
+            self.document_items_table = await self.db.open_table("document_items")
+        else:
+            self.document_items_table = await self.db.create_table(
+                "document_items", schema=get_document_items_arrow_schema()
+            )
+            await ensure_indexes(
+                self.document_items_table,
+                "document_items",
+                self._config.search.fts_language,
+            )
+
+        # _initialize opened the settings table when the database had one.
+        if "settings" not in existing_tables:
+            self.settings_table = await self.db.create_table(
+                "settings", schema=SettingsRecord
+            )
+            settings_data = recorded_settings(self._config.model_dump(mode="json"))
+            await self.settings_table.add(
+                [SettingsRecord(id="settings", settings=json.dumps(settings_data))]
+            )
+
+    async def _set_initial_version(self):
+        """Set the initial version for a new database."""
+        from haiku.rag.store.upgrades import latest_schema_version
+
+        await self._write_settings(
+            version=metadata.version("haiku.rag-slim"),
+            schema_version=latest_schema_version(),
+        )
+
+    async def _check_migrations(self, db_version: str) -> None:
+        """Raise if migrations are pending. Opening never writes the version.
+
+        Raises:
+            MigrationRequiredError: If migrations are pending.
+        """
+        from haiku.rag.store.upgrades import get_pending_upgrades
+
+        current_version = metadata.version("haiku.rag-slim")
+
+        if self._tag is not None:
+            require_current_tag(self._tag, db_version)
+
+        pending = get_pending_upgrades(db_version)
+        if pending:
+            # Migrations are pending - require explicit migrate command
+            raise MigrationRequiredError(
+                f"Database requires migration from {db_version} to {current_version}. "
+                f"{len(pending)} migration(s) pending. "
+                "Run 'haiku-rag migrate' to upgrade."
+            )
+
+    async def migrate(self) -> list[str]:
+        """Run pending database migrations.
+
+        Returns:
+            List of descriptions of applied upgrades.
+
+        Raises:
+            ReadOnlyError: If the store is in read-only mode.
+            UpgradeRequiredError: If a newer release wrote the schema.
+        """
+        self._assert_writable()
+
+        from haiku.rag.store.upgrades import (
+            latest_schema_version,
+            run_pending_upgrades,
+        )
+
+        require_known_schema(await read_settings(self.settings_table))
+
+        db_version = await self.get_haiku_version()
+        current_version = metadata.version("haiku.rag-slim")
+
+        applied = await run_pending_upgrades(self, db_version)
+
+        # The release marker only moves forward: a newer build may have
+        # stamped a schema-compatible database last.
+        await self._write_settings(
+            version=max(current_version, db_version, key=parse),
+            schema_version=latest_schema_version(),
+        )
+
+        return applied
+
+    async def get_haiku_version(self) -> str:
+        """Returns the user version stored in settings."""
+        settings_records = await query_to_pydantic(
+            self.settings_table.query().limit(1), SettingsRecord
+        )
+        if settings_records:
+            settings = (
+                json.loads(settings_records[0].settings)
+                if settings_records[0].settings
+                else {}
+            )
+            return settings.get("version", "0.0.0")
+        return "0.0.0"
+
+    async def set_haiku_version(self, version: str) -> None:
+        """Updates the user version in settings.
+
+        Raises:
+            ReadOnlyError: If the store is in read-only mode.
+        """
+        await self._write_settings(version=version)
+
+    async def _write_settings(self, **fields: str) -> None:
+        """Write `fields` into the settings row in one update."""
+        self._assert_writable()
+        settings_records = await query_to_pydantic(
+            self.settings_table.query().limit(1), SettingsRecord
+        )
+        if settings_records:
+            # Only write if version actually changes to avoid creating new table versions
+            current = (
+                json.loads(settings_records[0].settings)
+                if settings_records[0].settings
+                else {}
+            )
+            updated = recorded_settings({**current, **fields})
+            if updated != current:
+                await self.settings_table.update(
+                    {"settings": json.dumps(updated)},
+                    where="id = 'settings'",
+                )
+        else:
+            settings_data = recorded_settings(self._config.model_dump(mode="json"))
+            settings_data.update(fields)
+            await self.settings_table.add(
+                [SettingsRecord(id="settings", settings=json.dumps(settings_data))]
+            )
+
+    async def recreate_embeddings_table(self) -> None:
+        """Recreate the chunks table with current vector dimensions.
+
+        Raises:
+            ReadOnlyError: If the store is in read-only mode.
+        """
+        self._assert_writable()
+        # Drop and recreate chunks table. Check existence first rather than
+        # catching-and-swallowing drop_table's errors — a catch-all would
+        # hide real failures (permissions, storage-backend errors) and then
+        # the subsequent create_table would fail confusingly.
+        if "chunks" in (await self.db.list_tables()).tables:
+            await self.db.drop_table("chunks")
+
+        self.ChunkRecord = create_chunk_model(self.embedder._vector_dim)
+        self.chunks_table = await self.db.create_table(
+            "chunks", schema=self.ChunkRecord
+        )
+        await ensure_indexes(
+            self.chunks_table, "chunks", self._config.search.fts_language
+        )
+
+    def close(self):
+        """Close the database connection."""
+        # AsyncConnection.close() is synchronous
+        if hasattr(self, "db"):
+            self.db.close()
+
+    def _tables(self) -> dict[str, lancedb.AsyncTable]:
+        """Map every haiku.rag table name to its open AsyncTable."""
+        return {
+            "documents": self.documents_table,
+            "document_meta": self.document_meta_table,
+            "chunks": self.chunks_table,
+            "document_items": self.document_items_table,
+            "settings": self.settings_table,
+        }
+
+    async def current_table_versions(self) -> dict[str, int]:
+        """Capture current versions of key tables for rollback using LanceDB's API."""
+        return {name: await table.version() for name, table in self._tables().items()}
+
+    @asynccontextmanager
+    async def write_transaction(self) -> AsyncIterator[None]:
+        """Hold the write lock for a multi-table mutation, restoring every table
+        to its pre-mutation version if the mutation fails.
+
+        Rollback follows RESTORE_TABLE_ORDER and a cancellation cannot interrupt
+        it; a cancellation absorbed during rollback is re-delivered. A rollback
+        that itself fails raises with the original failure as its cause.
+
+        In-process coordination only: a writer in another process can commit
+        between the version snapshot and the mutation.
+
+        Sets `lock_wait_ms` on the recording span, if any.
+
+        Raises:
+            ReadOnlyError: If the store is in read-only mode.
+        """
+        self._assert_writable()
+        waiting_since = monotonic()
+        async with self._write_lock:
+            trace.get_current_span().set_attribute(
+                "lock_wait_ms", (monotonic() - waiting_since) * 1000
+            )
+            versions = await self.current_table_versions()
+            try:
+                yield
+            except BaseException as exc:
+                failures, cancelled = await self._rollback_to_snapshot(versions)
+                if failures:
+                    raise RuntimeError(
+                        f"Write failed ({exc!r}) and rollback failed on: "
+                        f"{', '.join(name for name, _ in failures)}. Tables may "
+                        "be left inconsistent."
+                    ) from exc
+                if cancelled and not isinstance(exc, asyncio.CancelledError):
+                    raise asyncio.CancelledError()
+                raise
+
+    async def create_tag(self, name: str) -> None:
+        """Tag the current version of every table with the given name.
+
+        Serializes with client writes via the write lock so a write cannot
+        land between the version snapshot and the per-table tag creation.
+        This is in-process coordination only: a writer in another process
+        can commit between the per-table version reads, so create tags with
+        all other writers stopped when a consistent snapshot matters.
+
+        Raises:
+            ReadOnlyError: If the store is in read-only mode.
+            ValueError: If a rebuild is in progress, or if the tag already
+                exists on any table. A partial tag (present on some tables
+                only) must be deleted before the name can be reused.
+        """
+        self._assert_writable()
+        self._assert_not_rebuilding()
+
+        async with self._rebuild_lock, self._write_lock:
+            await self._create_tag_locked(name)
+
+    async def _create_tag_locked(self, name: str) -> None:
+        """Create a tag on every table; the caller must hold the write lock."""
+        tables = self._tables()
+
+        existing = [
+            table_name
+            for table_name, table in tables.items()
+            if name in await table.tags.list()
+        ]
+        if len(existing) == len(tables):
+            raise ValueError(f"Tag '{name}' already exists")
+        if existing:
+            raise ValueError(
+                f"Tag '{name}' already exists on some tables "
+                f"({', '.join(existing)}); delete it first with delete_tag"
+            )
+
+        versions = await self.current_table_versions()
+        try:
+            for table_name, table in tables.items():
+                await table.tags.create(name, versions[table_name])
+        except BaseException as exc:
+            # BaseException: cancellation must also trigger cleanup, and the
+            # cleanup itself is protected from further cancellation. The
+            # sweep covers all tables, not only the recorded ones: a
+            # cancellation can land after lance committed a table's tag but
+            # before this attempt recorded it, and preflight guarantees the
+            # name was unused, so any occurrence belongs to this attempt.
+            (_, failed_cleanup), cancelled = await _wait_protected(
+                self._delete_tag_locked(name)
+            )
+            if failed_cleanup:
+                raise RuntimeError(
+                    f"Tag '{name}' creation failed ({exc!r}) and cleanup "
+                    f"failed on: {', '.join(failed_cleanup)}. A partial "
+                    "tag may remain; delete it with delete_tag."
+                ) from exc
+            if cancelled and not isinstance(exc, asyncio.CancelledError):
+                raise asyncio.CancelledError()
+            raise
+
+    async def _delete_tag_locked(self, name: str) -> tuple[bool, list[str]]:
+        """Delete the tag from every table that has it; the caller must
+        hold the write lock.
+
+        Returns whether the tag was found anywhere and the tables where
+        listing or deletion failed.
+        """
+        found = False
+        failed: list[str] = []
+        for table_name, table in self._tables().items():
+            try:
+                if name in await table.tags.list():
+                    found = True
+                    await table.tags.delete(name)
+            except Exception:
+                failed.append(table_name)
+        return found, failed
+
+    async def list_tags(self) -> dict[str, TagInfo]:
+        """Aggregate per-table tags into database-level tags.
+
+        Returns:
+            Tag name mapped to a TagInfo with the tagged version per table
+            and the tables the tag is missing from (empty when complete).
+        """
+        return await _aggregate_tags(self._tables())
+
+    async def tag_haiku_version(self, name: str) -> str:
+        """The haiku.rag version recorded at a complete tag.
+
+        Reads through its own `settings` handle, so `settings_table` stays live.
+        """
+        info = _restorable_tag(await self.list_tags(), name)
+        return (await self._tag_settings(info)).get("version", "0.0.0")
+
+    async def _tag_settings(self, info: TagInfo) -> dict:
+        """The settings blob at a tag, read through its own handle."""
+        settings = await self.db.open_table("settings")
+        await settings.checkout(info.tables["settings"])
+        return await read_settings(settings)
+
+    async def delete_tag(self, name: str) -> None:
+        """Delete the tag from every table that has it.
+
+        Serializes with create_tag and client writes via the write lock.
+
+        Raises:
+            ReadOnlyError: If the store is in read-only mode.
+            ValueError: If a rebuild is in progress or no table has the tag.
+            RuntimeError: If deletion failed on some tables; remnants remain
+                until a retry succeeds.
+        """
+        self._assert_writable()
+        self._assert_not_rebuilding()
+        async with self._rebuild_lock, self._write_lock:
+            found, failed = await self._delete_tag_locked(name)
+            if failed:
+                # A listing failure obscures whether the tag exists on that
+                # table, so failures take precedence over not-found.
+                raise RuntimeError(
+                    f"Tag '{name}' deletion failed on: {', '.join(failed)}. "
+                    "Remnants may remain; retry delete_tag."
+                )
+            if not found:
+                raise ValueError(f"Tag '{name}' does not exist")
+
+    async def _restore_tables(
+        self, versions: dict[str, int], *, best_effort: bool = False
+    ) -> list[tuple[str, Exception]]:
+        """Restore every table to the given versions, documents last.
+
+        Stops at the first failure by default; with best_effort, continues
+        through all tables. Returns the failures either way.
+        """
+        tables = self._tables()
+        failures: list[tuple[str, Exception]] = []
+        for table_name in RESTORE_TABLE_ORDER:
+            try:
+                await tables[table_name].restore(int(versions[table_name]))
+            except Exception as exc:
+                failures.append((table_name, exc))
+                if not best_effort:
+                    break
+        return failures
+
+    async def _rollback_to_snapshot(
+        self, snapshot: dict[str, int]
+    ) -> tuple[list[tuple[str, Exception]], bool]:
+        """Best-effort rollback that a cancellation cannot interrupt.
+
+        Returns the rollback failures and whether a cancellation was
+        absorbed; the caller must re-deliver an absorbed cancellation.
+        """
+        return await _wait_protected(self._restore_tables(snapshot, best_effort=True))
+
+    async def restore_tag(self, name: str) -> str:
+        """Restore every table to the versions of a complete tag.
+
+        Creates a complete safety tag for the pre-restore state before
+        changing any table and returns its name. Each table restore writes a
+        new latest version; nothing is left checked out read-only.
+
+        In-process coordination only: all other writers must be stopped for
+        the duration of the operation.
+
+        Raises:
+            ReadOnlyError: If the store is in read-only mode.
+            ValueError: If a rebuild is in progress, the tag does not exist,
+                or the tag is partial.
+            RuntimeError: If the safety tag could not be created (no table
+                changed), or a table restore failed (the error states whether
+                rollback succeeded).
+            UpgradeRequiredError: If a newer release wrote the tag's schema.
+        """
+        self._assert_writable()
+        self._assert_not_rebuilding()
+
+        async with self._rebuild_lock, self._write_lock:
+            tags = await self.list_tags()
+            info = _restorable_tag(tags, name)
+            require_known_schema(await self._tag_settings(info))
+
+            snapshot = await self.current_table_versions()
+            safety_tag = _safety_tag_name(set(tags))
+            try:
+                await self._create_tag_locked(safety_tag)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Restore of tag '{name}' did not begin: safety tag "
+                    f"creation failed ({exc}). No table was changed."
+                ) from exc
+
+            try:
+                failures = await self._restore_tables(info.tables)
+            except asyncio.CancelledError:
+                # CancelledError is a BaseException and escapes the
+                # per-table handler; roll back before re-raising.
+                rollback_failures, _ = await self._rollback_to_snapshot(snapshot)
+                if rollback_failures:
+                    failed_names = ", ".join(t for t, _ in rollback_failures)
+                    raise RuntimeError(
+                        f"Restore of tag '{name}' was cancelled and rollback "
+                        f"failed on: {failed_names}. The database may be "
+                        f"cross-table inconsistent; manual recovery is "
+                        f"required using safety tag '{safety_tag}'."
+                    ) from None
+                raise
+            if failures:
+                failed_table, cause = failures[0]
+                rollback_failures, cancelled = await self._rollback_to_snapshot(
+                    snapshot
+                )
+                if rollback_failures:
+                    failed_names = ", ".join(t for t, _ in rollback_failures)
+                    raise RuntimeError(
+                        f"Restore of tag '{name}' failed on table "
+                        f"'{failed_table}' and rollback failed on: "
+                        f"{failed_names}. The database may be cross-table "
+                        f"inconsistent; manual recovery is required using "
+                        f"safety tag '{safety_tag}'."
+                    ) from cause
+                if cancelled:
+                    raise asyncio.CancelledError()
+                raise RuntimeError(
+                    f"Restore of tag '{name}' failed on table "
+                    f"'{failed_table}'; all tables were rolled back to the "
+                    f"pre-restore state. Safety tag '{safety_tag}' is "
+                    "preserved."
+                ) from cause
+
+            return safety_tag
+
+    async def list_table_versions(self, table_name: str) -> list[dict[str, Any]]:
+        """List version history for a table.
+
+        Args:
+            table_name: Name of the table ("documents", "document_meta",
+                "chunks", "document_items", or "settings")
+
+        Returns:
+            List of version info dicts with "version" and "timestamp" keys
+        """
+        table = self._tables().get(table_name)
+        if table is None:
+            raise ValueError(f"Unknown table: {table_name}")
+
+        return list(await table.list_versions())

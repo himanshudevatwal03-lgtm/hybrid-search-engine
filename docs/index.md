@@ -1,0 +1,49 @@
+---
+title: Hybrid Search Engine
+description: Local-first agentic RAG. Index PDFs, web pages, and whole directories, then ask questions and get answers cited to page numbers and section headings. Hybrid search, reranking, and multimodal retrieval on embedded LanceDB.
+---
+
+Hybrid Search Engine is a local-first document RAG project based on haiku.rag. It indexes PDFs, web pages, and whole directories, retrieves with hybrid search, and answers with citations down to the page number and section heading. It runs on an embedded database with open models, so your documents stay on your machine and there is no server to operate.
+
+This repository carries the MIT-licensed upstream implementation by [Yiorgis Gozadinos](https://github.com/ggozad/haiku.rag), copied with permission. See the [destination repository](https://github.com/himanshudevatwal03-lgtm/hybrid-search-engine) and its [LICENSE](https://github.com/himanshudevatwal03-lgtm/hybrid-search-engine/blob/main/LICENSE).
+
+```bash
+uv pip install haiku.rag
+
+haiku-rag init
+haiku-rag add-src ~/Documents/some-paper.pdf
+haiku-rag ask "what does it conclude?"
+```
+
+[Quickstart](tutorial.md) covers provider setup and the first ingestion.
+
+## Why this project
+
+**Answers you can check.** Every answer carries citations with page numbers and section headings. Visual grounding shows the cited chunk highlighted on the original page image. An optional capability requires every answer to declare what grounds it, including declaring that nothing does.
+
+**Local-first, no server.** Embedded [LanceDB](https://lancedb.com/) and open models through [Ollama](https://ollama.com/) by default. No database to run and no API keys required. The same code runs against S3, GCS, Azure, LanceDB Cloud, or any provider Pydantic AI supports.
+
+**Built for agents.** Native [Pydantic AI](https://ai.pydantic.dev/) capabilities compose into your own agents. An [MCP server](mcp.md) exposes the same database to Claude Desktop and other assistants. The capability runs sandboxed Python across documents for questions that need computation rather than retrieval.
+
+**Benchmarked.** Retrieval and answer quality are tracked against public benchmarks with runnable configs. See [Benchmarks](benchmarks.md).
+
+## What it does
+
+- **Ingest.** PDFs, office documents, HTML, Markdown and images, converted by [Docling](configuration/processing.md) in-process or on [docling-serve](remote-processing.md). One-shot from the CLI, or continuously from filesystem, S3, HTTP and WebDAV sources with the [ingester](ingester.md).
+- **Search.** Hybrid vector and full-text search, optional [reranking](configuration/providers.md#reranking-providers), section-aware context expansion, and image search with a multimodal embedder. Across [several databases](configuration/multiple-databases.md) at once.
+- **Answer.** The [RAG capability](capabilities/rag.md) searches, runs sandboxed Python over the documents, and cites what it used. [Evidence compaction](capabilities/compaction.md) and a [citation policy](capabilities/policy.md) are optional.
+- **Integrate.** A [Python API](python.md), Pydantic AI [capabilities](capabilities/index.md) for your own agents, and an [MCP server](mcp.md).
+- **Use it in the browser.** A [web app](apps.md) for chat with cited answers, the ingester's queue, an inspector with a corpus map, and the doctor.
+- **Operate.** [Storage](configuration/storage.md) on local disk, S3, GCS, Azure or LanceDB Cloud, tags and rollback, vacuum, `haiku-rag doctor` health checks, and an ingester with a job queue, retries and a dashboard.
+
+## Start here
+
+- [Quickstart](tutorial.md): install, index, chat.
+- [Installation](installation.md): packages and extras.
+- [Architecture](overview.md): how a document becomes a cited answer.
+- [Capabilities](capabilities/index.md): native capabilities for Pydantic AI agents.
+- [Python API](python.md): use haiku.rag from code.
+- [MCP server](mcp.md): expose haiku.rag to Claude Desktop or other AI assistants.
+- [Configuration](configuration/index.md): every setting.
+
+MIT licensed. Upstream source: [ggozad/haiku.rag](https://github.com/ggozad/haiku.rag). This repository: [himanshudevatwal03-lgtm/hybrid-search-engine](https://github.com/himanshudevatwal03-lgtm/hybrid-search-engine).

@@ -1,0 +1,90 @@
+import logging
+from importlib import metadata
+
+import logfire
+import pytest
+from opentelemetry import trace
+
+from haiku.rag import telemetry
+from tests.conftest import capture_logs
+
+
+@pytest.fixture
+def captured_configure(monkeypatch):
+    """Capture the kwargs telemetry.configure() passes to logfire.configure,
+    and no-op the instrumentation so tests don't touch a real exporter."""
+    captured: dict = {}
+
+    def _fake_configure(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(logfire, "configure", _fake_configure)
+    monkeypatch.setattr(logfire, "instrument_pydantic_ai", lambda: None)
+    return captured
+
+
+@pytest.mark.parametrize("variable", ["OTEL_SERVICE_NAME", "LOGFIRE_SERVICE_NAME"])
+def test_service_name_variable_overrides_default(
+    captured_configure, monkeypatch, variable
+):
+    monkeypatch.delenv("OTEL_SERVICE_NAME", raising=False)
+    monkeypatch.delenv("LOGFIRE_SERVICE_NAME", raising=False)
+    monkeypatch.setenv(variable, "customer-ingester")
+
+    telemetry.configure(service_name="haiku-ingester")
+
+    # service_name=None lets logfire read the variable, so the variable wins over
+    # the default.
+    assert captured_configure["service_name"] is None
+
+
+def test_service_name_and_version_without_env(captured_configure, monkeypatch):
+    monkeypatch.delenv("OTEL_SERVICE_NAME", raising=False)
+    monkeypatch.delenv("LOGFIRE_SERVICE_NAME", raising=False)
+
+    telemetry.configure(service_name="haiku-ingester")
+
+    assert captured_configure["service_name"] == "haiku-ingester"
+    assert captured_configure["service_version"] == metadata.version("haiku.rag-slim")
+
+
+def test_scrubbing_defaults_to_enabled(captured_configure):
+    telemetry.configure(service_name="haiku-rag")
+
+    # None is logfire's "scrubbing enabled" default.
+    assert captured_configure["scrubbing"] is None
+
+
+def test_scrubbing_can_be_disabled(captured_configure):
+    telemetry.configure(service_name="evals", scrubbing=False)
+
+    assert captured_configure["scrubbing"] is False
+
+
+def test_attach_env_context_without_traceparent_keeps_the_active_trace(monkeypatch):
+    from opentelemetry.sdk.trace import TracerProvider
+
+    monkeypatch.delenv("TRACEPARENT", raising=False)
+    monkeypatch.setenv("TRACESTATE", "vendor=value")
+    tracer = TracerProvider().get_tracer("test")
+
+    with tracer.start_as_current_span("caller") as span:
+        with telemetry.attach_env_context():
+            current = trace.get_current_span().get_span_context()
+        assert current.trace_id == span.get_span_context().trace_id
+
+
+def test_configure_failure_logs_a_warning_and_returns(monkeypatch):
+    def _failing_configure(**kwargs):
+        raise RuntimeError("bad token")
+
+    monkeypatch.setattr(logfire, "configure", _failing_configure)
+
+    with capture_logs(logging.getLogger("haiku.rag"), logging.WARNING) as records:
+        telemetry.configure(service_name="haiku-rag")
+
+    assert [record.getMessage() for record in records] == [
+        "Logfire configuration failed: bad token"
+    ]
+    assert records[0].levelno == logging.WARNING
+    assert records[0].exc_info is not None

@@ -1,0 +1,902 @@
+"""haiku-ingester CLI: exercises every subcommand via CliRunner with
+IngesterApp / open_queue patched out so no real ingestion runs."""
+
+import subprocess
+import sys
+from contextlib import closing, contextmanager
+from datetime import UTC, datetime
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+import yaml
+from typer.testing import CliRunner
+
+from haiku.rag.config import AppConfig, QueueConfig
+from haiku.rag.config.models import LanceDBConfig
+from haiku.rag.ingester.app import BatchProgress, BatchReport, FailedDatabase
+from haiku.rag.ingester.batch import (
+    BatchChange,
+    BatchDryRunReport,
+    BatchManifest,
+    BatchSourceSummary,
+)
+from haiku.rag.ingester.cli import _cli as cli
+from haiku.rag.ingester.cli import _resolve_queue_config
+from haiku.rag.ingester.cli import cli as ingester_cli
+from haiku.rag.ingester.exceptions import DuplicateSourceError, NoDatabaseStartedError
+from haiku.rag.ingester.queue.db import SCHEMA_VERSION
+from haiku.rag.ingester.queue.models import JobOp, JobStatus
+from haiku.rag.store.exceptions import (
+    AmbiguousDatabaseError,
+    ConfigMismatchError,
+    MigrationRequiredError,
+    ReadOnlyError,
+    SourceUnavailableError,
+    UnknownDatabaseError,
+    UpgradeRequiredError,
+)
+from tests.conftest import TRACEPARENT, current_trace
+from tests.platform import requires_symlinks
+
+runner = CliRunner()
+
+
+def test_importing_ingester_cli_does_not_load_heavy_dependencies():
+    """Importing the CLI must not pull the heavy runtime dependencies; they cost
+    seconds of startup. Runs in a subprocess because another test in the same
+    session may already have imported them."""
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import haiku.rag.ingester.cli, sys; "
+            "loaded = {'lancedb', 'pyarrow', 'pydantic_ai'} & sys.modules.keys(); "
+            "assert not loaded, loaded",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+# --- helpers ---
+
+
+@contextmanager
+def _progress_context(callback):
+    yield callback
+
+
+def _config_with_queue(queue: QueueConfig):
+    config = MagicMock()
+    config.ingester.queue = queue
+    return config
+
+
+def _fake_app(report: BatchReport, monkeypatch) -> AsyncMock:
+    fake = AsyncMock()
+    fake.run_batch.return_value = report
+    monkeypatch.setattr("haiku.rag.ingester.app.IngesterApp", lambda **_: fake)
+    return fake
+
+
+def _manifest() -> BatchManifest:
+    now = datetime(2026, 6, 22, 10, 30, tzinfo=UTC)
+    return BatchManifest(
+        generated_at=now,
+        sources=[
+            BatchSourceSummary(
+                source_id="docs",
+                upsert_count=1,
+                delete_count=1,
+                unchanged_count=2,
+            )
+        ],
+        changes=[
+            BatchChange(
+                op=JobOp.UPSERT,
+                source_id="docs",
+                uri="file:///a.md",
+                revision="r1",
+                discovered_at=now,
+            ),
+            BatchChange(
+                op=JobOp.DELETE,
+                source_id="docs",
+                uri="file:///gone.md",
+                discovered_at=now,
+            ),
+        ],
+    )
+
+
+def _fake_dry_run_app(report: BatchDryRunReport, monkeypatch) -> AsyncMock:
+    fake = AsyncMock()
+    fake.run_batch_dry_run.return_value = report
+    monkeypatch.setattr("haiku.rag.ingester.app.IngesterApp", lambda **_: fake)
+    return fake
+
+
+def _fake_manifest_app(report: BatchReport, monkeypatch) -> AsyncMock:
+    fake = AsyncMock()
+    fake.run_batch_from_manifest.return_value = report
+    monkeypatch.setattr("haiku.rag.ingester.app.IngesterApp", lambda **_: fake)
+    return fake
+
+
+def _write_manifest(path) -> None:
+    path.write_text(yaml.safe_dump(_manifest().model_dump(mode="json")))
+
+
+def test_a_server_queue_without_a_namespace_exits_one(tmp_path, monkeypatch, capsys):
+    config_file = tmp_path / "haiku.rag.yaml"
+    config_file.write_text(
+        "ingester:\n  queue:\n    dburi: postgresql+asyncpg://u:p@host/db\n"
+        "  databases:\n"
+        f"    haiku.rag: {{sources: [{{type: fs, root: {tmp_path}}}]}}\n"
+    )
+    import haiku.rag.config as config_module
+
+    monkeypatch.setattr(config_module, "_config", None)
+    monkeypatch.setattr(sys, "argv", ["haiku-ingester", "run-batch"])
+    monkeypatch.setenv("HAIKU_RAG_CONFIG_PATH", str(config_file))
+
+    with pytest.raises(SystemExit) as exit_info:
+        ingester_cli()
+
+    assert exit_info.value.code == 1
+    assert "Error: ingester.queue.namespace is required" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "selection, statuses",
+    [
+        ("dead", {JobStatus.DEAD}),
+        ("rejected", {JobStatus.REJECTED}),
+        ("all", {JobStatus.DEAD, JobStatus.REJECTED}),
+    ],
+)
+def test_run_batch_retry_names_the_statuses_to_retry(monkeypatch, selection, statuses):
+    fake = _fake_app(BatchReport(succeeded=2, retried=2), monkeypatch)
+
+    result = runner.invoke(cli, ["run-batch", "--retry", selection])
+
+    assert result.exit_code == 0
+    assert fake.run_batch.await_args.kwargs["retry"] == statuses
+    assert "Retried 2 job(s)\nBatch complete: 2 succeeded" in result.output
+
+
+def test_run_batch_without_retry_retries_nothing(monkeypatch):
+    fake = _fake_app(BatchReport(succeeded=1), monkeypatch)
+
+    result = runner.invoke(cli, ["run-batch"])
+
+    assert result.exit_code == 0
+    assert fake.run_batch.await_args.kwargs["retry"] == set()
+    assert "Retried" not in result.output
+
+
+@pytest.mark.parametrize("other", [["--dry-run"], ["--manifest", "m.yaml"]])
+def test_run_batch_retry_refuses_a_dry_run_or_a_manifest(monkeypatch, other):
+    fake = _fake_app(BatchReport(), monkeypatch)
+
+    result = runner.invoke(cli, ["run-batch", "--retry", "dead", *other])
+
+    assert result.exit_code == 2
+    assert f"--retry cannot be combined with {other[0]}" in result.output
+    fake.run_batch.assert_not_awaited()
+
+
+def test_run_batch_passes_progress_callback_when_enabled(monkeypatch):
+    fake = AsyncMock()
+
+    async def _run_batch(*, retry, progress_callback):
+        progress_callback(BatchProgress(total=1, completed=1, succeeded=1))
+        return BatchReport(succeeded=1, dead=0)
+
+    fake.run_batch.side_effect = _run_batch
+    monkeypatch.setattr("haiku.rag.ingester.app.IngesterApp", lambda **_: fake)
+    monkeypatch.setattr(
+        "haiku.rag.ingester.cli._batch_progress",
+        lambda _: _progress_context(lambda snapshot: None),
+    )
+
+    result = runner.invoke(cli, ["run-batch"])
+
+    assert result.exit_code == 0
+    fake.run_batch.assert_awaited_once()
+    assert "1 succeeded, 0 dead" in result.output
+
+
+def _run_batch_in(mode: str, report: BatchReport, monkeypatch, tmp_path):
+    if mode == "batch":
+        _fake_app(report, monkeypatch)
+        return runner.invoke(cli, ["run-batch"])
+    manifest_path = tmp_path / "manifest.yaml"
+    _write_manifest(manifest_path)
+    _fake_manifest_app(report, monkeypatch)
+    return runner.invoke(cli, ["run-batch", "--manifest", str(manifest_path)])
+
+
+_BATCH_MODES = pytest.mark.parametrize(
+    "mode, complete",
+    [("batch", "Batch complete"), ("manifest", "Manifest batch complete")],
+)
+
+
+@_BATCH_MODES
+def test_run_batch_exits_nonzero_when_dead(monkeypatch, tmp_path, mode, complete):
+    result = _run_batch_in(
+        mode, BatchReport(succeeded=1, dead=2), monkeypatch, tmp_path
+    )
+
+    assert result.exit_code == 1
+    assert "2 dead" in result.output
+
+
+@_BATCH_MODES
+def test_run_batch_exits_zero_on_rejections_alone(
+    monkeypatch, tmp_path, mode, complete
+):
+    result = _run_batch_in(
+        mode, BatchReport(succeeded=1, dead=0, rejected=2), monkeypatch, tmp_path
+    )
+
+    assert result.exit_code == 0
+    assert f"{complete}: 1 succeeded, 0 dead, 2 rejected" in result.output
+
+
+@_BATCH_MODES
+def test_run_batch_exits_nonzero_naming_a_skipped_database(
+    monkeypatch, tmp_path, mode, complete
+):
+    report = BatchReport(
+        succeeded=2,
+        failed_databases=[FailedDatabase(database="wiki", error="needs a migration")],
+    )
+
+    result = _run_batch_in(mode, report, monkeypatch, tmp_path)
+
+    assert result.exit_code == 1
+    assert f"{complete}: 2 succeeded" in result.output
+    assert "Databases that failed to start: wiki (needs a migration)" in result.output
+
+
+@_BATCH_MODES
+def test_run_batch_exits_nonzero_naming_a_failed_maintenance(
+    monkeypatch, tmp_path, mode, complete
+):
+    report = BatchReport(
+        succeeded=2,
+        failed_maintenance=[FailedDatabase(database="wiki", error="disk full")],
+    )
+
+    result = _run_batch_in(mode, report, monkeypatch, tmp_path)
+
+    assert result.exit_code == 1
+    assert f"{complete}: 2 succeeded" in result.output
+    assert "Databases that failed maintenance: wiki (disk full)" in result.output
+
+
+def test_run_batch_exits_nonzero_when_sweep_fails(monkeypatch):
+    _fake_app(BatchReport(succeeded=2, dead=0, failed_sweeps=["docs"]), monkeypatch)
+
+    result = runner.invoke(cli, ["run-batch"])
+
+    assert result.exit_code == 1
+    assert "failed to sweep: docs" in result.output
+
+
+def test_run_batch_dry_run_writes_default_manifest(monkeypatch, tmp_path):
+    fake = _fake_dry_run_app(
+        BatchDryRunReport(manifest=_manifest()),
+        monkeypatch,
+    )
+
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        result = runner.invoke(cli, ["run-batch", "--dry-run"])
+
+        assert result.exit_code == 0
+        assert "Dry run complete: 1 upsert, 1 delete, 2 unchanged -> manifest-" in (
+            result.output
+        )
+        written = list(tmp_path.glob("*/manifest-*.yaml"))
+        assert len(written) == 1
+        data = yaml.safe_load(written[0].read_text())
+
+    assert data["version"] == 1
+    assert data["sources"][0]["source_id"] == "docs"
+    assert [change["op"] for change in data["changes"]] == ["upsert", "delete"]
+    fake.run_batch_dry_run.assert_awaited_once()
+    fake.run_batch.assert_not_awaited()
+
+
+def test_run_batch_dry_run_writes_explicit_output(monkeypatch, tmp_path):
+    output = tmp_path / "custom.yaml"
+    _fake_dry_run_app(BatchDryRunReport(manifest=_manifest()), monkeypatch)
+
+    result = runner.invoke(
+        cli,
+        ["run-batch", "--dry-run", "--output", str(output)],
+    )
+
+    assert result.exit_code == 0
+    assert f"-> {output}" in result.output
+    data = yaml.safe_load(output.read_text())
+    assert data["changes"][0]["uri"] == "file:///a.md"
+
+
+def test_run_batch_dry_run_exits_nonzero_when_sweep_fails(monkeypatch, tmp_path):
+    output = tmp_path / "failed.yaml"
+    _fake_dry_run_app(
+        BatchDryRunReport(manifest=_manifest(), failed_sweeps=["docs"]),
+        monkeypatch,
+    )
+
+    result = runner.invoke(
+        cli,
+        ["run-batch", "--dry-run", "--output", str(output)],
+    )
+
+    assert result.exit_code == 1
+    assert "failed to sweep: docs" in result.output
+    assert not output.exists()
+
+
+def test_run_batch_manifest_replays_manifest(monkeypatch, tmp_path):
+    manifest_path = tmp_path / "manifest.yaml"
+    _write_manifest(manifest_path)
+    fake = _fake_manifest_app(BatchReport(succeeded=2, dead=0), monkeypatch)
+
+    result = runner.invoke(cli, ["run-batch", "--manifest", str(manifest_path)])
+
+    assert result.exit_code == 0
+    assert "Manifest batch complete: 2 succeeded, 0 dead" in result.output
+    fake.run_batch_from_manifest.assert_awaited_once()
+    loaded = fake.run_batch_from_manifest.await_args.args[0]
+    assert isinstance(loaded, BatchManifest)
+    assert loaded.changes[0].uri == "file:///a.md"
+    fake.run_batch.assert_not_awaited()
+    fake.run_batch_dry_run.assert_not_awaited()
+
+
+def test_run_batch_manifest_passes_progress_callback(monkeypatch, tmp_path):
+    manifest_path = tmp_path / "manifest.yaml"
+    _write_manifest(manifest_path)
+    fake = AsyncMock()
+
+    async def _run_manifest(_manifest, *, progress_callback):
+        progress_callback(BatchProgress(total=1, completed=1, succeeded=1))
+        return BatchReport(succeeded=1, dead=0)
+
+    fake.run_batch_from_manifest.side_effect = _run_manifest
+    monkeypatch.setattr("haiku.rag.ingester.app.IngesterApp", lambda **_: fake)
+    monkeypatch.setattr(
+        "haiku.rag.ingester.cli._batch_progress",
+        lambda _: _progress_context(lambda snapshot: None),
+    )
+
+    result = runner.invoke(cli, ["run-batch", "--manifest", str(manifest_path)])
+
+    assert result.exit_code == 0
+    fake.run_batch_from_manifest.assert_awaited_once()
+    assert "1 succeeded, 0 dead" in result.output
+
+
+def test_run_batch_manifest_reports_validation_error(monkeypatch, tmp_path):
+    manifest_path = tmp_path / "manifest.yaml"
+    _write_manifest(manifest_path)
+    fake = AsyncMock()
+    fake.run_batch_from_manifest.side_effect = ValueError("bad manifest")
+    monkeypatch.setattr("haiku.rag.ingester.app.IngesterApp", lambda **_: fake)
+
+    result = runner.invoke(cli, ["run-batch", "--manifest", str(manifest_path)])
+
+    assert result.exit_code == 1
+    assert "Error: bad manifest" in result.output
+
+
+def test_run_batch_manifest_conflicts_with_dry_run(tmp_path):
+    manifest_path = tmp_path / "manifest.yaml"
+    _write_manifest(manifest_path)
+
+    result = runner.invoke(
+        cli, ["run-batch", "--manifest", str(manifest_path), "--dry-run"]
+    )
+
+    assert result.exit_code != 0
+    assert "--manifest cannot be combined with --dry-run" in result.output
+
+
+def test_run_batch_manifest_conflicts_with_output(tmp_path):
+    manifest_path = tmp_path / "manifest.yaml"
+    _write_manifest(manifest_path)
+
+    result = runner.invoke(
+        cli,
+        [
+            "run-batch",
+            "--manifest",
+            str(manifest_path),
+            "--output",
+            str(tmp_path / "out.yaml"),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "--output is only valid with --dry-run" in result.output
+
+
+def test_run_batch_output_requires_dry_run(tmp_path):
+    result = runner.invoke(
+        cli,
+        ["run-batch", "--output", str(tmp_path / "out.yaml")],
+    )
+
+    assert result.exit_code != 0
+    assert "--output is only valid with --dry-run" in result.output
+
+
+def test_resolve_queue_config_keeps_dburi_when_path_override_present(tmp_path):
+    queue = QueueConfig(
+        dburi="postgresql+asyncpg://user:pass@example.test/db",
+        path=tmp_path / "configured.db",
+    )
+    config = _config_with_queue(queue)
+
+    resolved = _resolve_queue_config(config, tmp_path / "override.db")
+
+    assert resolved is queue
+
+
+# --- serve ---
+
+
+def test_serve_invokes_app(monkeypatch):
+    fake = AsyncMock()
+    monkeypatch.setattr("haiku.rag.ingester.app.IngesterApp", lambda **_: fake)
+
+    result = runner.invoke(cli, ["serve", "--no-api"])
+
+    assert result.exit_code == 0
+    fake.serve.assert_awaited_once_with(api=False)
+
+
+def test_serve_passes_host_and_port(monkeypatch):
+    fake = AsyncMock()
+    captured = {}
+
+    def _capture(**kwargs):
+        captured.update(kwargs)
+        return fake
+
+    monkeypatch.setattr("haiku.rag.ingester.app.IngesterApp", _capture)
+
+    result = runner.invoke(cli, ["serve", "--host", "0.0.0.0", "--port", "9999"])
+
+    assert result.exit_code == 0
+    assert captured["config"].ingester.api.host == "0.0.0.0"
+    assert captured["config"].ingester.api.port == 9999
+
+
+def test_serve_passes_fd(monkeypatch):
+    captured = _captured_app(monkeypatch)
+
+    result = runner.invoke(cli, ["serve", "--fd", "3"])
+
+    assert result.exit_code == 0
+    assert captured["config"].ingester.api.fd == 3
+    assert captured["api_overrides"] == {"fd": 3}
+
+
+def test_serve_passes_root_path(monkeypatch):
+    fake = AsyncMock()
+    captured = {}
+
+    def _capture(**kwargs):
+        captured.update(kwargs)
+        return fake
+
+    monkeypatch.setattr("haiku.rag.ingester.app.IngesterApp", _capture)
+
+    result = runner.invoke(cli, ["serve", "--root-path", "/ingester/"])
+
+    assert result.exit_code == 0
+    # Assignment is normalized (trailing slash stripped) via validate_assignment.
+    assert captured["config"].ingester.api.root_path == "/ingester"
+
+
+def _captured_app(monkeypatch) -> dict:
+    captured = {}
+
+    def _capture(**kwargs):
+        captured.update(kwargs)
+        return AsyncMock()
+
+    monkeypatch.setattr("haiku.rag.ingester.app.IngesterApp", _capture)
+    return captured
+
+
+def test_serve_records_the_configuration_file_it_was_given(tmp_path, monkeypatch):
+    path = tmp_path / "custom.yaml"
+    path.write_text("{}", encoding="utf-8")
+    captured = _captured_app(monkeypatch)
+
+    result = runner.invoke(cli, ["--config", str(path), "serve", "--no-api"])
+
+    assert result.exit_code == 0
+    assert captured["config_path"] == path
+    assert captured["api_overrides"] == {}
+
+
+@requires_symlinks
+def test_serve_records_a_symlinked_configuration_file_as_the_link(
+    tmp_path, monkeypatch
+):
+    target = tmp_path / "v1.yaml"
+    target.write_text("{}", encoding="utf-8")
+    link = tmp_path / "haiku.rag.yaml"
+    link.symlink_to(target)
+    monkeypatch.chdir(tmp_path)
+    captured = _captured_app(monkeypatch)
+
+    result = runner.invoke(cli, ["--config", "haiku.rag.yaml", "serve", "--no-api"])
+
+    assert result.exit_code == 0
+    assert captured["config_path"] == link
+
+
+def test_serve_records_the_configuration_file_it_found(tmp_path, monkeypatch):
+    (tmp_path / "haiku.rag.yaml").write_text("{}", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HAIKU_RAG_CONFIG_PATH", raising=False)
+    captured = _captured_app(monkeypatch)
+
+    result = runner.invoke(cli, ["serve", "--no-api", "--port", "9999"])
+
+    assert result.exit_code == 0
+    assert captured["config_path"] == tmp_path / "haiku.rag.yaml"
+    assert captured["api_overrides"] == {"port": 9999}
+
+
+# --- queue init / migrate ---
+
+
+def _schema_version(path) -> int:
+    import sqlite3
+
+    with closing(sqlite3.connect(path)) as db:
+        return db.execute("SELECT version FROM schema_version").fetchone()[0]
+
+
+def test_queue_init(tmp_path):
+    db_path = tmp_path / "queue.db"
+    result = runner.invoke(cli, ["queue", "init", "--queue", str(db_path)])
+
+    assert result.exit_code == 0
+    assert "initialized" in result.output
+    assert _schema_version(db_path) == SCHEMA_VERSION
+
+
+def test_queue_migrate(tmp_path):
+    db_path = tmp_path / "queue.db"
+    result = runner.invoke(cli, ["queue", "migrate", "--queue", str(db_path)])
+
+    assert result.exit_code == 0
+    assert "up to date" in result.output
+    assert _schema_version(db_path) == SCHEMA_VERSION
+
+
+def test_queue_init_dburi_migrates_the_named_queue(tmp_path):
+    db_path = tmp_path / "named.db"
+    result = runner.invoke(
+        cli, ["queue", "init", "--dburi", f"sqlite+aiosqlite:///{db_path}"]
+    )
+
+    assert result.exit_code == 0
+    assert f"sqlite+aiosqlite:///{db_path}" in result.output
+    assert _schema_version(db_path) == SCHEMA_VERSION
+
+
+def test_queue_migrate_reads_dburi_from_the_environment(tmp_path, monkeypatch):
+    db_path = tmp_path / "named.db"
+    monkeypatch.setenv("HAIKU_RAG_QUEUE_DBURI", f"sqlite+aiosqlite:///{db_path}")
+    result = runner.invoke(cli, ["queue", "migrate"])
+
+    assert result.exit_code == 0
+    assert _schema_version(db_path) == SCHEMA_VERSION
+
+
+def test_queue_init_refuses_dburi_with_queue(tmp_path):
+    result = runner.invoke(
+        cli,
+        [
+            "queue",
+            "init",
+            "--dburi",
+            f"sqlite+aiosqlite:///{tmp_path / 'a.db'}",
+            "--queue",
+            str(tmp_path / "b.db"),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "--dburi cannot be combined with --queue" in result.output
+    assert not (tmp_path / "a.db").exists()
+    assert not (tmp_path / "b.db").exists()
+
+
+def test_queue_migrate_refuses_a_newer_schema(tmp_path, monkeypatch, capsys):
+    db_path = tmp_path / "queue.db"
+    assert runner.invoke(cli, ["queue", "init", "--queue", str(db_path)]).exit_code == 0
+    import sqlite3
+
+    with closing(sqlite3.connect(db_path)) as db, db:
+        db.execute("UPDATE schema_version SET version = 99")
+    monkeypatch.setattr(
+        sys, "argv", ["haiku-ingester", "queue", "migrate", "--queue", str(db_path)]
+    )
+
+    with pytest.raises(SystemExit) as exit_info:
+        ingester_cli()
+
+    assert exit_info.value.code == 1
+    assert "Error: queue at" in capsys.readouterr().err
+    assert _schema_version(db_path) == 99
+
+
+def test_queue_target_masks_dburi_password():
+    from haiku.rag.config import QueueConfig
+    from haiku.rag.ingester.cli import _queue_target
+
+    target = _queue_target(
+        QueueConfig(dburi="postgresql+asyncpg://user:secret@host:5432/db")
+    )
+    assert "secret" not in target
+    assert "***" in target
+    assert "user" in target and "host:5432/db" in target
+
+
+# --- config loading ---
+
+
+def test_load_config_with_explicit_path(tmp_path):
+    from haiku.rag.ingester.cli import _load_config_with_override
+
+    config_file = tmp_path / "test.yaml"
+    config_file.write_text("embeddings:\n  model:\n    provider: ollama\n")
+
+    config = _load_config_with_override(config_file)
+    assert config.embeddings.model.provider == "ollama"
+
+
+def test_load_config_falls_back_to_default(monkeypatch):
+    from haiku.rag.ingester.cli import _load_config_with_override, get_config
+
+    monkeypatch.setattr("haiku.rag.ingester.cli.find_config_file", lambda _: None)
+
+    config = _load_config_with_override(None)
+    assert config == get_config()
+
+
+# --- cli() entry point ---
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        AmbiguousDatabaseError("names a set"),
+        ConfigMismatchError("embedder drifted"),
+        MigrationRequiredError("need migration"),
+        UpgradeRequiredError("need a newer release"),
+        ReadOnlyError("read-only"),
+        SourceUnavailableError("papers would not open"),
+        UnknownDatabaseError("no such database"),
+        ImportError("docling is not installed"),
+        DuplicateSourceError("source id(s) a name several configured sources"),
+        NoDatabaseStartedError("every configured database failed to start"),
+    ],
+    ids=lambda e: type(e).__name__,
+)
+def test_cli_entry_point_exits_cleanly_on_known_errors(monkeypatch, capsys, error):
+    from haiku.rag.ingester.cli import cli as cli_entry
+
+    monkeypatch.setattr("haiku.rag.ingester.cli._cli", MagicMock(side_effect=error))
+    monkeypatch.setattr("haiku.rag.ingester.cli.configure_cli_logging", lambda: None)
+    monkeypatch.setattr("haiku.rag.telemetry.configure", lambda **_: None)
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli_entry()
+    assert exc_info.value.code == 1
+    assert f"Error: {error}" in capsys.readouterr().err
+
+
+class TestPlacingTheIngesterDatabases:
+    """The ingester writes every database `ingester.databases` names, where
+    `lancedb.databases` places it, or the one a name selects."""
+
+    @staticmethod
+    def _app(config: AppConfig, database_name=None):
+        from haiku.rag.ingester.app import IngesterApp
+
+        return IngesterApp(config=config, database_name=database_name)
+
+    @staticmethod
+    def _ingesting(databases: dict, ingested: list[str]) -> AppConfig:
+        return AppConfig.model_validate(
+            {
+                "lancedb": {"databases": databases},
+                "ingester": {
+                    "databases": {
+                        name: {
+                            "sources": [{"type": "fs", "id": name, "root": "/tmp/docs"}]
+                        }
+                        for name in ingested
+                    }
+                },
+            }
+        )
+
+    @staticmethod
+    def _placed(app) -> dict:
+        return {ref.name: ref.location for ref, _ in app._databases}
+
+    def test_each_ingested_database_is_placed_where_lancedb_puts_it(self, tmp_path):
+        config = self._ingesting(
+            {"prod": "s3://bucket/prod.lancedb", "docs": str(tmp_path / "docs")},
+            ["prod", "docs"],
+        )
+
+        assert self._placed(self._app(config)) == {
+            "prod": "s3://bucket/prod.lancedb",
+            "docs": tmp_path / "docs",
+        }
+
+    def test_each_database_gets_its_own_sources(self, tmp_path):
+        config = self._ingesting(
+            {"a": str(tmp_path / "a"), "b": str(tmp_path / "b")}, ["a", "b"]
+        )
+
+        app = self._app(config)
+
+        assert [
+            (ref.name, [source.id for source in sources])
+            for ref, sources in app._databases
+        ] == [("a", ["a"]), ("b", ["b"])]
+
+    def test_the_ingested_database_is_written_among_several_configured(self, tmp_path):
+        """A config shared with readers names other databases, a tagged one
+        included. The ingester writes the one its sources name."""
+        config = self._ingesting(
+            {
+                "papers": str(tmp_path / "papers.lancedb"),
+                "wiki": str(tmp_path / "wiki.lancedb"),
+                "release": {"location": str(tmp_path / "papers.lancedb"), "tag": "v1"},
+            },
+            ["wiki"],
+        )
+
+        assert list(self._placed(self._app(config))) == ["wiki"]
+
+    async def test_without_ingested_databases_a_batch_is_refused(self, tmp_path):
+        from haiku.rag.ingester.exceptions import NothingToIngestError
+
+        config = AppConfig(
+            lancedb=LanceDBConfig(
+                databases={
+                    "a": str(tmp_path / "a"),
+                    "b": {"location": str(tmp_path / "b"), "tag": "v1"},
+                }
+            )
+        )
+        app = self._app(config)
+
+        assert self._placed(app) == {}
+        for batch in (app.run_batch, app.run_batch_dry_run):
+            with pytest.raises(NothingToIngestError, match="ingester.databases"):
+                await batch()
+        with pytest.raises(NothingToIngestError, match="ingester.databases"):
+            await app.run_batch_from_manifest(
+                BatchManifest(generated_at=datetime.now(UTC))
+            )
+
+    @pytest.mark.parametrize(
+        "spellings, existing",
+        [
+            (lambda root: (str(root / "x"), str(root / "y" / ".." / "x")), False),
+            (lambda root: (str(root / "x"), str(root / "y" / ".." / "x")), True),
+            (lambda root: ("s3://bucket/x.lancedb", "s3://bucket/x.lancedb/"), False),
+            (
+                lambda root: (str(root / "x.lancedb"), (root / "x.lancedb").as_uri()),
+                False,
+            ),
+            (
+                lambda root: (
+                    "archive:2026.lancedb",
+                    str(root / "archive:2026.lancedb"),
+                ),
+                False,
+            ),
+        ],
+        ids=["path", "existing-directory", "uri", "file-uri", "relative-colon"],
+    )
+    def test_two_spellings_of_one_location_are_refused(
+        self, tmp_path, monkeypatch, spellings, existing
+    ):
+        from haiku.rag.store.exceptions import AmbiguousDatabaseError
+
+        monkeypatch.chdir(tmp_path)
+        if existing:
+            (tmp_path / "x").mkdir()
+        a, b = spellings(tmp_path)
+        config = self._ingesting({"a": a, "b": b}, ["a", "b"])
+
+        with pytest.raises(AmbiguousDatabaseError, match="'a' and 'b'"):
+            self._app(config)
+
+    def test_a_name_selects_one_database(self, tmp_path):
+        config = self._ingesting(
+            {"a": str(tmp_path / "a"), "b": str(tmp_path / "b")}, ["a", "b"]
+        )
+
+        app = self._app(config, "b")
+
+        assert list(self._placed(app)) == ["b"]
+
+    def test_a_shared_location_is_refused_whatever_is_selected(self, tmp_path):
+        from haiku.rag.store.exceptions import AmbiguousDatabaseError
+
+        config = self._ingesting(
+            {"a": str(tmp_path / "x"), "b": str(tmp_path / "x")}, ["a", "b"]
+        )
+
+        with pytest.raises(AmbiguousDatabaseError, match="'a' and 'b'"):
+            self._app(config, "a")
+
+
+def test_run_batch_db_name_selects_the_database(monkeypatch):
+    built = {}
+
+    def _app(**kwargs):
+        built.update(kwargs)
+        fake = AsyncMock()
+        fake.run_batch.return_value = BatchReport(succeeded=1)
+        return fake
+
+    monkeypatch.setattr("haiku.rag.ingester.app.IngesterApp", _app)
+
+    result = runner.invoke(cli, ["run-batch", "--db-name", "papers"])
+
+    assert result.exit_code == 0
+    assert built["database_name"] == "papers"
+
+
+@pytest.mark.parametrize("command", ["serve", "run-batch"])
+def test_db_path_is_no_ingester_option(command):
+    result = runner.invoke(cli, [command, "--db", "x.lancedb"])
+
+    assert result.exit_code == 2
+    assert "No such option" in result.output
+
+
+@pytest.mark.parametrize("command, joins", [("run-batch", True), ("serve", False)])
+def test_one_shot_commands_join_the_traceparent_trace(monkeypatch, command, joins):
+    seen: list[tuple[str, str]] = []
+
+    async def record(*_, **__):
+        seen.append(current_trace())
+        return BatchReport()
+
+    fake = MagicMock(run_batch=record, serve=record)
+    monkeypatch.setattr("haiku.rag.ingester.app.IngesterApp", lambda **_: fake)
+    monkeypatch.setenv("TRACEPARENT", TRACEPARENT)
+    monkeypatch.setenv("TRACESTATE", "vendor=value")
+    monkeypatch.setenv("LOGFIRE_DISTRIBUTED_TRACING", "false")
+
+    runner.invoke(cli, [command])
+
+    if joins:
+        assert seen == [("4bf92f3577b34da6a3ce929d0e0e4736", "vendor=value")]
+    else:
+        assert seen == [("0" * 32, "")]
+    assert current_trace() == ("0" * 32, "")

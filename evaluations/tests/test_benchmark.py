@@ -1,0 +1,1033 @@
+import json
+import os
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+import typer
+from typer.testing import CliRunner
+
+from evaluations.benchmark import (
+    _load_config,
+    _resolve_dataset,
+    evaluate_dataset,
+    require_telemetry,
+)
+from evaluations.config import DatasetSpec
+from evaluations.qa import run_qa_benchmark
+from haiku.rag.config.models import AppConfig, ModelConfig
+from tests.specs import stub_spec
+
+
+class TestResolveDataset:
+    def test_valid_dataset(self) -> None:
+        spec = _resolve_dataset("hotpotqa")
+        assert spec.key == "hotpotqa"
+
+    def test_case_insensitive(self) -> None:
+        spec = _resolve_dataset("HOTPOTQA")
+        assert spec.key == "hotpotqa"
+
+    def test_an_unknown_dataset_raises_listing_the_valid_ones(self) -> None:
+        with pytest.raises(
+            typer.BadParameter, match="Unknown dataset 'nonexistent'.*hotpotqa"
+        ):
+            _resolve_dataset("nonexistent")
+
+
+class TestConversationInputDispatch:
+    async def test_prefix_rides_as_message_history(self, tmp_path: Path) -> None:
+        """A ConversationInput case runs its prefix as message history and records its citation status."""
+        from dataclasses import dataclass
+
+        from pydantic_evals import Case
+        from pydantic_evals.evaluators import Evaluator, EvaluatorContext
+
+        from evaluations.capability_runner import CapabilityRunResult
+        from evaluations.config import ConversationInput, Turn
+
+        @dataclass
+        class AlwaysOne(Evaluator):
+            def evaluate(self, ctx: EvaluatorContext) -> float:
+                return 1.0
+
+        def build_case(idx: int, doc) -> Case:
+            return Case(
+                name="c1",
+                inputs=ConversationInput(
+                    turns=[
+                        Turn(speaker="user", text="q1"),
+                        Turn(speaker="agent", text="a1"),
+                        Turn(speaker="user", text="q2"),
+                    ]
+                ),
+                expected_output="ref",
+            )
+
+        spec = stub_spec(
+            qa_loader=lambda: [{"id": "t1"}],
+            qa_case_builder=build_case,
+            qa_evaluator=AlwaysOne(),
+        )
+
+        recorded: dict[str, object] = {}
+        with (
+            patch("evaluations.qa.get_model", return_value="fake-model"),
+            patch(
+                "evaluations.qa.set_eval_attribute",
+                side_effect=lambda key, value: recorded.__setitem__(key, value),
+            ),
+            patch(
+                "evaluations.qa.run_capability_question",
+                new_callable=AsyncMock,
+                return_value=CapabilityRunResult(
+                    answer="answer", citation_status="ungrounded"
+                ),
+            ) as run_question,
+        ):
+            await run_qa_benchmark(spec, AppConfig(), db_path=tmp_path / "test.lancedb")
+
+        assert run_question.await_args is not None
+        kwargs = run_question.await_args.kwargs
+        assert kwargs["question"] == "q2"
+        history = kwargs["message_history"]
+        assert len(history) == 2
+        assert history[0].parts[0].content == "q1"
+        assert history[1].parts[0].content == "a1"
+        assert recorded["citation_status"] == "ungrounded"
+
+
+class TestRefusalMetrics:
+    def _case(self, label: str | None, refused: bool | None) -> MagicMock:
+        case = MagicMock()
+        case.metadata = {"answerability": label} if label is not None else {}
+        case.assertions = (
+            {"refused": MagicMock(value=refused)} if refused is not None else {}
+        )
+        return case
+
+    def test_precision_and_recall(self) -> None:
+        from evaluations.qa import _refusal_metrics
+
+        cases = [
+            self._case("UNANSWERABLE", True),  # true refusal
+            self._case("UNANSWERABLE", False),  # missed refusal
+            self._case("ANSWERABLE", True),  # false refusal
+            self._case("ANSWERABLE", False),  # answered correctly
+            self._case("PARTIAL", None),  # skipped by the judge, no assertion
+            self._case(None, None),  # no label
+        ]
+
+        metrics = _refusal_metrics(cases)
+
+        assert metrics is not None
+        precision, recall, unanswerable, refusals = metrics
+        assert precision == 0.5  # 1 true refusal of 2 refusals
+        assert recall == 0.5  # 1 of 2 unanswerable turns refused
+        assert unanswerable == 2
+        assert refusals == 2
+
+    def test_none_when_no_judged_cases(self) -> None:
+        from evaluations.qa import _refusal_metrics
+
+        assert _refusal_metrics([self._case("PARTIAL", None)]) is None
+
+
+class TestFactsMetrics:
+    def _case(self, completeness: float | None, correct: bool | None) -> MagicMock:
+        case = MagicMock()
+        case.scores = (
+            {"answer_completeness": MagicMock(value=completeness)}
+            if completeness is not None
+            else {}
+        )
+        case.assertions = (
+            {"answer_equivalent": MagicMock(value=correct)}
+            if correct is not None
+            else {}
+        )
+        return case
+
+    def test_erb_score_is_completeness_of_correct_answers(self) -> None:
+        from evaluations.qa import _facts_metrics
+
+        cases = [
+            self._case(1.0, True),
+            self._case(0.5, True),
+            self._case(0.75, False),  # incorrect: erb_score 0
+            self._case(0.0, False),
+            self._case(None, True),  # no facts judged
+            self._case(0.5, None),  # correctness unjudged
+        ]
+
+        metrics = _facts_metrics(cases)
+
+        assert metrics is not None
+        completeness, erb_score, judged = metrics
+        assert completeness == (1.0 + 0.5 + 0.75 + 0.0) / 4
+        assert erb_score == (1.0 + 0.5) / 4
+        assert judged == 4
+
+    def test_none_when_no_case_has_facts(self) -> None:
+        from evaluations.qa import _facts_metrics
+
+        assert _facts_metrics([self._case(None, True)]) is None
+
+    async def test_qa_run_records_answer_completeness(self, tmp_path: Path) -> None:
+        import json
+
+        from pydantic_ai import ModelResponse, TextPart, ToolCallPart
+        from pydantic_ai.models.function import FunctionModel
+        from pydantic_evals import Case
+
+        from evaluations.capability_runner import CapabilityRunResult
+
+        def build_case(idx: int, doc) -> Case:
+            return Case(
+                name="c1",
+                inputs="q1",
+                expected_output="ref",
+                metadata={"question_id": "q1", "answer_facts": ["A.", "B."]},
+            )
+
+        spec = stub_spec(qa_loader=lambda: [{"id": "t1"}], qa_case_builder=build_case)
+        passing_judge = FunctionModel(
+            lambda messages, info: ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        info.output_tools[0].name,
+                        {"reason": "r", "pass": True, "score": 1.0},
+                    )
+                    if info.output_tools
+                    else TextPart("yes")
+                ]
+            )
+        )
+
+        with (
+            patch("evaluations.qa.get_model", return_value=passing_judge),
+            patch(
+                "evaluations.qa.run_capability_question",
+                new_callable=AsyncMock,
+                return_value=CapabilityRunResult(answer="answer"),
+            ),
+        ):
+            await run_qa_benchmark(
+                spec,
+                AppConfig(),
+                db_path=tmp_path / "test.lancedb",
+                results_dir=tmp_path / "results",
+            )
+
+        [results] = (tmp_path / "results").glob("*.jsonl")
+        [row] = [json.loads(line) for line in results.read_text().splitlines()]
+        assert row["passed"] is True
+        assert row["answer_completeness"] == 1.0
+
+
+class TestLiveSummary:
+    def _case(self, scores: dict[str, float | int]) -> MagicMock:
+        case = MagicMock()
+        case.scores = {key: MagicMock(value=value) for key, value in scores.items()}
+        return case
+
+    def test_micro_and_macro_aggregation(self) -> None:
+        from evaluations.qa import _live_summary
+
+        # Conversation A: 1/4 turns pass; B: 2/2 pass. Micro weights turns
+        # (3/6); macro averages conversations ((0.25 + 1.0) / 2).
+        cases = [
+            self._case(
+                {
+                    "turn_pass_rate": 0.25,
+                    "turns_passed": 1,
+                    "turns_judged": 4,
+                    "turns_total": 4,
+                    "cited_map": 0.5,
+                    "cited_eligible": 3,
+                    "true_refusals": 1,
+                    "false_refusals": 1,
+                    "unanswerable_turns": 2,
+                }
+            ),
+            self._case(
+                {
+                    "turn_pass_rate": 1.0,
+                    "turns_passed": 2,
+                    "turns_judged": 2,
+                    "turns_total": 2,
+                    "cited_map": 1.0,
+                    "cited_eligible": 1,
+                    "true_refusals": 0,
+                    "false_refusals": 0,
+                    "unanswerable_turns": 0,
+                }
+            ),
+        ]
+
+        failure = MagicMock()
+        failure.inputs = ["fq1", "fq2", "fq3"]
+        summary = _live_summary(cases, [failure])
+
+        assert summary is not None
+        assert summary["conversations"] == 2
+        assert summary["conversations_attempted"] == 3
+        assert summary["turns_total"] == 6
+        assert summary["turns_judged"] == 6
+        assert summary["turns_attempted"] == 9
+        assert summary["micro_pass_rate"] == pytest.approx(0.5)
+        assert summary["macro_pass_rate"] == pytest.approx(0.625)
+        assert summary["cited_eligible"] == 4
+        assert summary["cited_map_micro"] == pytest.approx((0.5 * 3 + 1.0 * 1) / 4)
+        assert summary["cited_map_macro"] == pytest.approx(0.75)
+        assert summary["refusal_precision"] == pytest.approx(0.5)
+        assert summary["refusal_recall"] == pytest.approx(0.5)
+
+    def test_none_without_scored_cases(self) -> None:
+        from evaluations.qa import _live_summary
+
+        assert _live_summary([self._case({})], []) is None
+
+    def test_macro_rate_excludes_fully_unjudged_conversations(self) -> None:
+        """A conversation whose every turn lost its judge reports
+        turn_pass_rate 0.0; treating that as a failed conversation would
+        contradict the exclusion policy. It must not enter the macro average."""
+        from evaluations.qa import _live_summary
+
+        cases = [
+            self._case(
+                {
+                    "turn_pass_rate": 1.0,
+                    "turns_passed": 2,
+                    "turns_judged": 2,
+                    "turns_total": 2,
+                    "cited_eligible": 0,
+                    "true_refusals": 0,
+                    "false_refusals": 0,
+                    "unanswerable_turns": 0,
+                }
+            ),
+            self._case(
+                {
+                    "turn_pass_rate": 0.0,
+                    "turns_passed": 0,
+                    "turns_judged": 0,  # total judge outage for this conversation
+                    "turns_total": 8,
+                    "cited_eligible": 0,
+                    "true_refusals": 0,
+                    "false_refusals": 0,
+                    "unanswerable_turns": 0,
+                }
+            ),
+        ]
+
+        summary = _live_summary(cases, [])
+
+        assert summary is not None
+        assert summary["macro_pass_rate"] == pytest.approx(1.0)
+        assert summary["micro_pass_rate"] == pytest.approx(1.0)
+        assert summary["turns_judged"] == 2
+        assert summary["turns_total"] == 10
+
+
+class TestLiveConversationDispatch:
+    async def test_live_replays_and_records_per_turn_traffic_arrays(
+        self, tmp_path: Path
+    ) -> None:
+        """The conversation replays with its settings and records per-turn tool traffic as arrays."""
+        from pydantic_evals import Case
+
+        from evaluations.benchmark import run_live_qa_benchmark
+        from evaluations.capability_runner import CapabilityRunResult
+
+        def build_case(idx: int, doc) -> Case:
+            return Case(
+                name="conv1",
+                inputs=["q1", "q2"],
+                metadata={
+                    "conversation_id": "conv1",
+                    "turns": [
+                        {"reference": "r1", "answerability": "ANSWERABLE"},
+                        {"reference": "r2", "answerability": "ANSWERABLE"},
+                    ],
+                },
+            )
+
+        spec = stub_spec(
+            key="test_live",
+            qa_loader=lambda: [{"id": "conv1"}],
+            qa_case_builder=build_case,
+            live=True,
+            compaction=True,
+        )
+
+        turn_results = [
+            CapabilityRunResult(
+                answer="a1",
+                cited_uris=["u1"],
+                n_search_calls=2,
+                n_rejected_searches=1,
+                n_failed_tools=1,
+                n_executions=3,
+                n_requests=4,
+                citation_status="grounded",
+            ),
+            CapabilityRunResult(answer="a2"),
+        ]
+        recorded: dict[str, object] = {}
+
+        with (
+            patch("evaluations.qa.get_model", return_value="fake-model"),
+            patch(
+                "evaluations.qa.set_eval_attribute",
+                side_effect=lambda key, value: recorded.__setitem__(key, value),
+            ),
+            patch(
+                "evaluations.qa.run_capability_conversation",
+                new_callable=AsyncMock,
+                return_value=turn_results,
+            ) as run_conversation,
+            patch(
+                "evaluations.evaluators.conversation.judge_input_output_expected",
+                new_callable=AsyncMock,
+                return_value=MagicMock(score=None, pass_=True, reason=None),
+            ),
+            patch(
+                "evaluations.evaluators.conversation.judge_output",
+                new_callable=AsyncMock,
+                return_value=MagicMock(score=None, pass_=False, reason=None),
+            ),
+        ):
+            await run_live_qa_benchmark(
+                spec,
+                AppConfig(),
+                db_path=tmp_path / "test.lancedb",
+                document_filter="uri = 'manual.pdf'",
+            )
+
+        assert run_conversation.await_args is not None
+        assert run_conversation.await_args.kwargs["questions"] == ["q1", "q2"]
+        assert run_conversation.await_args.kwargs["compaction"] is True
+        assert (
+            run_conversation.await_args.kwargs["document_filter"]
+            == "uri = 'manual.pdf'"
+        )
+        assert recorded["turn_n_search_calls"] == [2, 0]
+        assert recorded["turn_n_rejected_searches"] == [1, 0]
+        assert recorded["turn_n_failed_tools"] == [1, 0]
+        assert recorded["turn_n_executions"] == [3, 0]
+        assert recorded["turn_n_requests"] == [4, 0]
+        assert recorded["turn_citation_status"] == ["grounded", None]
+        questions = 2
+        for key, value in recorded.items():
+            if key.startswith("turn_"):
+                assert isinstance(value, list) and len(value) == questions, key
+
+
+class TestResolveDatasets:
+    def test_all_dedupes_shared_databases(self) -> None:
+        """Specs sharing a db_filename (mtrag query variants) appear once, so
+        `download all`/`upload all` do not process the same DB twice."""
+        from evaluations.benchmark import _resolve_datasets
+
+        specs = _resolve_datasets("all")
+        filenames = [spec.db_filename for spec in specs]
+        assert len(filenames) == len(set(filenames))
+        assert "mtrag_clapnq.lancedb" in filenames
+
+    def test_single_key_not_deduped(self) -> None:
+        from evaluations.benchmark import _resolve_datasets
+
+        specs = _resolve_datasets("mtrag_clapnq_rewrite")
+        assert [spec.key for spec in specs] == ["mtrag_clapnq_rewrite"]
+
+
+class TestLoadConfig:
+    def test_explicit_path(self, tmp_path: Path) -> None:
+        config_file = tmp_path / "test.yaml"
+        config_file.write_text("search:\n  limit: 42\n")
+        config = _load_config(config_file)
+        assert config.search.limit == 42
+
+    def test_explicit_path_not_found(self, tmp_path: Path) -> None:
+        with pytest.raises(typer.BadParameter, match="Config file not found"):
+            _load_config(tmp_path / "nonexistent.yaml")
+
+    def test_none_falls_back_to_find_config(self, tmp_path: Path) -> None:
+        config_file = tmp_path / "haiku.rag.yaml"
+        config_file.write_text("search:\n  limit: 99\n")
+        with patch("evaluations.benchmark.find_config_file", return_value=config_file):
+            config = _load_config(None)
+        assert config.search.limit == 99
+
+    def test_none_no_config_uses_defaults(self) -> None:
+        with patch("evaluations.benchmark.find_config_file", return_value=None):
+            config = _load_config(None)
+        assert config == AppConfig()
+
+
+class TestRunQaBenchmarkJudgeModel:
+    @pytest.mark.parametrize(
+        "judge_model", [ModelConfig(provider="openai", name="gpt-4o"), None]
+    )
+    async def test_judges_with_the_given_or_pinned_model(
+        self, tmp_path: Path, judge_model: ModelConfig | None
+    ) -> None:
+        import evaluations.qa as qa_module
+        from evaluations.experiment import DEFAULT_JUDGE_MODEL
+
+        with (
+            patch("evaluations.qa.get_model") as mock_get_model,
+            patch("evaluations.qa.run_capability_question", new_callable=AsyncMock),
+        ):
+            mock_get_model.return_value = "fake-model"
+            await run_qa_benchmark(
+                stub_spec(),
+                AppConfig(),
+                db_path=tmp_path / "test.lancedb",
+                judge_model=judge_model,
+            )
+
+        mock_get_model.assert_any_call(judge_model or DEFAULT_JUDGE_MODEL, AppConfig())
+        # The capability manages its own client, so the QA runner opens none.
+        assert not hasattr(qa_module, "HaikuRAG")
+
+    def test_pinned_judge_avoids_greedy_decoding(self) -> None:
+        from evaluations.experiment import DEFAULT_JUDGE_MODEL
+
+        assert DEFAULT_JUDGE_MODEL.temperature == 0.6
+        assert DEFAULT_JUDGE_MODEL.name == "qwen3.8"
+        assert DEFAULT_JUDGE_MODEL.max_tokens == 16384
+        assert DEFAULT_JUDGE_MODEL.extra_body == {"top_p": 0.95}
+
+
+async def test_a_db_path_beside_configured_databases_is_refused(tmp_path) -> None:
+    """`--db` places the database where the configuration places none; beside
+    `lancedb.databases` the run refuses before touching anything."""
+    from haiku.rag.config.models import LanceDBConfig
+
+    config = AppConfig(
+        lancedb=LanceDBConfig(databases={"alpha": str(tmp_path / "a.lancedb")})
+    )
+    with pytest.raises(ValueError, match="alpha"):
+        await evaluate_dataset(
+            spec=stub_spec(),
+            config=config,
+            skip_db=True,
+            skip_retrieval=True,
+            skip_qa=True,
+            limit=None,
+            name=None,
+            db_path=tmp_path / "other.lancedb",
+        )
+
+
+class TestCapabilityModel:
+    async def test_the_capability_runs_on_qa_model(self, tmp_path: Path) -> None:
+        from evaluations.qa import _prepare_qa_run
+
+        spec = stub_spec()
+        config = AppConfig()
+        config.qa.model = ModelConfig(
+            provider="openai", name="served", base_url="http://gpu:8000/v1"
+        )
+        with patch("evaluations.qa.get_model") as mock_get_model:
+            run = await _prepare_qa_run(
+                spec, config, None, None, tmp_path / "test.lancedb", None, None, None
+            )
+        mock_get_model.assert_called_once_with(config.qa.model, config)
+        assert run.experiment_metadata["capability_model"] == "served"
+        assert run.experiment_metadata["db_path"] == str(tmp_path / "test.lancedb")
+
+
+class TestCitationEvaluatorWiring:
+    def test_specs_with_retrieval_declare_citation_evaluator(self) -> None:
+        """Citation scoring is declared per spec, not inferred: every dataset
+        that scores retrieval also scores citations."""
+        from evaluations.datasets import DATASETS
+        from evaluations.evaluators import CitationMAPEvaluator
+
+        for spec in DATASETS.values():
+            if spec.retrieval_evaluators:
+                assert isinstance(spec.citation_evaluator, CitationMAPEvaluator), (
+                    spec.key
+                )
+
+
+class TestAttachRelevantUris:
+    def test_joins_by_question(self) -> None:
+        from pydantic_evals import Case
+
+        from evaluations.config import RetrievalSample
+        from evaluations.evaluators import MAPEvaluator
+        from evaluations.qa import _attach_relevant_uris
+
+        cases: list[Case[str, str, dict]] = [
+            Case(name="c1", inputs="What is X?", expected_output="X is a thing"),
+            Case(
+                name="c2",
+                inputs="What is Y?",
+                expected_output="Y is another",
+                metadata={"existing": "value"},
+            ),
+            Case(
+                name="c3",
+                inputs="What is Z?",
+                expected_output="not in retrieval set",
+            ),
+        ]
+
+        spec = stub_spec(
+            retrieval_loader=lambda: [
+                {"q": "What is X?", "uris": ("uri-x",)},
+                {"q": "What is Y?", "uris": ("uri-y1", "uri-y2")},
+            ],
+            retrieval_mapper=lambda d: RetrievalSample(
+                question=d["q"], expected_uris=d["uris"]
+            ),
+            retrieval_evaluators=[MAPEvaluator()],
+        )
+
+        _attach_relevant_uris(cases, spec, limit=None)
+
+        assert cases[0].metadata == {"relevant_uris": ["uri-x"]}
+        assert cases[1].metadata == {
+            "existing": "value",
+            "relevant_uris": ["uri-y1", "uri-y2"],
+        }
+        # case c3 has no matching retrieval sample — metadata untouched
+        assert cases[2].metadata is None
+
+    def test_no_op_without_retrieval_loader(self) -> None:
+        from pydantic_evals import Case
+
+        from evaluations.qa import _attach_relevant_uris
+
+        cases: list[Case[str, str, dict]] = [
+            Case(name="c1", inputs="q", expected_output="a"),
+        ]
+        _attach_relevant_uris(cases, stub_spec(), limit=None)
+        assert cases[0].metadata is None
+
+
+class TestFilterQaCorpus:
+    def test_keeps_only_matching_ids(self) -> None:
+        from datasets import Dataset
+
+        from evaluations.qa import _filter_qa_corpus
+
+        corpus = Dataset.from_list(
+            [{"id": "a", "q": 1}, {"id": "b", "q": 2}, {"id": "c", "q": 3}]
+        )
+        out = _filter_qa_corpus(corpus, {"a", "c"})
+        assert [r["id"] for r in out] == ["a", "c"]
+
+    def test_none_returns_corpus_unchanged(self) -> None:
+        from datasets import Dataset
+
+        from evaluations.qa import _filter_qa_corpus
+
+        corpus = Dataset.from_list([{"id": "a"}])
+        assert _filter_qa_corpus(corpus, None) is corpus
+
+    def test_matches_the_named_id_field(self) -> None:
+        from datasets import Dataset
+
+        from evaluations.qa import _filter_qa_corpus
+
+        corpus = Dataset.from_list(
+            [{"question_id": "a"}, {"question_id": "b"}, {"question_id": "c"}]
+        )
+        out = _filter_qa_corpus(corpus, {"a", "c"}, id_key="question_id")
+        assert out["question_id"] == ["a", "c"]
+
+    def test_an_id_set_matching_nothing_raises(self) -> None:
+        from datasets import Dataset
+
+        from evaluations.qa import _filter_qa_corpus
+
+        corpus = Dataset.from_list([{"query_id": "a"}, {"query_id": "b"}])
+
+        with pytest.raises(ValueError, match="matched none"):
+            _filter_qa_corpus(corpus, {"a"})
+
+    def test_enterprise_rag_filters_on_question_id(self) -> None:
+        from evaluations.datasets.enterprise_rag import ENTERPRISE_RAG_SPEC
+
+        assert ENTERPRISE_RAG_SPEC.case_id_key == "question_id"
+
+
+class TestLoadCaseIds:
+    def test_reads_strips_and_drops_blanks(self, tmp_path: Path) -> None:
+        from evaluations.benchmark import _load_case_ids
+
+        f = tmp_path / "ids.txt"
+        f.write_text("finqa_dev_16\n  finqa_dev_66 \n\n\nfinqa_dev_113\n")
+        assert _load_case_ids(f) == {"finqa_dev_16", "finqa_dev_66", "finqa_dev_113"}
+
+    def test_none_path_returns_none(self) -> None:
+        from evaluations.benchmark import _load_case_ids
+
+        assert _load_case_ids(None) is None
+
+
+class TestRetrievalTarget:
+    def _spec(self) -> DatasetSpec:
+        from evaluations.config import RetrievalSample
+        from evaluations.evaluators import MAPEvaluator
+
+        return stub_spec(
+            retrieval_loader=lambda: [{"q": "What is X?", "uris": ("uri-x",)}],
+            retrieval_mapper=lambda d: RetrievalSample(
+                question=d["q"], expected_uris=d["uris"]
+            ),
+            retrieval_evaluators=[MAPEvaluator()],
+        )
+
+    async def test_scores_from_search_results_without_reading_documents(
+        self, tmp_path: Path
+    ) -> None:
+        from evaluations.benchmark import run_retrieval_benchmark
+        from haiku.rag.store.models.chunk import SearchResult
+
+        searches: list[dict] = []
+
+        class FakeRag:
+            async def search(self, **kwargs) -> list[SearchResult]:
+                searches.append(kwargs)
+                return [
+                    SearchResult(
+                        content="x",
+                        score=1.0,
+                        document_id="doc-1",
+                        document_uri="uri-x",
+                    )
+                ]
+
+            async def get_document_by_id(self, document_id: str) -> None:
+                raise AssertionError(
+                    "retrieval scoring must not read whole document rows"
+                )
+
+        fake = FakeRag()
+        with patch("evaluations.retrieval.HaikuRAG") as mock_haiku:
+            mock_haiku.return_value.__aenter__.return_value = fake
+            result = await run_retrieval_benchmark(
+                self._spec(),
+                AppConfig(),
+                db_path=tmp_path / "test.lancedb",
+                document_filter="uri LIKE '%arxiv%'",
+            )
+
+        assert result is not None
+        assert result["map"] == 1.0
+        assert searches[0]["include_images"] is False
+        assert searches[0]["filter"] == "uri LIKE '%arxiv%'"
+
+    async def test_records_the_corpus_fingerprint(self, tmp_path: Path) -> None:
+        from pydantic_evals import Dataset as EvalDataset
+
+        from evaluations.benchmark import run_retrieval_benchmark
+
+        class FakeRag:
+            async def search(self, **kwargs) -> list:
+                return []
+
+        recorded: dict = {}
+        evaluate = EvalDataset.evaluate
+
+        async def capture(self, *args, **kwargs):
+            recorded.update(kwargs["metadata"])
+            return await evaluate(self, *args, **kwargs)
+
+        db = tmp_path / "test.lancedb"
+        with (
+            patch("evaluations.retrieval.HaikuRAG") as mock_haiku,
+            patch.object(EvalDataset, "evaluate", capture),
+        ):
+            mock_haiku.return_value.__aenter__.return_value = FakeRag()
+            await run_retrieval_benchmark(self._spec(), AppConfig(), db_path=db)
+
+        assert recorded["db_path"] == str(db)
+        assert "db_documents" in recorded
+
+    async def test_ranks_each_document_once(self, tmp_path: Path) -> None:
+        from evaluations.benchmark import run_retrieval_benchmark
+        from haiku.rag.store.models.chunk import SearchResult
+
+        def _result(uri: str, score: float) -> SearchResult:
+            return SearchResult(content="x", score=score, document_uri=uri)
+
+        class FakeRag:
+            async def search(self, **kwargs) -> list[SearchResult]:
+                return [
+                    _result("uri-other", 1.0),
+                    _result("uri-x", 0.9),
+                    _result("uri-other", 0.8),
+                    _result("uri-x", 0.7),
+                ]
+
+        with patch("evaluations.retrieval.HaikuRAG") as mock_haiku:
+            mock_haiku.return_value.__aenter__.return_value = FakeRag()
+            result = await run_retrieval_benchmark(
+                self._spec(), AppConfig(), db_path=tmp_path / "test.lancedb"
+            )
+
+        # uri-x is the only relevant document and ranks second of two
+        assert result is not None
+        assert result["map"] == 0.5
+
+
+class TestDocumentFilterThreading:
+    """The filter must reach both benchmark phases, so retrieval and QA score
+    the same subset of the database."""
+
+    async def test_qa_capability_run_receives_filter(self, tmp_path: Path) -> None:
+        from pydantic_evals import Case
+
+        from evaluations.capability_runner import CapabilityRunResult
+        from evaluations.evaluators import NumberMatchEvaluator
+
+        # A deterministic evaluator, so no judge model is constructed.
+        spec = stub_spec(
+            qa_loader=lambda: [{"question": "What is X?", "answer": "42"}],
+            qa_case_builder=lambda idx, doc: Case(
+                name=f"case-{idx}",
+                inputs=doc["question"],
+                expected_output=doc["answer"],
+            ),
+            qa_evaluator=NumberMatchEvaluator(),
+        )
+
+        with patch(
+            "evaluations.qa.run_capability_question",
+            new_callable=AsyncMock,
+            return_value=CapabilityRunResult(answer="ANSWER: 42"),
+        ) as mock_run:
+            await run_qa_benchmark(
+                spec,
+                AppConfig(),
+                db_path=tmp_path / "test.lancedb",
+                document_filter="uri LIKE '%arxiv%'",
+            )
+
+        mock_run.assert_awaited_once()
+        assert mock_run.call_args[1]["document_filter"] == "uri LIKE '%arxiv%'"
+
+    async def test_evaluate_dataset_forwards_its_arguments_to_both_phases(
+        self, tmp_path: Path
+    ) -> None:
+        expected = """metadata LIKE '%"corpus": "orb_text"%'"""
+        judge = ModelConfig(provider="anthropic", name="claude-sonnet-4-20250514")
+
+        with (
+            patch(
+                "evaluations.benchmark.run_retrieval_benchmark", new_callable=AsyncMock
+            ) as mock_retrieval,
+            patch(
+                "evaluations.benchmark.run_qa_benchmark", new_callable=AsyncMock
+            ) as mock_qa,
+        ):
+            await evaluate_dataset(
+                spec=stub_spec(),
+                config=AppConfig(),
+                skip_db=True,
+                skip_retrieval=False,
+                skip_qa=False,
+                limit=None,
+                name=None,
+                db_path=None,
+                document_filter=expected,
+                judge_model=judge,
+                case_ids={"finqa_dev_16", "finqa_dev_66"},
+                results_dir=tmp_path / "results",
+            )
+
+        assert mock_retrieval.call_args[1]["document_filter"] == expected
+        mock_qa.assert_called_once()
+        assert mock_qa.call_args[1]["document_filter"] == expected
+        assert mock_qa.call_args[1]["judge_model"] is judge
+        assert mock_qa.call_args[1]["case_ids"] == {"finqa_dev_16", "finqa_dev_66"}
+        assert mock_qa.call_args[1]["results_dir"] == tmp_path / "results"
+
+
+async def test_population_refuses_a_configured_set():
+    """Population writes to one database and refuses a configured set."""
+    import pytest
+
+    from evaluations.benchmark import evaluate_dataset
+    from evaluations.datasets import DATASETS
+    from haiku.rag.config.models import AppConfig, LanceDBConfig
+
+    spec = next(iter(DATASETS.values()))
+    config = AppConfig(
+        lancedb=LanceDBConfig(databases={"a": "/a.lancedb", "b": "/b.lancedb"})
+    )
+
+    with pytest.raises(ValueError, match="--skip-db"):
+        await evaluate_dataset(
+            spec,
+            config,
+            skip_db=False,
+            skip_retrieval=True,
+            skip_qa=True,
+            limit=None,
+            name=None,
+            db_path=None,
+        )
+
+
+class TestRunPrintsItsIdentity:
+    def test_prints_the_revision_and_config_hash(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import evaluations.benchmark as benchmark
+        from evaluations.experiment import code_revision, config_hash
+
+        async def nothing(**kwargs) -> None:
+            return None
+
+        monkeypatch.setattr(benchmark, "evaluate_dataset", nothing)
+        with patch("evaluations.benchmark.find_config_file", return_value=None):
+            result = CliRunner().invoke(
+                benchmark.app, ["run", "frames", "--skip-db", "--no-telemetry"]
+            )
+
+        assert result.exit_code == 0, result.output
+        assert code_revision()["git_sha"] in result.output
+        assert f"config hash: {config_hash(AppConfig())}" in result.output
+
+
+def _resolved_token(monkeypatch: pytest.MonkeyPatch, token: str | None) -> None:
+    """Stand in for what `logfire.configure` resolved from its sources."""
+    import logfire
+
+    monkeypatch.setattr(logfire.DEFAULT_LOGFIRE_INSTANCE.config, "token", token)
+
+
+class TestRequireTelemetry:
+    def test_refuses_when_logfire_resolved_no_token(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _resolved_token(monkeypatch, None)
+        with pytest.raises(typer.Exit):
+            require_telemetry()
+
+    @pytest.mark.parametrize("credentials", [True, False])
+    def test_a_credentials_file_counts_as_a_token(
+        self, tmp_path: Path, credentials: bool
+    ) -> None:
+        """Logfire reads the token from `LOGFIRE_CREDENTIALS_DIR` as well as the
+        environment. Run in a child process: configuring Logfire is global."""
+        import subprocess
+        import sys
+
+        if credentials:
+            (tmp_path / "logfire_credentials.json").write_text(
+                json.dumps(
+                    {
+                        "token": "pylf_v1_eu_test",
+                        "project_name": "p",
+                        "project_url": "https://logfire-eu.pydantic.dev/o/p",
+                        "logfire_api_url": "https://logfire-eu.pydantic.dev",
+                    }
+                )
+            )
+        env = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith(("LOGFIRE_", "OTEL_"))
+        }
+        env["LOGFIRE_CREDENTIALS_DIR"] = str(tmp_path)
+        program = (
+            "from evaluations.benchmark import configure_telemetry, require_telemetry\n"
+            "configure_telemetry(service_name='evals', scrubbing=False)\n"
+            "require_telemetry()\n"
+        )
+        done = subprocess.run(
+            [sys.executable, "-c", program],
+            env=env,
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        assert done.returncode == (0 if credentials else 1), done.stderr
+        assert ("found no token" in done.stdout) is not credentials
+
+
+class TestRunTelemetry:
+    def _stub(self, monkeypatch: pytest.MonkeyPatch, token: str | None) -> list[dict]:
+        import evaluations.benchmark as benchmark
+
+        configured: list[dict] = []
+
+        def configure(**kwargs) -> None:
+            configured.append(kwargs)
+            _resolved_token(monkeypatch, token)
+
+        monkeypatch.setattr(benchmark, "configure_telemetry", configure)
+
+        async def nothing(**kwargs) -> None:
+            return None
+
+        monkeypatch.setattr(benchmark, "evaluate_dataset", nothing)
+        return configured
+
+    def test_an_opt_out_sends_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import evaluations.benchmark as benchmark
+
+        monkeypatch.setenv("LOGFIRE_IGNORE_NO_CONFIG", "0")
+        configured = self._stub(monkeypatch, "pylf_v1_eu_test")
+
+        result = CliRunner().invoke(
+            benchmark.app, ["run", "frames", "--no-telemetry", "--skip-db"]
+        )
+
+        assert result.exit_code == 0, result.output
+        assert configured == []
+        assert os.environ["LOGFIRE_IGNORE_NO_CONFIG"] == "1"
+
+    def test_a_run_that_keeps_telemetry_configures_it(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import evaluations.benchmark as benchmark
+
+        configured = self._stub(monkeypatch, "pylf_v1_eu_test")
+
+        result = CliRunner().invoke(benchmark.app, ["run", "frames", "--skip-db"])
+
+        assert result.exit_code == 0, result.output
+        assert configured == [{"service_name": "evals", "scrubbing": False}]
+
+    def test_a_run_without_a_resolved_token_stops(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import evaluations.benchmark as benchmark
+
+        self._stub(monkeypatch, None)
+
+        result = CliRunner().invoke(benchmark.app, ["run", "frames", "--skip-db"])
+
+        assert result.exit_code == 1
+        assert "--no-telemetry" in result.output
+
+
+class TestRunRefusesAnUnusableName:
+    def test_a_name_that_is_not_a_file_name_stops_the_run(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import evaluations.benchmark as benchmark
+
+        monkeypatch.setenv("LOGFIRE_TOKEN", "pylf_v1_eu_test")
+
+        def never(**kwargs):
+            raise AssertionError("must not start an evaluation")
+
+        monkeypatch.setattr(benchmark, "evaluate_dataset", never)
+        result = CliRunner().invoke(
+            benchmark.app, ["run", "frames", "--name", "../escape"]
+        )
+
+        assert result.exit_code == 1
+        assert "run name" in result.output

@@ -1,0 +1,344 @@
+import base64
+import io
+from typing import TYPE_CHECKING, Any
+
+from pydantic_ai.embeddings import Embedder
+from pydantic_ai.embeddings.openai import OpenAIEmbeddingModel
+from pydantic_ai.providers import Provider
+from pydantic_ai.providers.ollama import OllamaProvider
+from pydantic_ai.providers.openai import OpenAIProvider
+
+from haiku.rag.config import AppConfig, get_config
+from haiku.rag.utils.images import image_data_uri
+from haiku.rag.utils.models import check_api_key_supported, vllm_base_url
+
+if TYPE_CHECKING:
+    from PIL import Image as PILImage
+
+    from haiku.rag.config.models import EmbeddingModelConfig
+    from haiku.rag.store.models.chunk import Chunk
+
+
+ImageInput = "bytes | PILImage.Image"
+
+
+class EmbedderWrapper:
+    """Wrapper around pydantic-ai Embedder with explicit query/document methods.
+
+    Subclasses that can encode pictures into the same vector space as text either
+    set the ``supports_images`` class attribute or pass ``supports_images=True``,
+    and override the image methods. ``query_prefix`` and ``document_prefix`` are
+    prepended to every query and document text. Images get neither.
+    """
+
+    supports_images: bool = False
+
+    def __init__(
+        self,
+        embedder: Embedder | None,
+        vector_dim: int,
+        supports_images: bool | None = None,
+        query_prefix: str = "",
+        document_prefix: str = "",
+        provider: Provider | None = None,
+    ):
+        self._embedder = embedder
+        self._provider = provider
+        self._vector_dim = vector_dim
+        self._query_prefix = query_prefix
+        self._document_prefix = document_prefix
+        if supports_images is not None:
+            self.supports_images = supports_images
+
+    @property
+    def vector_dim(self) -> int:
+        return self._vector_dim
+
+    async def embed_query(self, text: str) -> list[float]:
+        """Embed a search query."""
+        return await self._embed_query(self._query_prefix + text)
+
+    async def _embed_query(self, text: str) -> list[float]:
+        assert self._embedder is not None
+        result = await self._embedder.embed_query(text)
+        return list(result.embeddings[0])
+
+    async def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        """Embed documents/chunks for indexing."""
+        if not texts:
+            return []
+        return await self._embed_documents(
+            [self._document_prefix + text for text in texts]
+        )
+
+    async def _embed_documents(self, texts: list[str]) -> list[list[float]]:
+        assert self._embedder is not None
+        result = await self._embedder.embed_documents(texts)
+        return [list(e) for e in result.embeddings]
+
+    async def embed_image(self, image: "Any") -> list[float]:
+        """Embed a single image into the same vector space as text.
+
+        Multimodal providers override this. Picture embedding is single-image:
+        vLLM's ``/v1/embeddings`` accepts one image per request via the
+        ``messages`` superset. Callers loop when they need many.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support image embedding. Set "
+            "embeddings.model.multimodal: true on a vllm, openrouter, voyageai, or "
+            "cohere model."
+        )
+
+    async def aclose(self) -> None:
+        """Release resources held by the embedder."""
+        if self._provider is not None:
+            # A provider closes the HTTP client it created when its last context exits.
+            async with self._provider:
+                pass
+
+
+def _to_data_uri(image: "bytes | PILImage.Image") -> str:
+    """Render an image as a ``data:<media type>;base64,...`` URI."""
+    if isinstance(image, bytes):
+        return image_data_uri(image)
+
+    from PIL import Image as PILImageModule
+
+    if isinstance(image, PILImageModule.Image):
+        buf = io.BytesIO()
+        image.save(buf, format="PNG")
+        return (
+            f"data:image/png;base64,{base64.b64encode(buf.getvalue()).decode('ascii')}"
+        )
+
+    raise TypeError(f"Unsupported image type: {type(image)!r}")
+
+
+def contextualize(chunks: list["Chunk"]) -> list[str]:
+    """Prepare chunk content for embedding/FTS by adding context.
+
+    Prepends section headings to chunk content for better semantic search.
+
+    Args:
+        chunks: List of chunks to contextualize.
+
+    Returns:
+        List of contextualized text strings.
+    """
+    texts = []
+    for chunk in chunks:
+        meta = chunk.get_chunk_metadata()
+        if meta.headings:
+            text = "\n".join(meta.headings) + "\n" + chunk.content
+        else:
+            text = chunk.content
+        texts.append(text)
+    return texts
+
+
+async def embed_chunks(
+    chunks: list["Chunk"],
+    embedder: "EmbedderWrapper",
+    config: AppConfig | None = None,
+) -> list["Chunk"]:
+    """Generate embeddings for chunks, dispatching text vs picture variants.
+
+    Text chunks are contextualized (headings prepended) and routed through
+    ``embed_documents``. Picture chunks (those carrying ``_picture_data``)
+    are routed through ``embed_images`` and require a multimodal embedder.
+    Vectors land in the original chunk order.
+    """
+    config = config if config is not None else get_config()
+    if not chunks:
+        return []
+
+    from haiku.rag.store.models.chunk import Chunk
+
+    text_chunks: list[Chunk] = []
+    picture_chunks: list[Chunk] = []
+    for chunk in chunks:
+        if chunk._picture_data is not None:
+            picture_chunks.append(chunk)
+        else:
+            text_chunks.append(chunk)
+
+    text_embeddings: list[list[float]] = []
+    if text_chunks:
+        texts = contextualize(text_chunks)
+        batch_size = config.embeddings.batch_size
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i : i + batch_size]
+            text_embeddings.extend(await embedder.embed_documents(batch))
+
+    picture_embeddings: list[list[float]] = []
+    if picture_chunks:
+        if not embedder.supports_images:
+            raise ValueError(
+                "Picture chunks require a multimodal embedder. Set "
+                "embeddings.model.multimodal: true on a vllm, openrouter, "
+                "voyageai, or cohere model, or omit picture chunks."
+            )
+        for chunk in picture_chunks:
+            picture_embeddings.append(await embedder.embed_image(chunk._picture_data))
+
+    text_iter = iter(text_embeddings)
+    picture_iter = iter(picture_embeddings)
+    return [
+        Chunk(
+            id=chunk.id,
+            document_id=chunk.document_id,
+            content=chunk.content,
+            metadata=chunk.metadata,
+            order=chunk.order,
+            document_uri=chunk.document_uri,
+            document_title=chunk.document_title,
+            document_meta=chunk.document_meta,
+            embedding=(
+                next(picture_iter)
+                if chunk._picture_data is not None
+                else next(text_iter)
+            ),
+        )
+        for chunk in chunks
+    ]
+
+
+def get_embedder(config: AppConfig | None = None) -> EmbedderWrapper:
+    """Factory function to get the appropriate embedder based on the configuration.
+
+    Args:
+        config: Configuration to use. Defaults to the current global config.
+
+    Returns:
+        An embedder instance configured according to the config.
+    """
+    config = config if config is not None else get_config()
+    embedding_model = config.embeddings.model
+    provider = embedding_model.provider
+    model_name = embedding_model.name
+    vector_dim = embedding_model.vector_dim
+    check_api_key_supported(embedding_model, {"openai", "ollama", "openrouter", "vllm"})
+    _check_prefixes_supported(embedding_model)
+    query_prefix = embedding_model.query_prefix
+    document_prefix = embedding_model.document_prefix
+
+    if provider == "vllm":
+        from haiku.rag.embeddings.vllm import VLLMMultimodalEmbedder
+
+        return VLLMMultimodalEmbedder(
+            model_name,
+            vector_dim,
+            base_url=vllm_base_url(embedding_model.base_url),
+            api_key=embedding_model.api_key,
+            supports_images=embedding_model.multimodal,
+            query_prefix=query_prefix,
+            document_prefix=document_prefix,
+        )
+
+    if provider == "openrouter":
+        from haiku.rag.embeddings.openrouter import BASE_URL, OpenRouterEmbedder
+
+        return OpenRouterEmbedder(
+            model_name,
+            vector_dim,
+            base_url=embedding_model.base_url or BASE_URL,
+            api_key=embedding_model.api_key,
+            supports_images=embedding_model.multimodal,
+            query_prefix=query_prefix,
+            document_prefix=document_prefix,
+        )
+
+    if embedding_model.multimodal:
+        return _get_multimodal_embedder(embedding_model)
+
+    if provider == "ollama":
+        # Use model-level base_url if set, otherwise fall back to providers config
+        base_url = embedding_model.base_url or config.providers.ollama.base_url
+        if not base_url.rstrip("/").endswith("/v1"):
+            base_url = base_url.rstrip("/") + "/v1"
+        ollama_provider = OllamaProvider(
+            base_url=base_url, api_key=embedding_model.api_key
+        )
+        return EmbedderWrapper(
+            Embedder(OpenAIEmbeddingModel(model_name, provider=ollama_provider)),
+            vector_dim,
+            query_prefix=query_prefix,
+            document_prefix=document_prefix,
+            provider=ollama_provider,
+        )
+
+    if provider == "openai":
+        if embedding_model.base_url or embedding_model.api_key:
+            openai_provider = OpenAIProvider(
+                base_url=embedding_model.base_url, api_key=embedding_model.api_key
+            )
+            return EmbedderWrapper(
+                Embedder(OpenAIEmbeddingModel(model_name, provider=openai_provider)),
+                vector_dim,
+                query_prefix=query_prefix,
+                document_prefix=document_prefix,
+                provider=openai_provider,
+            )
+        return EmbedderWrapper(
+            Embedder(f"openai:{model_name}"),
+            vector_dim,
+            query_prefix=query_prefix,
+            document_prefix=document_prefix,
+        )
+
+    if provider == "voyageai":
+        return EmbedderWrapper(Embedder(f"voyageai:{model_name}"), vector_dim)
+
+    if provider == "cohere":
+        return EmbedderWrapper(Embedder(f"cohere:{model_name}"), vector_dim)
+
+    if provider == "sentence-transformers":
+        return EmbedderWrapper(
+            Embedder(f"sentence-transformers:{model_name}"), vector_dim
+        )
+
+    raise ValueError(f"Unsupported embedding provider: {provider}")
+
+
+_PREFIX_PROVIDERS = {"ollama", "openai", "openrouter", "vllm"}
+
+
+def _check_prefixes_supported(embedding_model: "EmbeddingModelConfig") -> None:
+    """Reject a prefix on a provider that marks queries and documents itself."""
+    if (
+        embedding_model.query_prefix or embedding_model.document_prefix
+    ) and embedding_model.provider not in _PREFIX_PROVIDERS:
+        raise ValueError(
+            "query_prefix and document_prefix are not supported on the "
+            f"'{embedding_model.provider}' provider "
+            f"(supported: {', '.join(sorted(_PREFIX_PROVIDERS))})."
+        )
+
+
+def _get_multimodal_embedder(
+    embedding_model: "EmbeddingModelConfig",
+) -> EmbedderWrapper:
+    """Build an image-capable embedder for the vendor SDK providers.
+
+    Each passes images in its own wire format, so the capability lives in a
+    per-provider embedder.
+    """
+    provider = embedding_model.provider
+    model_name = embedding_model.name
+    vector_dim = embedding_model.vector_dim
+
+    if provider == "voyageai":
+        from haiku.rag.embeddings.voyageai import VoyageMultimodalEmbedder
+
+        return VoyageMultimodalEmbedder(model_name, vector_dim)
+
+    if provider == "cohere":
+        from haiku.rag.embeddings.cohere import CohereMultimodalEmbedder
+
+        return CohereMultimodalEmbedder(model_name, vector_dim)
+
+    raise ValueError(
+        f"Provider '{provider}' does not support multimodal embedding. Set "
+        "embeddings.model.multimodal: true on a vllm, openrouter, voyageai, or "
+        "cohere model."
+    )

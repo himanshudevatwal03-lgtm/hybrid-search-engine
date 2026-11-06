@@ -1,0 +1,839 @@
+interactions:
+- request:
+    headers:
+      accept:
+      - application/json
+      accept-encoding:
+      - gzip, deflate
+      connection:
+      - keep-alive
+      content-length:
+      - '114'
+      content-type:
+      - application/json
+      host:
+      - localhost:11434
+    method: POST
+    parsed_body:
+      encoding_format: base64
+      input:
+      - Python is a high-level programming language.
+      model: qwen3-embedding:4b
+    uri: http://localhost:11434/v1/embeddings
+  response:
+    headers:
+      content-type:
+      - application/json
+      transfer-encoding:
+      - chunked
+    parsed_body:
+      data:
+      - embedding: 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
+        index: 0
+        object: embedding
+      model: qwen3-embedding:4b
+      object: list
+      usage:
+        prompt_tokens: 9
+        total_tokens: 9
+    status:
+      code: 200
+      message: OK
+- request:
+    headers:
+      accept:
+      - application/json
+      accept-encoding:
+      - gzip, deflate
+      connection:
+      - keep-alive
+      content-length:
+      - '11578'
+      content-type:
+      - application/json
+      host:
+      - localhost:11434
+    method: POST
+    parsed_body:
+      messages:
+      - content: |-
+          # RAG
+
+          You answer questions over a document knowledge base. Two common workflows:
+
+          - **`search → cite → answer`** when the answer is grounded on specific document content. Call `cite` with the supporting chunk_ids before writing the answer.
+          - **`execute_code → answer`** when the answer is a count, aggregation, listing, or structural computation over the corpus (e.g. "how many documents?", "average page count"). Call `cite` with an empty list when no specific chunks support the answer.
+
+          You can mix the two. The rule: always call `cite` before answering — pass the grounding chunk_ids, or an empty list for a corpus-level computation. Never fabricate citations.
+
+          ## Tools
+
+          ### execute_code
+          Execute Python code in a sandboxed interpreter. Variables persist between calls — you can build state incrementally. Use `print()` to output results.
+
+          Inside the code, these functions are available (use `await`):
+          - `await search(query, limit=10)` → list of dicts with keys: chunk_id, content, document_id, document_title, document_uri, score, page_numbers, headings, doc_item_refs, labels, picture_refs (subset of doc_item_refs labeled `picture`), chunk_meta (the matched chunk's stored metadata, custom keys included)
+          - `await list_documents()` → list of dicts with keys: id, title, uri, created_at, metadata
+
+          Useful modules include `json`, `re`, `math`, `pathlib`, `datetime`, `collections`, `itertools`, `functools` and `dataclasses`. `decimal` and `statistics` do not exist.
+          Not supported: class inheritance and metaclasses, generators/yield, match statements, iterating a file object (`for line in f`)
+
+          ### search
+          Search the knowledge base directly, outside code execution. The same search is available inside code as `await search(...)`. Each result has a `Type:` (paragraph, table, code, list_item, picture). When the Type is `picture`, the corresponding figure may also be attached to the tool response as an image alongside the text — use it directly to answer questions about figures, diagrams, charts, screenshots.
+
+          ### cite
+          Register the chunk IDs that ground your answer. **You must call `cite` before writing any final answer that uses retrieved evidence — search results, items.jsonl rows, toc.json nodes, or content.txt content.** Skipping `cite` leaves the answer ungrounded and is treated as a failure.
+
+          When your answer is a corpus-level computation that doesn't draw on specific chunks — counts, aggregations, listings, averages across documents — call `cite` with an empty list. Don't fabricate citations for these.
+
+          Chunk IDs come from two places:
+          - The `chunk_id` field on `search` / `await search(...)` results
+          - The `chunk_ids` field on `items.jsonl` rows / `toc.json` nodes (when you ground via direct file reads)
+
+          Do NOT cite `self_ref` (`#/texts/N` style refs), `position`, or any other identifier-shaped field. They are not chunk IDs and the tool will reject them. Copy chunk IDs verbatim — they are opaque UUIDs.
+
+          ## Document Filesystem (inside execute_code)
+
+          All documents are mounted as a virtual filesystem at `/documents/`:
+
+          ```
+          /documents/{document_id}/
+              metadata.json    # {"id", "title", "uri", "created_at", "metadata"}
+              content.txt      # Full document text
+              items.jsonl      # Structured items (one JSON object per line)
+              chunks.jsonl     # Chunks in order with their metadata (one JSON object per line)
+              toc.json         # Section tree derived from heading_level
+          ```
+
+          `{document_id}` is an internal identifier, not the user-facing `uri` (filename, URL, etc.). When you only know a document by its URI or title, use `await list_documents()` to enumerate ids and match against `uri` / `title` — that's a single call to the host. Iterating `/documents/` and reading every `metadata.json` works too but is much slower on portal-scale corpora.
+
+          ### Reading files
+          Read with `Path.read_text()` or `open()` (including `with` blocks); file objects support `.read()`, `.readline()`, and `.readlines()`. A file object cannot be iterated, so read line-wise with `.readlines()` or `.read().split("\n")` instead of `for line in f`. Files are read-only; writing raises `PermissionError`. There is no network. A call has a time limit, named in the error when it is hit, and output past a size is cut with an `... (output truncated)` marker.
+
+          ```python
+          from pathlib import Path
+          import json
+
+          # Discover documents
+          for doc_dir in Path('/documents').iterdir():
+              meta = json.loads((doc_dir / 'metadata.json').read_text())
+              print(meta['title'])
+
+          # Read full text
+          content = Path(f'/documents/{doc_id}/content.txt').read_text()
+
+          # Read and parse items
+          for line in Path(f'/documents/{doc_id}/items.jsonl').read_text().strip().split("\n"):
+              item = json.loads(line)
+              if item['label'] == 'table':
+                  print(item['text'][:200])
+          ```
+
+          ### metadata.json
+          Document metadata: `id`, `title`, `uri`, `created_at`, and `metadata`, the keys stored with the document.
+
+          ### content.txt
+          Full text content. Use for regex or keyword search across a whole document.
+
+          ### items.jsonl
+          Structured document items. One JSON object per line. The row's **line index** is the item's position — `item_range` values in `toc.json` are line-slice bounds into this file.
+
+          Each row carries:
+          - `self_ref`: item reference (e.g. `"#/texts/5"`, `"#/tables/0"`) — used to cross-reference with `doc_item_refs` from search results
+          - `label`: item type — one of `"section_header"`, `"text"`, `"table"`, `"list_item"`, `"caption"`, `"formula"`, `"picture"`, `"code"`, `"footnote"`
+          - `text`: rendered content (tables are markdown with `|` columns)
+          - `page_numbers`: list of page numbers where the item appears
+          - `chunk_ids`: chunks that contain this item — pass to `cite()` to ground an answer that read this item directly
+          - `heading_level`: H-level for `section_header` rows; `0` on non-header rows
+
+          ### chunks.jsonl
+          The document's chunks in order, one JSON object per line: `chunk_id` and `metadata`, the chunk's stored metadata (`doc_item_refs`, `headings`, `labels`, `page_numbers`, and any custom keys such as paragraph or footnote numbers). To read by chunk metadata, keep the matching rows and take the `items.jsonl` rows whose `chunk_ids` name them.
+
+          ### toc.json
+          Section tree derived from `heading_level`: `{"doc_id", "title", "tree": [...]}` where each node has `{self_ref, level, title, page_numbers, item_range: [start, end_exclusive], chunk_ids, children}`. `item_range` is a line slice into `items.jsonl` — `items[start:end]`. `chunk_ids` aggregates the citable chunks across all items in the section — pass directly to `cite()` to ground a section-scoped answer without a corpus-wide `search()` call. `tree: []` for docs with no headers.
+
+          ### Cross-referencing search results with items
+          Search results include `doc_item_refs` (e.g. `["#/texts/48", "#/tables/0"]`) that correspond to `self_ref` values in `items.jsonl`. To find which section a hit lives in: locate the item by `self_ref`, take its line index, and walk `toc.json` to find the deepest node whose `item_range` contains that index.
+
+          ## Questions with attached images
+
+          The user may attach images to their question. An attached image is part of the question, not knowledge-base content. Search the knowledge base for the criteria, standards, or facts named in the question text, cite them, and apply them to the attached image. Never refuse merely because the image itself is not in the knowledge base.
+
+          ## Strategy
+
+          1. Search first.
+          2. Identify the chunk_ids from the search results that support your answer and call `cite` with them. Then write a concise answer.
+          3. Reach for `execute_code` when search results are insufficient or when the task requires computation, aggregation, traversal across documents, or section-scoped reading. From inside code you can search again with different terms, or read `items.jsonl` / `toc.json` / `content.txt` directly from the document filesystem.
+          4. For questions about a *known document's* structure ("which section contains X", "list the sections of doc Y", "summarise section Z"), read `/documents/{id}/toc.json` first. Each node carries `item_range` (a slice into `items.jsonl`) and `chunk_ids` (citable). Prefer this over `search()` for in-document navigation — `search()` ranks across the whole corpus and can return chunks from unrelated documents.
+          5. Before writing your final response, call `cite` with the chunk_ids that ground your answer.
+
+          You MUST call `cite` before producing your final answer, every time, with no exceptions. Pass the chunk IDs that ground the answer, or an empty list when none do — because you are refusing for lack of information, or because the answer is a corpus-level computation. An answer not preceded by `cite` is a protocol violation.
+
+          ## When search returns irrelevant results
+
+          If your first search returns results that clearly don't match the question:
+          - Try one more search with different keywords
+          - If still irrelevant, report that the knowledge base doesn't contain relevant information
+
+          ## Important
+
+          - Variables persist between `execute_code` calls — you can search in one call and process results in the next
+          - Use `print()` to output results — the output is your only feedback
+          - When you write code, execute it — don't describe what code would do. But not every question needs code; simple lookups are best answered by `search → cite`.
+          - Use `await` for all async functions inside `execute_code` (`search`, `list_documents`)
+          - Read files with `Path.read_text()` or `open()`/`with`. For lines use `.readlines()` or `.read().split("\n")`, never `for line in f`.
+          - If the retrieved documents do not directly address the question, say: "I cannot find enough information in the knowledge base to answer this question." Do not guess or infer from tangentially related content. Refusing does not exempt you from `cite` — call it with an empty list to record that nothing grounds the answer.
+          - Do NOT include chunk IDs or UUIDs in your answer text — your answer should read naturally. Use the `cite` tool separately to register citations. `cite{...}` markdown-style inline references do nothing; only an actual `cite` tool call registers a citation.
+          - **Before you write your final answer, invoke the `cite` tool with the supporting chunk_ids, or with an empty list if there are none.** This is the last tool call before answering, every time.
+        role: system
+      - content: What is Python?
+        role: user
+      model: qwen3.8
+      reasoning_effort: medium
+      stream: false
+      temperature: 0.3
+      tool_choice: auto
+      tools:
+      - function:
+          description: Search the knowledge base for evidence to analyze.
+          name: search
+          parameters:
+            additionalProperties: false
+            properties:
+              limit:
+                anyOf:
+                - type: integer
+                - type: 'null'
+                default: null
+              query:
+                type: string
+            required:
+            - query
+            type: object
+        type: function
+      - function:
+          description: Execute Python against the sandboxed document filesystem.
+          name: execute_code
+          parameters:
+            additionalProperties: false
+            properties:
+              code:
+                type: string
+            required:
+            - code
+            type: object
+        type: function
+      - function:
+          description: Register exact retrieved chunk IDs as citations for the answer.
+          name: cite
+          parameters:
+            additionalProperties: false
+            properties:
+              chunk_ids:
+                items:
+                  type: string
+                type: array
+            required:
+            - chunk_ids
+            type: object
+        type: function
+    uri: http://localhost:11434/v1/chat/completions
+  response:
+    headers:
+      content-length:
+      - '745'
+      content-type:
+      - application/json
+    parsed_body:
+      choices:
+      - finish_reason: tool_calls
+        index: 0
+        message:
+          content: ''
+          reasoning: The user asks "What is Python?" This is a general knowledge question. But I'm a RAG agent over a document
+            knowledge base. I should check whether the knowledge base contains relevant information about Python. Let me search
+            first.
+          role: assistant
+          tool_calls:
+          - function:
+              arguments: '{"query":"What is Python programming language"}'
+              name: search
+            id: call_9csujyqz
+            index: 0
+            type: function
+      created: 1789133036
+      id: chatcmpl-142
+      model: qwen3.8
+      object: chat.completion
+      system_fingerprint: fp_ollama
+      usage:
+        completion_tokens: 76
+        prompt_tokens: 2866
+        prompt_tokens_details:
+          cached_tokens: 2854
+        total_tokens: 2942
+    status:
+      code: 200
+      message: OK
+- request:
+    headers:
+      accept:
+      - application/json
+      accept-encoding:
+      - gzip, deflate
+      connection:
+      - keep-alive
+      content-length:
+      - '105'
+      content-type:
+      - application/json
+      host:
+      - localhost:11434
+    method: POST
+    parsed_body:
+      encoding_format: base64
+      input:
+      - What is Python programming language
+      model: qwen3-embedding:4b
+    uri: http://localhost:11434/v1/embeddings
+  response:
+    headers:
+      content-type:
+      - application/json
+      transfer-encoding:
+      - chunked
+    parsed_body:
+      data:
+      - embedding: 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
+        index: 0
+        object: embedding
+      model: qwen3-embedding:4b
+      object: list
+      usage:
+        prompt_tokens: 6
+        total_tokens: 6
+    status:
+      code: 200
+      message: OK
+- request:
+    headers:
+      accept:
+      - application/json
+      accept-encoding:
+      - gzip, deflate
+      connection:
+      - keep-alive
+      content-length:
+      - '12190'
+      content-type:
+      - application/json
+      host:
+      - localhost:11434
+    method: POST
+    parsed_body:
+      messages:
+      - content: |-
+          # RAG
+
+          You answer questions over a document knowledge base. Two common workflows:
+
+          - **`search → cite → answer`** when the answer is grounded on specific document content. Call `cite` with the supporting chunk_ids before writing the answer.
+          - **`execute_code → answer`** when the answer is a count, aggregation, listing, or structural computation over the corpus (e.g. "how many documents?", "average page count"). Call `cite` with an empty list when no specific chunks support the answer.
+
+          You can mix the two. The rule: always call `cite` before answering — pass the grounding chunk_ids, or an empty list for a corpus-level computation. Never fabricate citations.
+
+          ## Tools
+
+          ### execute_code
+          Execute Python code in a sandboxed interpreter. Variables persist between calls — you can build state incrementally. Use `print()` to output results.
+
+          Inside the code, these functions are available (use `await`):
+          - `await search(query, limit=10)` → list of dicts with keys: chunk_id, content, document_id, document_title, document_uri, score, page_numbers, headings, doc_item_refs, labels, picture_refs (subset of doc_item_refs labeled `picture`), chunk_meta (the matched chunk's stored metadata, custom keys included)
+          - `await list_documents()` → list of dicts with keys: id, title, uri, created_at, metadata
+
+          Useful modules include `json`, `re`, `math`, `pathlib`, `datetime`, `collections`, `itertools`, `functools` and `dataclasses`. `decimal` and `statistics` do not exist.
+          Not supported: class inheritance and metaclasses, generators/yield, match statements, iterating a file object (`for line in f`)
+
+          ### search
+          Search the knowledge base directly, outside code execution. The same search is available inside code as `await search(...)`. Each result has a `Type:` (paragraph, table, code, list_item, picture). When the Type is `picture`, the corresponding figure may also be attached to the tool response as an image alongside the text — use it directly to answer questions about figures, diagrams, charts, screenshots.
+
+          ### cite
+          Register the chunk IDs that ground your answer. **You must call `cite` before writing any final answer that uses retrieved evidence — search results, items.jsonl rows, toc.json nodes, or content.txt content.** Skipping `cite` leaves the answer ungrounded and is treated as a failure.
+
+          When your answer is a corpus-level computation that doesn't draw on specific chunks — counts, aggregations, listings, averages across documents — call `cite` with an empty list. Don't fabricate citations for these.
+
+          Chunk IDs come from two places:
+          - The `chunk_id` field on `search` / `await search(...)` results
+          - The `chunk_ids` field on `items.jsonl` rows / `toc.json` nodes (when you ground via direct file reads)
+
+          Do NOT cite `self_ref` (`#/texts/N` style refs), `position`, or any other identifier-shaped field. They are not chunk IDs and the tool will reject them. Copy chunk IDs verbatim — they are opaque UUIDs.
+
+          ## Document Filesystem (inside execute_code)
+
+          All documents are mounted as a virtual filesystem at `/documents/`:
+
+          ```
+          /documents/{document_id}/
+              metadata.json    # {"id", "title", "uri", "created_at", "metadata"}
+              content.txt      # Full document text
+              items.jsonl      # Structured items (one JSON object per line)
+              chunks.jsonl     # Chunks in order with their metadata (one JSON object per line)
+              toc.json         # Section tree derived from heading_level
+          ```
+
+          `{document_id}` is an internal identifier, not the user-facing `uri` (filename, URL, etc.). When you only know a document by its URI or title, use `await list_documents()` to enumerate ids and match against `uri` / `title` — that's a single call to the host. Iterating `/documents/` and reading every `metadata.json` works too but is much slower on portal-scale corpora.
+
+          ### Reading files
+          Read with `Path.read_text()` or `open()` (including `with` blocks); file objects support `.read()`, `.readline()`, and `.readlines()`. A file object cannot be iterated, so read line-wise with `.readlines()` or `.read().split("\n")` instead of `for line in f`. Files are read-only; writing raises `PermissionError`. There is no network. A call has a time limit, named in the error when it is hit, and output past a size is cut with an `... (output truncated)` marker.
+
+          ```python
+          from pathlib import Path
+          import json
+
+          # Discover documents
+          for doc_dir in Path('/documents').iterdir():
+              meta = json.loads((doc_dir / 'metadata.json').read_text())
+              print(meta['title'])
+
+          # Read full text
+          content = Path(f'/documents/{doc_id}/content.txt').read_text()
+
+          # Read and parse items
+          for line in Path(f'/documents/{doc_id}/items.jsonl').read_text().strip().split("\n"):
+              item = json.loads(line)
+              if item['label'] == 'table':
+                  print(item['text'][:200])
+          ```
+
+          ### metadata.json
+          Document metadata: `id`, `title`, `uri`, `created_at`, and `metadata`, the keys stored with the document.
+
+          ### content.txt
+          Full text content. Use for regex or keyword search across a whole document.
+
+          ### items.jsonl
+          Structured document items. One JSON object per line. The row's **line index** is the item's position — `item_range` values in `toc.json` are line-slice bounds into this file.
+
+          Each row carries:
+          - `self_ref`: item reference (e.g. `"#/texts/5"`, `"#/tables/0"`) — used to cross-reference with `doc_item_refs` from search results
+          - `label`: item type — one of `"section_header"`, `"text"`, `"table"`, `"list_item"`, `"caption"`, `"formula"`, `"picture"`, `"code"`, `"footnote"`
+          - `text`: rendered content (tables are markdown with `|` columns)
+          - `page_numbers`: list of page numbers where the item appears
+          - `chunk_ids`: chunks that contain this item — pass to `cite()` to ground an answer that read this item directly
+          - `heading_level`: H-level for `section_header` rows; `0` on non-header rows
+
+          ### chunks.jsonl
+          The document's chunks in order, one JSON object per line: `chunk_id` and `metadata`, the chunk's stored metadata (`doc_item_refs`, `headings`, `labels`, `page_numbers`, and any custom keys such as paragraph or footnote numbers). To read by chunk metadata, keep the matching rows and take the `items.jsonl` rows whose `chunk_ids` name them.
+
+          ### toc.json
+          Section tree derived from `heading_level`: `{"doc_id", "title", "tree": [...]}` where each node has `{self_ref, level, title, page_numbers, item_range: [start, end_exclusive], chunk_ids, children}`. `item_range` is a line slice into `items.jsonl` — `items[start:end]`. `chunk_ids` aggregates the citable chunks across all items in the section — pass directly to `cite()` to ground a section-scoped answer without a corpus-wide `search()` call. `tree: []` for docs with no headers.
+
+          ### Cross-referencing search results with items
+          Search results include `doc_item_refs` (e.g. `["#/texts/48", "#/tables/0"]`) that correspond to `self_ref` values in `items.jsonl`. To find which section a hit lives in: locate the item by `self_ref`, take its line index, and walk `toc.json` to find the deepest node whose `item_range` contains that index.
+
+          ## Questions with attached images
+
+          The user may attach images to their question. An attached image is part of the question, not knowledge-base content. Search the knowledge base for the criteria, standards, or facts named in the question text, cite them, and apply them to the attached image. Never refuse merely because the image itself is not in the knowledge base.
+
+          ## Strategy
+
+          1. Search first.
+          2. Identify the chunk_ids from the search results that support your answer and call `cite` with them. Then write a concise answer.
+          3. Reach for `execute_code` when search results are insufficient or when the task requires computation, aggregation, traversal across documents, or section-scoped reading. From inside code you can search again with different terms, or read `items.jsonl` / `toc.json` / `content.txt` directly from the document filesystem.
+          4. For questions about a *known document's* structure ("which section contains X", "list the sections of doc Y", "summarise section Z"), read `/documents/{id}/toc.json` first. Each node carries `item_range` (a slice into `items.jsonl`) and `chunk_ids` (citable). Prefer this over `search()` for in-document navigation — `search()` ranks across the whole corpus and can return chunks from unrelated documents.
+          5. Before writing your final response, call `cite` with the chunk_ids that ground your answer.
+
+          You MUST call `cite` before producing your final answer, every time, with no exceptions. Pass the chunk IDs that ground the answer, or an empty list when none do — because you are refusing for lack of information, or because the answer is a corpus-level computation. An answer not preceded by `cite` is a protocol violation.
+
+          ## When search returns irrelevant results
+
+          If your first search returns results that clearly don't match the question:
+          - Try one more search with different keywords
+          - If still irrelevant, report that the knowledge base doesn't contain relevant information
+
+          ## Important
+
+          - Variables persist between `execute_code` calls — you can search in one call and process results in the next
+          - Use `print()` to output results — the output is your only feedback
+          - When you write code, execute it — don't describe what code would do. But not every question needs code; simple lookups are best answered by `search → cite`.
+          - Use `await` for all async functions inside `execute_code` (`search`, `list_documents`)
+          - Read files with `Path.read_text()` or `open()`/`with`. For lines use `.readlines()` or `.read().split("\n")`, never `for line in f`.
+          - If the retrieved documents do not directly address the question, say: "I cannot find enough information in the knowledge base to answer this question." Do not guess or infer from tangentially related content. Refusing does not exempt you from `cite` — call it with an empty list to record that nothing grounds the answer.
+          - Do NOT include chunk IDs or UUIDs in your answer text — your answer should read naturally. Use the `cite` tool separately to register citations. `cite{...}` markdown-style inline references do nothing; only an actual `cite` tool call registers a citation.
+          - **Before you write your final answer, invoke the `cite` tool with the supporting chunk_ids, or with an empty list if there are none.** This is the last tool call before answering, every time.
+        role: system
+      - content: What is Python?
+        role: user
+      - content: null
+        reasoning: The user asks "What is Python?" This is a general knowledge question. But I'm a RAG agent over a document
+          knowledge base. I should check whether the knowledge base contains relevant information about Python. Let me search
+          first.
+        role: assistant
+        tool_calls:
+        - function:
+            arguments: '{"query":"What is Python programming language"}'
+            name: search
+          id: call_9csujyqz
+          type: function
+      - content: |-
+          [48a0f21e-442a-46d4-9ea0-b0ae02cde6b6] [rank 1 of 1]
+          Type: text
+          Content:
+          Python is a high-level programming language.
+        role: tool
+        tool_call_id: call_9csujyqz
+      model: qwen3.8
+      reasoning_effort: medium
+      stream: false
+      temperature: 0.3
+      tool_choice: auto
+      tools:
+      - function:
+          description: Search the knowledge base for evidence to analyze.
+          name: search
+          parameters:
+            additionalProperties: false
+            properties:
+              limit:
+                anyOf:
+                - type: integer
+                - type: 'null'
+                default: null
+              query:
+                type: string
+            required:
+            - query
+            type: object
+        type: function
+      - function:
+          description: Execute Python against the sandboxed document filesystem.
+          name: execute_code
+          parameters:
+            additionalProperties: false
+            properties:
+              code:
+                type: string
+            required:
+            - code
+            type: object
+        type: function
+      - function:
+          description: Register exact retrieved chunk IDs as citations for the answer.
+          name: cite
+          parameters:
+            additionalProperties: false
+            properties:
+              chunk_ids:
+                items:
+                  type: string
+                type: array
+            required:
+            - chunk_ids
+            type: object
+        type: function
+    uri: http://localhost:11434/v1/chat/completions
+  response:
+    headers:
+      content-length:
+      - '892'
+      content-type:
+      - application/json
+    parsed_body:
+      choices:
+      - finish_reason: tool_calls
+        index: 0
+        message:
+          content: ''
+          reasoning: 'The knowledge base contains one relevant chunk: "Python is a high-level programming language." That''s
+            the only grounding available. I should cite that chunk and answer based on it. I shouldn''t fabricate a long general-knowledge
+            answer that isn''t grounded. I''ll give a concise answer grounded on the retrieved content, and can note that''s
+            what the knowledge base states.'
+          role: assistant
+          tool_calls:
+          - function:
+              arguments: '{"chunk_ids":["48a0f21e-442a-46d4-9ea0-b0ae02cde6b6"]}'
+              name: cite
+            id: call_dlb3t8zf
+            index: 0
+            type: function
+      created: 1789133045
+      id: chatcmpl-257
+      model: qwen3.8
+      object: chat.completion
+      system_fingerprint: fp_ollama
+      usage:
+        completion_tokens: 136
+        prompt_tokens: 3016
+        prompt_tokens_details:
+          cached_tokens: 2942
+        total_tokens: 3152
+    status:
+      code: 200
+      message: OK
+- request:
+    headers:
+      accept:
+      - application/json
+      accept-encoding:
+      - gzip, deflate
+      connection:
+      - keep-alive
+      content-length:
+      - '12853'
+      content-type:
+      - application/json
+      host:
+      - localhost:11434
+    method: POST
+    parsed_body:
+      messages:
+      - content: |-
+          # RAG
+
+          You answer questions over a document knowledge base. Two common workflows:
+
+          - **`search → cite → answer`** when the answer is grounded on specific document content. Call `cite` with the supporting chunk_ids before writing the answer.
+          - **`execute_code → answer`** when the answer is a count, aggregation, listing, or structural computation over the corpus (e.g. "how many documents?", "average page count"). Call `cite` with an empty list when no specific chunks support the answer.
+
+          You can mix the two. The rule: always call `cite` before answering — pass the grounding chunk_ids, or an empty list for a corpus-level computation. Never fabricate citations.
+
+          ## Tools
+
+          ### execute_code
+          Execute Python code in a sandboxed interpreter. Variables persist between calls — you can build state incrementally. Use `print()` to output results.
+
+          Inside the code, these functions are available (use `await`):
+          - `await search(query, limit=10)` → list of dicts with keys: chunk_id, content, document_id, document_title, document_uri, score, page_numbers, headings, doc_item_refs, labels, picture_refs (subset of doc_item_refs labeled `picture`), chunk_meta (the matched chunk's stored metadata, custom keys included)
+          - `await list_documents()` → list of dicts with keys: id, title, uri, created_at, metadata
+
+          Useful modules include `json`, `re`, `math`, `pathlib`, `datetime`, `collections`, `itertools`, `functools` and `dataclasses`. `decimal` and `statistics` do not exist.
+          Not supported: class inheritance and metaclasses, generators/yield, match statements, iterating a file object (`for line in f`)
+
+          ### search
+          Search the knowledge base directly, outside code execution. The same search is available inside code as `await search(...)`. Each result has a `Type:` (paragraph, table, code, list_item, picture). When the Type is `picture`, the corresponding figure may also be attached to the tool response as an image alongside the text — use it directly to answer questions about figures, diagrams, charts, screenshots.
+
+          ### cite
+          Register the chunk IDs that ground your answer. **You must call `cite` before writing any final answer that uses retrieved evidence — search results, items.jsonl rows, toc.json nodes, or content.txt content.** Skipping `cite` leaves the answer ungrounded and is treated as a failure.
+
+          When your answer is a corpus-level computation that doesn't draw on specific chunks — counts, aggregations, listings, averages across documents — call `cite` with an empty list. Don't fabricate citations for these.
+
+          Chunk IDs come from two places:
+          - The `chunk_id` field on `search` / `await search(...)` results
+          - The `chunk_ids` field on `items.jsonl` rows / `toc.json` nodes (when you ground via direct file reads)
+
+          Do NOT cite `self_ref` (`#/texts/N` style refs), `position`, or any other identifier-shaped field. They are not chunk IDs and the tool will reject them. Copy chunk IDs verbatim — they are opaque UUIDs.
+
+          ## Document Filesystem (inside execute_code)
+
+          All documents are mounted as a virtual filesystem at `/documents/`:
+
+          ```
+          /documents/{document_id}/
+              metadata.json    # {"id", "title", "uri", "created_at", "metadata"}
+              content.txt      # Full document text
+              items.jsonl      # Structured items (one JSON object per line)
+              chunks.jsonl     # Chunks in order with their metadata (one JSON object per line)
+              toc.json         # Section tree derived from heading_level
+          ```
+
+          `{document_id}` is an internal identifier, not the user-facing `uri` (filename, URL, etc.). When you only know a document by its URI or title, use `await list_documents()` to enumerate ids and match against `uri` / `title` — that's a single call to the host. Iterating `/documents/` and reading every `metadata.json` works too but is much slower on portal-scale corpora.
+
+          ### Reading files
+          Read with `Path.read_text()` or `open()` (including `with` blocks); file objects support `.read()`, `.readline()`, and `.readlines()`. A file object cannot be iterated, so read line-wise with `.readlines()` or `.read().split("\n")` instead of `for line in f`. Files are read-only; writing raises `PermissionError`. There is no network. A call has a time limit, named in the error when it is hit, and output past a size is cut with an `... (output truncated)` marker.
+
+          ```python
+          from pathlib import Path
+          import json
+
+          # Discover documents
+          for doc_dir in Path('/documents').iterdir():
+              meta = json.loads((doc_dir / 'metadata.json').read_text())
+              print(meta['title'])
+
+          # Read full text
+          content = Path(f'/documents/{doc_id}/content.txt').read_text()
+
+          # Read and parse items
+          for line in Path(f'/documents/{doc_id}/items.jsonl').read_text().strip().split("\n"):
+              item = json.loads(line)
+              if item['label'] == 'table':
+                  print(item['text'][:200])
+          ```
+
+          ### metadata.json
+          Document metadata: `id`, `title`, `uri`, `created_at`, and `metadata`, the keys stored with the document.
+
+          ### content.txt
+          Full text content. Use for regex or keyword search across a whole document.
+
+          ### items.jsonl
+          Structured document items. One JSON object per line. The row's **line index** is the item's position — `item_range` values in `toc.json` are line-slice bounds into this file.
+
+          Each row carries:
+          - `self_ref`: item reference (e.g. `"#/texts/5"`, `"#/tables/0"`) — used to cross-reference with `doc_item_refs` from search results
+          - `label`: item type — one of `"section_header"`, `"text"`, `"table"`, `"list_item"`, `"caption"`, `"formula"`, `"picture"`, `"code"`, `"footnote"`
+          - `text`: rendered content (tables are markdown with `|` columns)
+          - `page_numbers`: list of page numbers where the item appears
+          - `chunk_ids`: chunks that contain this item — pass to `cite()` to ground an answer that read this item directly
+          - `heading_level`: H-level for `section_header` rows; `0` on non-header rows
+
+          ### chunks.jsonl
+          The document's chunks in order, one JSON object per line: `chunk_id` and `metadata`, the chunk's stored metadata (`doc_item_refs`, `headings`, `labels`, `page_numbers`, and any custom keys such as paragraph or footnote numbers). To read by chunk metadata, keep the matching rows and take the `items.jsonl` rows whose `chunk_ids` name them.
+
+          ### toc.json
+          Section tree derived from `heading_level`: `{"doc_id", "title", "tree": [...]}` where each node has `{self_ref, level, title, page_numbers, item_range: [start, end_exclusive], chunk_ids, children}`. `item_range` is a line slice into `items.jsonl` — `items[start:end]`. `chunk_ids` aggregates the citable chunks across all items in the section — pass directly to `cite()` to ground a section-scoped answer without a corpus-wide `search()` call. `tree: []` for docs with no headers.
+
+          ### Cross-referencing search results with items
+          Search results include `doc_item_refs` (e.g. `["#/texts/48", "#/tables/0"]`) that correspond to `self_ref` values in `items.jsonl`. To find which section a hit lives in: locate the item by `self_ref`, take its line index, and walk `toc.json` to find the deepest node whose `item_range` contains that index.
+
+          ## Questions with attached images
+
+          The user may attach images to their question. An attached image is part of the question, not knowledge-base content. Search the knowledge base for the criteria, standards, or facts named in the question text, cite them, and apply them to the attached image. Never refuse merely because the image itself is not in the knowledge base.
+
+          ## Strategy
+
+          1. Search first.
+          2. Identify the chunk_ids from the search results that support your answer and call `cite` with them. Then write a concise answer.
+          3. Reach for `execute_code` when search results are insufficient or when the task requires computation, aggregation, traversal across documents, or section-scoped reading. From inside code you can search again with different terms, or read `items.jsonl` / `toc.json` / `content.txt` directly from the document filesystem.
+          4. For questions about a *known document's* structure ("which section contains X", "list the sections of doc Y", "summarise section Z"), read `/documents/{id}/toc.json` first. Each node carries `item_range` (a slice into `items.jsonl`) and `chunk_ids` (citable). Prefer this over `search()` for in-document navigation — `search()` ranks across the whole corpus and can return chunks from unrelated documents.
+          5. Before writing your final response, call `cite` with the chunk_ids that ground your answer.
+
+          You MUST call `cite` before producing your final answer, every time, with no exceptions. Pass the chunk IDs that ground the answer, or an empty list when none do — because you are refusing for lack of information, or because the answer is a corpus-level computation. An answer not preceded by `cite` is a protocol violation.
+
+          ## When search returns irrelevant results
+
+          If your first search returns results that clearly don't match the question:
+          - Try one more search with different keywords
+          - If still irrelevant, report that the knowledge base doesn't contain relevant information
+
+          ## Important
+
+          - Variables persist between `execute_code` calls — you can search in one call and process results in the next
+          - Use `print()` to output results — the output is your only feedback
+          - When you write code, execute it — don't describe what code would do. But not every question needs code; simple lookups are best answered by `search → cite`.
+          - Use `await` for all async functions inside `execute_code` (`search`, `list_documents`)
+          - Read files with `Path.read_text()` or `open()`/`with`. For lines use `.readlines()` or `.read().split("\n")`, never `for line in f`.
+          - If the retrieved documents do not directly address the question, say: "I cannot find enough information in the knowledge base to answer this question." Do not guess or infer from tangentially related content. Refusing does not exempt you from `cite` — call it with an empty list to record that nothing grounds the answer.
+          - Do NOT include chunk IDs or UUIDs in your answer text — your answer should read naturally. Use the `cite` tool separately to register citations. `cite{...}` markdown-style inline references do nothing; only an actual `cite` tool call registers a citation.
+          - **Before you write your final answer, invoke the `cite` tool with the supporting chunk_ids, or with an empty list if there are none.** This is the last tool call before answering, every time.
+        role: system
+      - content: What is Python?
+        role: user
+      - content: null
+        reasoning: The user asks "What is Python?" This is a general knowledge question. But I'm a RAG agent over a document
+          knowledge base. I should check whether the knowledge base contains relevant information about Python. Let me search
+          first.
+        role: assistant
+        tool_calls:
+        - function:
+            arguments: '{"query":"What is Python programming language"}'
+            name: search
+          id: call_9csujyqz
+          type: function
+      - content: |-
+          [48a0f21e-442a-46d4-9ea0-b0ae02cde6b6] [rank 1 of 1]
+          Type: text
+          Content:
+          Python is a high-level programming language.
+        role: tool
+        tool_call_id: call_9csujyqz
+      - content: null
+        reasoning: 'The knowledge base contains one relevant chunk: "Python is a high-level programming language." That''s
+          the only grounding available. I should cite that chunk and answer based on it. I shouldn''t fabricate a long general-knowledge
+          answer that isn''t grounded. I''ll give a concise answer grounded on the retrieved content, and can note that''s
+          what the knowledge base states.'
+        role: assistant
+        tool_calls:
+        - function:
+            arguments: '{"chunk_ids":["48a0f21e-442a-46d4-9ea0-b0ae02cde6b6"]}'
+            name: cite
+          id: call_dlb3t8zf
+          type: function
+      - content: Registered 1 citation(s).
+        role: tool
+        tool_call_id: call_dlb3t8zf
+      model: qwen3.8
+      reasoning_effort: medium
+      stream: false
+      temperature: 0.3
+      tool_choice: auto
+      tools:
+      - function:
+          description: Search the knowledge base for evidence to analyze.
+          name: search
+          parameters:
+            additionalProperties: false
+            properties:
+              limit:
+                anyOf:
+                - type: integer
+                - type: 'null'
+                default: null
+              query:
+                type: string
+            required:
+            - query
+            type: object
+        type: function
+      - function:
+          description: Execute Python against the sandboxed document filesystem.
+          name: execute_code
+          parameters:
+            additionalProperties: false
+            properties:
+              code:
+                type: string
+            required:
+            - code
+            type: object
+        type: function
+      - function:
+          description: Register exact retrieved chunk IDs as citations for the answer.
+          name: cite
+          parameters:
+            additionalProperties: false
+            properties:
+              chunk_ids:
+                items:
+                  type: string
+                type: array
+            required:
+            - chunk_ids
+            type: object
+        type: function
+    uri: http://localhost:11434/v1/chat/completions
+  response:
+    headers:
+      content-length:
+      - '1025'
+      content-type:
+      - application/json
+    parsed_body:
+      choices:
+      - finish_reason: stop
+        index: 0
+        message:
+          content: |-
+            According to the knowledge base, **Python is a high-level programming language**.
+
+            That's the only information the knowledge base contains about Python, so I can't provide a more detailed description from it. If you'd like, I can search for more specific topics (e.g., Python libraries, syntax, or use cases) if they exist in the corpus.
+          reasoning: 'The knowledge base only contains one fact about Python: "Python is a high-level programming language."
+            I should answer grounded on that. I won''t pad with ungrounded general knowledge beyond what''s reasonable, but
+            I can give a brief, accurate answer. The grounding is minimal, so I''ll keep the answer concise and faithful to
+            the source.'
+          role: assistant
+      created: 1789133054
+      id: chatcmpl-708
+      model: qwen3.8
+      object: chat.completion
+      system_fingerprint: fp_ollama
+      usage:
+        completion_tokens: 144
+        prompt_tokens: 3174
+        prompt_tokens_details:
+          cached_tokens: 3152
+        total_tokens: 3318
+    status:
+      code: 200
+      message: OK
+version: 1

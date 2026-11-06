@@ -1,0 +1,976 @@
+import asyncio
+import json
+import uuid
+from collections.abc import Collection, Iterable, Mapping
+from datetime import UTC, datetime, timedelta
+
+import sqlalchemy as sa
+from sqlalchemy.dialects import postgresql
+from sqlalchemy.dialects import sqlite as sqlite_dialect
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncEngine
+
+from haiku.rag.ingester.exceptions import BlockingTombstoneError
+from haiku.rag.ingester.queue.db import jobs, sync_state
+from haiku.rag.ingester.queue.models import (
+    Job,
+    JobOp,
+    JobStatus,
+    SyncRow,
+    SyncStateRow,
+)
+
+# URIs per UPDATE. SQLite and Postgres both cap bind parameters per statement,
+# and a rebuilt database can invalidate a whole corpus in one call.
+INVALIDATE_BATCH = 500
+
+
+def _utcnow_iso() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+def _parse_dt(value: str | None) -> datetime | None:
+    return datetime.fromisoformat(value) if value else None
+
+
+def _insert(table: sa.Table, dialect: str):
+    """Dialect-specific INSERT exposing on_conflict_* (and `.excluded`)."""
+    if dialect == "postgresql":
+        return postgresql.insert(table)
+    return sqlite_dialect.insert(table)
+
+
+def _requeued() -> dict:
+    """The values that return a terminal job to the queue, claimable at once."""
+    return {
+        "status": "queued",
+        "attempts": 0,
+        "last_error": None,
+        "claimed_at": None,
+        "claimed_by": None,
+        "last_heartbeat_at": None,
+        "completed_at": None,
+        "scheduled_at": _utcnow_iso(),
+        "conversion_stalled": False,
+    }
+
+
+def _attempts_minus_one() -> sa.ColumnElement[int]:
+    """attempts - 1, floored at 0. Renders identically on both dialects."""
+    return sa.case((jobs.c.attempts - 1 < 0, 0), else_=jobs.c.attempts - 1)
+
+
+def _of_sources(source_ids: Collection[str] | None) -> list[sa.ColumnElement[bool]]:
+    """The condition limiting jobs to `source_ids`, none for None."""
+    if source_ids is None:
+        return []
+    return [jobs.c.source_id.in_(sorted(source_ids))]
+
+
+def _row_to_job(row: Mapping) -> Job:
+    extra_text = row["extra"]
+    return Job(
+        id=row["id"],
+        source_id=row["source_id"],
+        uri=row["uri"],
+        op=JobOp(row["op"]),
+        content_hash=row["content_hash"],
+        revision=row["revision"],
+        status=JobStatus(row["status"]),
+        attempts=row["attempts"],
+        max_attempts=row["max_attempts"],
+        last_error=row["last_error"],
+        conversion_stalled=bool(row["conversion_stalled"]),
+        extra=json.loads(extra_text) if extra_text else None,
+        enqueued_at=datetime.fromisoformat(row["enqueued_at"]),
+        scheduled_at=datetime.fromisoformat(row["scheduled_at"]),
+        claimed_at=_parse_dt(row["claimed_at"]),
+        claimed_by=row["claimed_by"],
+        last_heartbeat_at=_parse_dt(row["last_heartbeat_at"]),
+        completed_at=_parse_dt(row["completed_at"]),
+    )
+
+
+def _row_to_sync_state(row: Mapping) -> SyncStateRow:
+    return SyncStateRow(
+        source_id=row["source_id"],
+        uri=row["uri"],
+        revision=row["revision"],
+        content_hash=row["content_hash"],
+        last_seen_at=datetime.fromisoformat(row["last_seen_at"]),
+        last_ingested_at=_parse_dt(row["last_ingested_at"]),
+    )
+
+
+class JobRepo:
+    def __init__(self, engine: AsyncEngine, namespace: str = ""):
+        self._engine = engine
+        self._dialect = engine.dialect.name
+        self._namespace = namespace
+        # Every statement carries it: an ingester sharing the queue never reads
+        # or writes another ingester's rows.
+        self._owned = jobs.c.namespace == namespace
+        # Notified after a successful enqueue so workers in this process wake
+        # immediately instead of polling on a fixed sleep interval. Workers in
+        # other processes (a shared Postgres queue) fall back to polling.
+        self.job_available = asyncio.Condition()
+
+    async def enqueue(
+        self,
+        source_id: str,
+        uri: str,
+        op: JobOp = JobOp.UPSERT,
+        *,
+        revision: str | None = None,
+        content_hash: str | None = None,
+        max_attempts: int = 5,
+        extra: dict | None = None,
+    ) -> Job | None:
+        """Enqueue an upsert/delete job. Returns the inserted Job, or None if a
+        live (queued/claimed) job already exists for the same (source_id, uri).
+        The partial unique index enforces atomicity.
+
+        Also returns None when a stalled conversion holds the same
+        `uq_jobs_blocking_op` slot, which is (source_id, uri, op, revision): the
+        same bytes stall again. A new revision, a DELETE, a DLQ retry and a
+        successful DELETE's `prune_unsuccessful` each free it."""
+        job_id = str(uuid.uuid4())
+        now = _utcnow_iso()
+        extra_json = json.dumps(extra) if extra is not None else None
+        stmt = (
+            _insert(jobs, self._dialect)
+            .values(
+                id=job_id,
+                namespace=self._namespace,
+                source_id=source_id,
+                uri=uri,
+                op=op.value,
+                content_hash=content_hash,
+                revision=revision,
+                status="queued",
+                attempts=0,
+                max_attempts=max_attempts,
+                last_error=None,
+                extra=extra_json,
+                enqueued_at=now,
+                scheduled_at=now,
+            )
+            .on_conflict_do_nothing()
+            .returning(*jobs.c)
+        )
+        async with self._engine.begin() as conn:
+            row = (await conn.execute(stmt)).mappings().one_or_none()
+        if row is not None:
+            async with self.job_available:
+                self.job_available.notify_all()
+        return _row_to_job(row) if row else None
+
+    def _ready(
+        self, now: str, source_ids: Collection[str] | None
+    ) -> list[sa.ColumnElement[bool]]:
+        """The jobs a claim can take at `now`."""
+        return [
+            self._owned,
+            jobs.c.status == "queued",
+            jobs.c.scheduled_at <= now,
+            *_of_sources(source_ids),
+        ]
+
+    async def ready_sources(self, source_ids: Collection[str]) -> set[str]:
+        """The sources in `source_ids` with a job a claim can take now."""
+        stmt = (
+            sa.select(jobs.c.source_id)
+            .distinct()
+            .where(*self._ready(_utcnow_iso(), source_ids))
+        )
+        async with self._engine.connect() as conn:
+            return set((await conn.execute(stmt)).scalars())
+
+    async def claim_next(
+        self, worker_id: str, *, source_ids: Collection[str] | None = None
+    ) -> Job | None:
+        """Atomically claim the oldest queued job whose scheduled_at <= now.
+        A single `UPDATE ... WHERE id = (SELECT ... LIMIT 1) RETURNING` keeps
+        the claim atomic across connections: on Postgres the subquery adds
+        `FOR UPDATE SKIP LOCKED`; on SQLite the whole statement runs under one
+        write lock, so a racing connection re-evaluates the subquery against
+        the committed state and finds the row already claimed.
+
+        `source_ids` limits the claim to jobs of those sources, and an empty
+        collection claims nothing. None claims from every source."""
+        now = _utcnow_iso()
+        candidate = (
+            sa.select(jobs.c.id)
+            .where(*self._ready(now, source_ids))
+            .order_by(jobs.c.scheduled_at, jobs.c.id)
+            .limit(1)
+            .with_for_update(skip_locked=True)
+            .scalar_subquery()
+        )
+        claim = (
+            sa.update(jobs)
+            .where(jobs.c.id == candidate)
+            .values(
+                status="claimed",
+                claimed_at=now,
+                claimed_by=worker_id,
+                last_heartbeat_at=now,
+                attempts=jobs.c.attempts + 1,
+            )
+            .returning(*jobs.c)
+        )
+        async with self._engine.begin() as conn:
+            row = (await conn.execute(claim)).mappings().one_or_none()
+        return _row_to_job(row) if row else None
+
+    async def get_job(self, job_id: str) -> Job | None:
+        async with self._engine.connect() as conn:
+            row = (
+                (
+                    await conn.execute(
+                        sa.select(jobs).where(self._owned, jobs.c.id == job_id)
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+        return _row_to_job(row) if row else None
+
+    async def _complete(self, job_id: str, claimed_by: str, **values) -> bool:
+        """Transition a still-claimed job to a terminal status. Guarded on
+        `status='claimed' AND claimed_by=?` so a reaper-resurrected job
+        picked up by a different worker isn't clobbered by the original
+        slow worker. Returns True when the row was updated."""
+        stmt = (
+            sa.update(jobs)
+            .where(
+                self._owned,
+                jobs.c.id == job_id,
+                jobs.c.status == "claimed",
+                jobs.c.claimed_by == claimed_by,
+            )
+            .values(completed_at=_utcnow_iso(), **values)
+            .returning(jobs.c.id)
+        )
+        async with self._engine.begin() as conn:
+            row = (await conn.execute(stmt)).first()
+        return row is not None
+
+    async def mark_succeeded(self, job_id: str, claimed_by: str) -> bool:
+        """Transition a still-claimed job to `succeeded`."""
+        return await self._complete(job_id, claimed_by, status="succeeded")
+
+    async def mark_dead(
+        self,
+        job_id: str,
+        error: str,
+        claimed_by: str,
+        *,
+        conversion_stalled: bool = False,
+    ) -> bool:
+        """Transition a still-claimed job to `dead`."""
+        return await self._complete(
+            job_id,
+            claimed_by,
+            status="dead",
+            last_error=error,
+            conversion_stalled=conversion_stalled,
+        )
+
+    async def mark_rejected(self, job_id: str, error: str, claimed_by: str) -> bool:
+        """Transition a still-claimed job to `rejected`: a hook refused the
+        document."""
+        return await self._complete(
+            job_id, claimed_by, status="rejected", last_error=error
+        )
+
+    async def reschedule(
+        self, job_id: str, delay_seconds: float, error: str, claimed_by: str
+    ) -> bool:
+        """Reset a still-claimed job back to `queued` with a future
+        scheduled_at. Guarded on `status='claimed' AND claimed_by=?` so a
+        slow worker can't clobber a re-claim that happened after the reaper
+        reset its claim. Returns True when the row was updated."""
+        scheduled = (datetime.now(UTC) + timedelta(seconds=delay_seconds)).isoformat()
+        stmt = (
+            sa.update(jobs)
+            .where(
+                self._owned,
+                jobs.c.id == job_id,
+                jobs.c.status == "claimed",
+                jobs.c.claimed_by == claimed_by,
+            )
+            .values(
+                status="queued",
+                scheduled_at=scheduled,
+                claimed_at=None,
+                claimed_by=None,
+                last_heartbeat_at=None,
+                last_error=error,
+            )
+            .returning(jobs.c.id)
+        )
+        async with self._engine.begin() as conn:
+            row = (await conn.execute(stmt)).first()
+        return row is not None
+
+    async def retry(self, job_id: str) -> Job:
+        """Reset a `dead`, `rejected` or `queued` job: status='queued',
+        attempts=0, error cleared, scheduled for immediate re-claim. Refuses
+        `claimed` rows (would race with the worker still processing) and
+        `succeeded` rows (re-ingest via UPSERT instead). Raises KeyError when
+        the row is missing or in a non-retryable state.
+
+        Idempotent against a live sibling: if a live (queued/claimed) job
+        already exists for the same (source_id, uri), reviving the dead row
+        would violate `uq_jobs_live`; instead the existing live job is returned
+        and the dead row is left dead."""
+        stmt = (
+            sa.update(jobs)
+            .where(
+                self._owned,
+                jobs.c.id == job_id,
+                jobs.c.status.in_(["dead", "rejected", "queued"]),
+            )
+            .values(**_requeued())
+            .returning(*jobs.c)
+        )
+        collided = False
+        try:
+            async with self._engine.begin() as conn:
+                row = (await conn.execute(stmt)).mappings().one_or_none()
+        except IntegrityError:
+            collided = True
+            row = None
+        if row is not None:
+            return _row_to_job(row)
+        if collided:
+            target = await self.get_job(job_id)
+            if target is not None:
+                live = await self._live_sibling(target.source_id, target.uri)
+                if live is not None:
+                    return live
+                blocking = await self._blocking_tombstone(target)
+                if blocking is not None:
+                    raise BlockingTombstoneError(job_id, blocking)
+        raise KeyError(f"Job {job_id!r} not found or not retryable")
+
+    async def retry_failed(
+        self,
+        statuses: Collection[JobStatus],
+        *,
+        source_ids: Collection[str] | None = None,
+    ) -> int:
+        """Re-queue the latest failed job of each URI whose status is in
+        `statuses`, unless the URI was ingested after it. `source_ids` limits
+        it to those sources' jobs, and None retries every source's. Returns
+        how many were re-queued.
+
+        Assumes no discovery runs meanwhile: a job enqueued between a revive's
+        lock and its update can complete unseen and leave a superseded failure
+        re-queued. `run-batch` retries after its sweep, and
+        `BasePoller.retry_failed` holds the sweep lock."""
+        wanted = {status.value for status in statuses}
+        refused = wanted - {JobStatus.DEAD.value, JobStatus.REJECTED.value}
+        if refused:
+            raise ValueError(
+                "retry_failed re-queues dead and rejected jobs, not "
+                + ", ".join(sorted(refused))
+            )
+        query = (
+            sa.select(jobs.c.id)
+            .where(self._owned, jobs.c.status.in_(wanted), *_of_sources(source_ids))
+            .order_by(jobs.c.completed_at, jobs.c.id)
+        )
+        async with self._engine.connect() as conn:
+            ids = (await conn.execute(query)).scalars().all()
+        revived = 0
+        for job_id in ids:
+            if await self._revive(job_id, wanted):
+                revived += 1
+        return revived
+
+    async def _revive(self, job_id: str, statuses: Collection[str]) -> bool:
+        """Re-queue one failed job if it is still the latest outcome of its
+        URI. Locks the URI's live jobs first, so a completion in flight
+        commits before the update reads the table."""
+        later = jobs.alias("later")
+        superseded = sa.exists().where(
+            later.c.namespace == jobs.c.namespace,
+            later.c.source_id == jobs.c.source_id,
+            later.c.uri == jobs.c.uri,
+            later.c.status.in_(["succeeded", "dead", "rejected"]),
+            sa.or_(
+                later.c.completed_at > jobs.c.completed_at,
+                sa.and_(
+                    later.c.completed_at == jobs.c.completed_at,
+                    later.c.id > jobs.c.id,
+                ),
+            ),
+        )
+        ingested_since = sa.exists().where(
+            sync_state.c.namespace == jobs.c.namespace,
+            sync_state.c.source_id == jobs.c.source_id,
+            sync_state.c.uri == jobs.c.uri,
+            sync_state.c.last_ingested_at >= jobs.c.completed_at,
+        )
+        key = sa.select(jobs.c.source_id, jobs.c.uri).where(
+            self._owned, jobs.c.id == job_id
+        )
+        update = (
+            sa.update(jobs)
+            .where(
+                self._owned,
+                jobs.c.id == job_id,
+                jobs.c.status.in_(statuses),
+                ~superseded,
+                ~ingested_since,
+            )
+            .values(**_requeued())
+            .returning(jobs.c.id)
+        )
+        try:
+            async with self._engine.begin() as conn:
+                row = (await conn.execute(key)).one_or_none()
+                if row is None:
+                    return False
+                await conn.execute(
+                    sa.select(jobs.c.id)
+                    .where(
+                        self._owned,
+                        jobs.c.source_id == row.source_id,
+                        jobs.c.uri == row.uri,
+                        jobs.c.status.in_(["queued", "claimed"]),
+                    )
+                    .with_for_update()
+                )
+                return (await conn.execute(update)).first() is not None
+        except IntegrityError:
+            return False
+
+    async def _blocking_tombstone(self, target: Job) -> str | None:
+        """The id of the stalled-conversion row holding `target`'s slot."""
+        query = (
+            sa.select(jobs.c.id)
+            .where(
+                self._owned,
+                jobs.c.source_id == target.source_id,
+                jobs.c.uri == target.uri,
+                jobs.c.op == target.op.value,
+                sa.func.coalesce(jobs.c.revision, "")
+                == sa.func.coalesce(sa.literal(target.revision), ""),
+                jobs.c.status == "dead",
+                jobs.c.conversion_stalled.is_(True),
+                jobs.c.id != target.id,
+            )
+            .limit(1)
+        )
+        async with self._engine.connect() as conn:
+            return (await conn.execute(query)).scalar_one_or_none()
+
+    async def _live_sibling(self, source_id: str, uri: str) -> Job | None:
+        """The live (queued/claimed) job for a (source_id, uri), if any.
+        `uq_jobs_live` guarantees at most one."""
+        query = (
+            sa.select(jobs)
+            .where(
+                self._owned,
+                jobs.c.source_id == source_id,
+                jobs.c.uri == uri,
+                jobs.c.status.in_(["queued", "claimed"]),
+            )
+            .limit(1)
+        )
+        async with self._engine.connect() as conn:
+            row = (await conn.execute(query)).mappings().one_or_none()
+        return _row_to_job(row) if row else None
+
+    async def cancel(self, job_id: str) -> bool:
+        """True iff a queued/claimed row was removed; terminal jobs aren't
+        cancellable (succeeded, dead and rejected rows are kept for history)."""
+        stmt = (
+            sa.delete(jobs)
+            .where(
+                self._owned,
+                jobs.c.id == job_id,
+                jobs.c.status.in_(["queued", "claimed"]),
+            )
+            .returning(jobs.c.id)
+        )
+        async with self._engine.begin() as conn:
+            row = (await conn.execute(stmt)).first()
+        return row is not None
+
+    async def cancel_unconfigured(self, source_ids: Collection[str]) -> int:
+        """Delete the queued and claimed jobs of every source outside
+        `source_ids`. Returns how many were deleted.
+
+        A claim is deleted too, so this runs only while no process serves
+        those sources."""
+        return await self._cancel_live(jobs.c.source_id.notin_(sorted(source_ids)))
+
+    async def cancel_sources(self, source_ids: Collection[str]) -> int:
+        """Delete the queued and claimed jobs of `source_ids`, which no worker
+        may be processing. Returns how many were deleted."""
+        return await self._cancel_live(*_of_sources(source_ids))
+
+    async def _cancel_live(self, *conditions: sa.ColumnElement[bool]) -> int:
+        stmt = sa.delete(jobs).where(
+            self._owned, jobs.c.status.in_(["queued", "claimed"]), *conditions
+        )
+        async with self._engine.begin() as conn:
+            result = await conn.execute(stmt)
+        return result.rowcount or 0
+
+    async def list_jobs(
+        self,
+        *,
+        status: JobStatus | None = None,
+        source_id: str | None = None,
+        uri: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[Job]:
+        query = sa.select(jobs).where(self._owned)
+        if status is not None:
+            query = query.where(jobs.c.status == status.value)
+        if source_id is not None:
+            query = query.where(jobs.c.source_id == source_id)
+        if uri is not None:
+            query = query.where(jobs.c.uri == uri)
+        query = query.order_by(jobs.c.enqueued_at.desc()).limit(limit).offset(offset)
+        async with self._engine.connect() as conn:
+            rows = (await conn.execute(query)).mappings().all()
+        return [_row_to_job(r) for r in rows]
+
+    async def live_jobs(self, source_ids: Collection[str]) -> list[Job]:
+        """Every queued and claimed job of `source_ids`, oldest first."""
+        query = (
+            sa.select(jobs)
+            .where(
+                self._owned,
+                jobs.c.status.in_(["queued", "claimed"]),
+                *_of_sources(source_ids),
+            )
+            .order_by(jobs.c.enqueued_at, jobs.c.id)
+        )
+        async with self._engine.connect() as conn:
+            rows = (await conn.execute(query)).mappings().all()
+        return [_row_to_job(row) for row in rows]
+
+    async def has_pending(self, source_id: str) -> bool:
+        """True iff at least one queued/claimed job exists for the source.
+        A one-shot sweep skips such a source."""
+        query = (
+            sa.select(jobs.c.id)
+            .where(
+                self._owned,
+                jobs.c.source_id == source_id,
+                jobs.c.status.in_(["queued", "claimed"]),
+            )
+            .limit(1)
+        )
+        async with self._engine.connect() as conn:
+            row = (await conn.execute(query)).first()
+        return row is not None
+
+    async def counts_by_status(self) -> dict[str, int]:
+        query = (
+            sa.select(jobs.c.status, sa.func.count().label("n"))
+            .where(self._owned)
+            .group_by(jobs.c.status)
+        )
+        async with self._engine.connect() as conn:
+            rows = (await conn.execute(query)).all()
+        return {status: n for status, n in rows}
+
+    async def counts_by_status_since(
+        self, since: datetime, *, source_ids: Collection[str] | None = None
+    ) -> dict[str, int]:
+        """status -> count of jobs that reached a terminal state at or after
+        `since` (by completed_at). Only succeeded, dead and rejected set
+        completed_at, so those are the only keys returned. Lets a one-shot batch report the
+        work it finished, independent of terminal rows from earlier runs.
+        `source_ids` limits the counts to those sources' jobs."""
+        query = (
+            sa.select(jobs.c.status, sa.func.count().label("n"))
+            .where(
+                self._owned,
+                jobs.c.completed_at >= since.isoformat(),
+                *_of_sources(source_ids),
+            )
+            .group_by(jobs.c.status)
+        )
+        async with self._engine.connect() as conn:
+            rows = (await conn.execute(query)).all()
+        return {status: n for status, n in rows}
+
+    async def batch_progress_counts_since(
+        self, since: datetime, *, source_ids: Collection[str] | None = None
+    ) -> dict[str, int]:
+        """Counts for a one-shot batch progress snapshot.
+
+        Live rows are counted regardless of enqueue time because run-batch
+        drains the whole pending queue. Terminal rows are counted only when
+        this run completed them, matching BatchReport semantics.
+        `source_ids` limits the counts to those sources' jobs.
+        """
+        query = (
+            sa.select(jobs.c.status, sa.func.count().label("n"))
+            .where(
+                self._owned,
+                sa.or_(
+                    jobs.c.status.in_(["queued", "claimed"]),
+                    jobs.c.completed_at >= since.isoformat(),
+                ),
+                *_of_sources(source_ids),
+            )
+            .group_by(jobs.c.status)
+        )
+        async with self._engine.connect() as conn:
+            rows = (await conn.execute(query)).all()
+        return {status: n for status, n in rows}
+
+    async def count_succeeded_since(self, seconds: int) -> int:
+        """How many jobs reached `succeeded` in the last `seconds` seconds.
+        Drives the dashboard's rolling-throughput chips."""
+        threshold = (datetime.now(UTC) - timedelta(seconds=seconds)).isoformat()
+        query = sa.select(sa.func.count()).where(
+            self._owned,
+            jobs.c.status == "succeeded",
+            jobs.c.completed_at >= threshold,
+        )
+        async with self._engine.connect() as conn:
+            count = (await conn.execute(query)).scalar()
+        return int(count or 0)
+
+    async def oldest_queued_age_seconds(self) -> float | None:
+        """Age (in seconds) of the oldest job sitting in `queued` whose
+        scheduled_at is in the past. Returns None when nothing is waiting.
+        Tells operators whether work is backing up."""
+        now = datetime.now(UTC)
+        query = sa.select(sa.func.min(jobs.c.scheduled_at)).where(
+            self._owned,
+            jobs.c.status == "queued",
+            jobs.c.scheduled_at <= now.isoformat(),
+        )
+        async with self._engine.connect() as conn:
+            oldest = (await conn.execute(query)).scalar()
+        if oldest is None:
+            return None
+        return (now - datetime.fromisoformat(oldest)).total_seconds()
+
+    async def counts_by_source(self, *statuses: str) -> dict[str, int]:
+        """source_id → count of jobs in any of the given statuses. Drives the
+        dashboard's per-source DLQ, rejected and backlog summaries."""
+        if not statuses:
+            return {}
+        query = (
+            sa.select(jobs.c.source_id, sa.func.count().label("n"))
+            .where(self._owned, jobs.c.status.in_(statuses))
+            .group_by(jobs.c.source_id)
+        )
+        async with self._engine.connect() as conn:
+            rows = (await conn.execute(query)).all()
+        return {source_id: n for source_id, n in rows}
+
+    async def release_if_claimed(self, job_id: str, claimed_by: str) -> bool:
+        """Reset a still-claimed job back to queued, immediately reclaimable.
+        Guarded on `status='claimed' AND claimed_by=?` so the cancel-cleanup
+        of a slow worker doesn't strip the claim of a different worker that
+        re-claimed after a reaper reset. Decrements attempts to undo the
+        increment from `claim_next`, since a cancellation isn't a failed
+        attempt. Returns True if the row was released."""
+        stmt = (
+            sa.update(jobs)
+            .where(
+                self._owned,
+                jobs.c.id == job_id,
+                jobs.c.status == "claimed",
+                jobs.c.claimed_by == claimed_by,
+            )
+            .values(
+                status="queued",
+                claimed_at=None,
+                claimed_by=None,
+                last_heartbeat_at=None,
+                scheduled_at=_utcnow_iso(),
+                attempts=_attempts_minus_one(),
+            )
+            .returning(jobs.c.id)
+        )
+        async with self._engine.begin() as conn:
+            row = (await conn.execute(stmt)).first()
+        return row is not None
+
+    async def prune_unsuccessful(self, source_id: str, uri: str) -> int:
+        """Delete dead and rejected jobs for the given (source_id, uri).
+        Called after a successful DELETE to clear stale UPSERT failures for
+        the same URI — the document is gone, so a "couldn't ingest this" entry
+        is no longer actionable. Returns the number of rows removed."""
+        stmt = sa.delete(jobs).where(
+            self._owned,
+            jobs.c.source_id == source_id,
+            jobs.c.uri == uri,
+            jobs.c.status.in_(["dead", "rejected"]),
+        )
+        async with self._engine.begin() as conn:
+            result = await conn.execute(stmt)
+        return result.rowcount or 0
+
+    async def prune_terminal(self, max_age_seconds: int) -> int:
+        """Delete terminal jobs (succeeded/dead/rejected) whose completed_at
+        is older than max_age_seconds. General housekeeping so the table
+        doesn't grow without bound. Returns the number of rows removed."""
+        threshold = (datetime.now(UTC) - timedelta(seconds=max_age_seconds)).isoformat()
+        stmt = sa.delete(jobs).where(
+            self._owned,
+            jobs.c.status.in_(["succeeded", "dead", "rejected"]),
+            jobs.c.completed_at < threshold,
+            # A stalled conversion's row is what stops discovery re-enqueuing
+            # the document, and age is not evidence the document changed.
+            jobs.c.conversion_stalled.is_(False),
+        )
+        async with self._engine.begin() as conn:
+            result = await conn.execute(stmt)
+        return result.rowcount or 0
+
+    async def reap_stale(
+        self, lease_ttl_seconds: int, *, keep: Collection[str] = ()
+    ) -> int:
+        """Reset claimed jobs whose lease has gone stale back to `queued`,
+        except the job ids in `keep`. A live worker renews its lease via
+        `renew_claims`, so a claim is stale only when its owner stopped
+        renewing (crash, wedged loop, lost DB).
+        Staleness is measured against the last heartbeat, falling back to
+        claimed_at for a claim made by a process that doesn't write the lease
+        (an older version sharing the queue). Decrements `attempts` to undo the
+        increment from `claim_next` — a reaped worker isn't a consumed attempt."""
+        threshold = (
+            datetime.now(UTC) - timedelta(seconds=lease_ttl_seconds)
+        ).isoformat()
+        lease = sa.func.coalesce(jobs.c.last_heartbeat_at, jobs.c.claimed_at)
+        stmt = (
+            sa.update(jobs)
+            .where(
+                self._owned,
+                jobs.c.status == "claimed",
+                lease < threshold,
+                jobs.c.id.not_in(sorted(keep)),
+            )
+            .values(
+                status="queued",
+                claimed_at=None,
+                claimed_by=None,
+                last_heartbeat_at=None,
+                attempts=_attempts_minus_one(),
+            )
+        )
+        async with self._engine.begin() as conn:
+            result = await conn.execute(stmt)
+        return result.rowcount or 0
+
+    async def renew_claims(self, claims: Mapping[str, str]) -> int:
+        """Refresh `last_heartbeat_at` for the given `job_id -> claimed_by`
+        pairs, extending their lease so the reaper leaves them alone. Guarded
+        on `status='claimed' AND claimed_by=?` per pair, so a job already
+        reaped and re-claimed elsewhere is left untouched — renewal never
+        resurrects a lost claim. Returns the number of rows renewed."""
+        if not claims:
+            return 0
+        now = _utcnow_iso()
+        pair_match = sa.or_(
+            *(
+                sa.and_(jobs.c.id == job_id, jobs.c.claimed_by == worker_id)
+                for job_id, worker_id in claims.items()
+            )
+        )
+        stmt = (
+            sa.update(jobs)
+            .where(self._owned, jobs.c.status == "claimed", pair_match)
+            .values(last_heartbeat_at=now)
+        )
+        async with self._engine.begin() as conn:
+            result = await conn.execute(stmt)
+        return result.rowcount or 0
+
+
+class SyncStateRepo:
+    def __init__(self, engine: AsyncEngine, namespace: str = ""):
+        self._engine = engine
+        self._dialect = engine.dialect.name
+        self._namespace = namespace
+        self._owned = sync_state.c.namespace == namespace
+
+    async def get_revision_snapshot(self, source_id: str) -> dict[str, str]:
+        """uri -> revision map for URIs that have a stored revision. Sources
+        compare current revision against this map to decide UPSERT vs
+        UNCHANGED. A stored revision means the file was accounted for at that
+        revision — successfully ingested OR permanently failed; both suppress
+        re-enqueue until the revision changes. Rows without a revision (HTTP
+        without ETag, or a worker that didn't complete) are excluded — they
+        have no revision to compare against; the closing-loop DELETE diff uses
+        list_known_uris instead."""
+        query = sa.select(sync_state.c.uri, sync_state.c.revision).where(
+            self._owned,
+            sync_state.c.source_id == source_id,
+            sync_state.c.revision.is_not(None),
+        )
+        async with self._engine.connect() as conn:
+            rows = (await conn.execute(query)).all()
+        return {uri: revision for uri, revision in rows}
+
+    async def list_known_uris(self, source_id: str) -> set[str]:
+        """Every URI the source has ever produced. Used by the closing-loop
+        diff in discover() so a URI previously seen but no longer visible
+        (FS file deleted, HTTP URL removed from config) emits DELETE."""
+        query = sa.select(sync_state.c.uri).where(
+            self._owned, sync_state.c.source_id == source_id
+        )
+        async with self._engine.connect() as conn:
+            rows = (await conn.execute(query)).all()
+        return {uri for (uri,) in rows}
+
+    async def get_row(self, source_id: str, uri: str) -> SyncStateRow | None:
+        query = sa.select(sync_state).where(
+            self._owned, sync_state.c.source_id == source_id, sync_state.c.uri == uri
+        )
+        async with self._engine.connect() as conn:
+            row = (await conn.execute(query)).mappings().one_or_none()
+        return _row_to_sync_state(row) if row else None
+
+    def _upsert_stmt(
+        self,
+        source_id: str,
+        uri: str,
+        revision: str | None,
+        content_hash: str | None,
+        last_seen_at: str,
+        last_ingested_at: str | None,
+    ):
+        ins = _insert(sync_state, self._dialect).values(
+            namespace=self._namespace,
+            source_id=source_id,
+            uri=uri,
+            revision=revision,
+            content_hash=content_hash,
+            last_seen_at=last_seen_at,
+            last_ingested_at=last_ingested_at,
+        )
+        excluded = ins.excluded
+        return ins.on_conflict_do_update(
+            index_elements=[
+                sync_state.c.namespace,
+                sync_state.c.source_id,
+                sync_state.c.uri,
+            ],
+            set_={
+                "revision": sa.func.coalesce(excluded.revision, sync_state.c.revision),
+                "content_hash": sa.func.coalesce(
+                    excluded.content_hash, sync_state.c.content_hash
+                ),
+                "last_seen_at": excluded.last_seen_at,
+                "last_ingested_at": sa.func.coalesce(
+                    excluded.last_ingested_at, sync_state.c.last_ingested_at
+                ),
+            },
+        )
+
+    async def upsert(
+        self,
+        source_id: str,
+        uri: str,
+        *,
+        revision: str | None = None,
+        content_hash: str | None = None,
+        ingested: bool = False,
+    ) -> None:
+        """Insert-or-update the sync_state row. `ingested=True` stamps
+        last_ingested_at; otherwise only last_seen_at is bumped.
+        `revision=None` and `content_hash=None` leave any existing values
+        untouched."""
+        now = _utcnow_iso()
+        stmt = self._upsert_stmt(
+            source_id, uri, revision, content_hash, now, now if ingested else None
+        )
+        async with self._engine.begin() as conn:
+            await conn.execute(stmt)
+
+    async def batch_upsert(self, rows: list[SyncRow]) -> None:
+        """Batch insert-or-update sync_state rows in a single transaction."""
+        if not rows:
+            return
+        now = _utcnow_iso()
+        async with self._engine.begin() as conn:
+            for source_id, uri, revision, content_hash, ingested in rows:
+                stmt = self._upsert_stmt(
+                    source_id,
+                    uri,
+                    revision,
+                    content_hash,
+                    now,
+                    now if ingested else None,
+                )
+                await conn.execute(stmt)
+
+    async def list_ingested_uris(self, source_id: str) -> set[str]:
+        """Every URI this source has successfully written a document for.
+
+        Narrower than `list_known_uris` and than the revision snapshot: a
+        revision is also written for a permanently failed job, to suppress
+        re-enqueue, so only `last_ingested_at` distinguishes a document the
+        source produced from one it gave up on.
+        """
+        query = sa.select(sync_state.c.uri).where(
+            self._owned,
+            sync_state.c.source_id == source_id,
+            sync_state.c.last_ingested_at.is_not(None),
+        )
+        async with self._engine.connect() as conn:
+            rows = (await conn.execute(query)).all()
+        return {uri for (uri,) in rows}
+
+    async def invalidate(self, source_id: str, uris: Iterable[str]) -> None:
+        """Clear the stored revision and content hash, keeping the rows.
+
+        `upsert` cannot: it coalesces both columns so the watch path can
+        enqueue without claiming a revision the worker has not written yet.
+        """
+        targets = list(uris)
+        if not targets:
+            return
+        async with self._engine.begin() as conn:
+            for start in range(0, len(targets), INVALIDATE_BATCH):
+                await conn.execute(
+                    sa.update(sync_state)
+                    .where(
+                        self._owned,
+                        sync_state.c.source_id == source_id,
+                        sync_state.c.uri.in_(targets[start : start + INVALIDATE_BATCH]),
+                    )
+                    .values(revision=None, content_hash=None)
+                )
+
+    async def retire(self, source_id: str, uri: str, revision: str) -> None:
+        """Keep `uri` accounted for at `revision` with no ingested document."""
+        delete = sa.delete(sync_state).where(
+            self._owned, sync_state.c.source_id == source_id, sync_state.c.uri == uri
+        )
+        insert = self._upsert_stmt(source_id, uri, revision, None, _utcnow_iso(), None)
+        async with self._engine.begin() as conn:
+            await conn.execute(delete)
+            await conn.execute(insert)
+
+    async def delete(self, source_id: str, uri: str) -> None:
+        stmt = sa.delete(sync_state).where(
+            self._owned, sync_state.c.source_id == source_id, sync_state.c.uri == uri
+        )
+        async with self._engine.begin() as conn:
+            await conn.execute(stmt)
+
+    async def delete_sources(self, source_ids: Collection[str]) -> None:
+        stmt = sa.delete(sync_state).where(
+            self._owned, sync_state.c.source_id.in_(sorted(source_ids))
+        )
+        async with self._engine.begin() as conn:
+            await conn.execute(stmt)

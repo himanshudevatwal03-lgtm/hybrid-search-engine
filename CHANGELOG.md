@@ -1,0 +1,3439 @@
+# Changelog
+
+## [Unreleased]
+
+### Changed
+
+- Web app: the frontend image runs on Node 26 and pnpm 12. Frontend dependencies are at their latest releases, among them `@ag-ui/client` 1.0, React 19.3 and Next 16.4.5.
+- Web app: the backend runs on `ag-ui-protocol` 1.0.
+
+## [0.109.0] - 2026-11-06
+
+### Added
+
+- `after_convert` hook point: transforms a `DoclingDocument` haiku.rag converted, before chunking and embedding.
+
+### Fixed
+
+- `add-src DIR` logs a file that fails to ingest and continues with the rest of the directory, then names the failure count and exits 1. A wedged docling converter still stops the run (#827).
+- A PDF attachment refused by docling-local, such as a MathML `equation-1.xml`, or with an undetectable text encoding, is skipped with a warning and no longer fails its PDF (#829).
+
+## [0.108.0] - 2026-11-05
+
+### Added
+
+- `thinking: max` effort level.
+- Ingester: `ingester.api.fd` and `serve --fd` serve the control plane on an inherited listening socket (#830).
+
+### Changed
+
+- `pydantic-ai-slim` requires `>=2.66.0,<2.67.0`.
+- The `docling` extra installs `onnxruntime` (#828).
+- Web app: Inter and JetBrains Mono replace Geist and Geist Mono, and render Greek.
+- Web app: a chat answer's reasoning and tool calls fold into one summary line once the answer starts, with a link to its sources. A citation links the document's `metadata.url` when it is an http(s) address. An empty chat names the databases and document count a question covers.
+- Web app: the doctor's report opens with a verdict, lists failures and warnings, and folds the passing checks. The memory estimate follows the jobs.
+- Web app: the ingestion page shows loading until its first read, a running scan or retry on its button, empty sections as one line, and `ok` for a source with nothing to report. "Refresh" is renamed "Scan now", and "Retry failed" is disabled for a source without dead jobs.
+- Web app: the inspector's sidebar puts the database first, opens the search page from its Search tab, and folds the SQL filter. Document rows show the title on two lines, the source and the file name. A document's header links its `metadata.url` and shows its short metadata fields, and "Show on map" folds the map's state and controls when the document is not on it. Chunk labels show once each, with a count.
+- Web app: below 768 px the inspector shows the document list or the open view, not both, and the header drops the database chips below 1024 px and the search label below 640 px. The search overlay has a Close button. The corpus map lists the documents its find box matches, as buttons that select them. The app has an icon.
+- Web app: the example config enables `ingester.maintenance`.
+- Web app: URIs are shown decoded. The inspector renders table items as tables and chunk text in the sans font. Search results lead with the document title and show the passage without markdown markers.
+
+### Fixed
+
+- Ingester: `serve` sweeps a source while it has queued or claimed jobs. `POST /sources/{id}/refresh` no longer answers `refreshed: false` for pending work (#848).
+- Ingester: a maintenance pass runs without waiting for the database's jobs in flight, and a `quiet_s` pass starts once none is running (#845).
+- Ingester: the reaper never resets the claim of a job its own process is running (#843).
+- A hook gets a span only at a hook point it overrides (#840).
+- Web app: a chat that follows a streaming answer scrolls on to the sources shown when the run finishes.
+
+## [0.107.0] - 2026-11-04
+
+### Added
+
+- `Hook.ingester_lifespan(client)`: entered per database by `haiku-ingester serve`, `run-batch` and reload, inside the client's `lifespan`, with spans `hook.ingester_lifespan.enter` and `hook.ingester_lifespan.exit` (#815).
+- `search.fts_language` sets the language of the full-text index. Default `English`. An existing database takes it on `haiku-rag rebuild --reindex`.
+- `doctor` warns when the full-text index was built in a language other than `search.fts_language`.
+- Ingester: `ingester.maintenance` (`enabled`, default false, `quiet_s`, `max_wait_s`) vacuums each database and builds a missing vector index, with the database's claims paused: in `serve` once the database is quiet, in `run-batch` and manifest replay after the drain. A failed pass makes `run-batch` exit non-zero. The ingester's clients do not auto-vacuum while it is enabled. `/stats` gains `maintenance_by_database`, and each pass is an `ingester.maintenance` span.
+
+### Changed
+
+- `docling` 2.142.1, paired with `docling-serve` v1.38.2.
+- `lancedb` 0.41.0 and `pylance` 14.0.2.
+
+### Security
+
+- Lock pydantic to 2.14.2 (GHSA-gj4f-r7mf-jjxh, GHSA-955g-x97g-8mcp).
+
+## [0.106.0] - 2026-11-03
+
+### Added
+
+- A Logfire span per hook call: `hook.before_ingest`, `hook.after_ingest`, `hook.after_delete`, `hook.lifespan.enter`, `hook.lifespan.exit`, `hook.before_search`, `hook.after_search`. Failures of `after_ingest`, `after_delete` and `lifespan` exit are recorded on the span at level error, and a rejection sets `rejected` and `reason` (#807).
+- `.rst` files are read as text (#805).
+- Ingester: `GET /sources` returns `unsupported_files`, the files an `fs`, `s3` or `webdav` source's last successful sweep skipped for their extension, counted by extension. A change in the counts is logged at INFO (#805).
+- Ingester dashboard and web app ingestion page: a source shows a badge for the files its last sweep skipped for their extension, with the count per extension in its tooltip (#805).
+- Web app backend: a Logfire span per HTTP request, and an `app.job` span per doctor run and corpus map with `kind` and `database` (#810).
+- Ingester: a Logfire span per control-plane request, except the polled `/health`, `/sources`, `/providers`, `/stats` and `/jobs` (#810).
+
+### Changed
+
+- A Logfire configuration failure is logged at WARNING with its traceback (#810).
+- `EmptyListingError.known` renamed to `count`.
+- `docker/Dockerfile`, `docker/Dockerfile.slim` and the web app's backend image build and run on Debian 13 (trixie): `uv:python3.13-trixie-slim` and `python:3.13-slim-trixie`.
+
+### Fixed
+
+- Web app: chat sends messages when the frontend is served over plain HTTP from a host other than localhost (#809).
+- Web app: a corpus map whose result cannot be built is reported failed and no longer blocks the database's next map (#810).
+- Ingester: outside `--dry-run`, a sweep that lists nothing fails only when its deletes would remove stored documents owned by the source, and otherwise enqueues them (#806).
+
+### Security
+
+- Lock pyasn1 to 0.6.5 and joserfc to 1.8.0.
+
+## [0.105.0] - 2026-11-02
+
+### Added
+
+- Ingester dashboard: "Processed in" column in recent jobs, the time from the last attempt's claim to completion (#789).
+- Web app: `POST /reload` on the backend reads the configuration and its database fragments again and serves the `lancedb.databases` they place (#795).
+- Docker images `ghcr.io/ggozad/haiku.rag-app-backend` and `ghcr.io/ggozad/haiku.rag-app-frontend`, tagged with the package version and `latest` (#791).
+- Web app: `BASE_PATH`, a build argument of the frontend image, serves the frontend under a URL prefix (#794).
+
+### Changed
+
+- A PDF's `after_ingest` fires after its attachments' and carries `md5`, and `source_revision` when the source supplies one (#790).
+- The web app's `docker-compose.yml` runs the published images and a docling-serve service, mounting the configuration directory `CONFIG_DIR` and the databases directory `DATA_DIR`. `docker-compose.dev.yml` builds the images. Move `app/haiku.rag.yaml` to `app/config/haiku.rag.yaml`, point `DATA_DIR` at the parent of a custom `DB_VOLUME`, place `haiku.rag` at `/data/<database directory>` (default `/data/haiku.rag.lancedb`), and set `processing.converter` and `processing.chunker` to `docling-serve` for the published images.
+- The web app's backend image runs as uid 1001. An existing `sessions` volume needs `docker compose run --rm --user root backend chown -R 1001:1001 /sessions` once.
+
+### Fixed
+
+- A rebuild of `docker/Dockerfile`, `docker/Dockerfile.slim` or the web app's backend image with a warm uv cache installs the current haiku.rag and app code, not the previously built wheel.
+- Discovery no longer re-enqueues an unchanged file whose job went dead after `max_attempts` (#792).
+
+## [0.104.0] - 2026-10-30
+
+### Added
+
+- `databases_include` names a directory of YAML fragments, each adding `lancedb.databases` and `ingester.databases` entries. The ingester's reload reads it again (#785).
+
+### Fixed
+
+- `CitationPolicyCapability` no longer redirects structured answers. An undeclared structured answer is recorded in `CitationPolicyState.violations` (#783) - thanks @gblackadder
+- `CitationPolicyCapability` no longer queues a second redirect for a response with no text followed by the answer.
+- `CitationPolicyCapability` no longer records a violation when a run pauses for deferred tool results.
+- The `http` and `webdav` sources enforce `max_file_size` while the GET body streams, when HEAD omits or understates `Content-Length`.
+- `haiku-rag info` and the inspector report indexed and unindexed rows for a vector index under any name, not only `vector_idx`.
+- `create_document_from_source` raises not-found when the document is deleted while its metadata refresh waits for the write lock.
+
+## [0.103.0] - 2026-10-29
+
+### Added
+
+- The ingester's `POST /sources/{id}/retry?status=dead|rejected|all` re-queues a source's failed jobs (#756).
+- The ingester dashboard and the app's ingestion page retry a source's dead jobs with Retry failed (#756).
+- A source's `metadata_provider` accepts `{name, options}`. The options are passed to the provider's factory as keyword arguments (#761).
+
+### Changed
+
+- Ingester workers claim from the ready source with the fewest jobs in flight, then the one claimed least recently. Jobs stay oldest first within a source (#755).
+- The ingester queue is at schema 6, which adds `idx_jobs_source_claimable`. Run `haiku-ingester queue migrate` on a server queue (#755).
+- Under `delete_orphans`, a sweep of an `http` source whose every URL answers 404 fails as an empty listing does, and repeated failures open its poller breaker (#757).
+- Under `delete_orphans`, a URL confirmed gone by a 404 gets a DELETE job on every sweep, and the DELETE removes the URL's dead jobs (#757).
+- `pydantic-monty` raised to 1.4. The sandbox now has the `decimal` module.
+
+### Fixed
+
+- The ingester dashboard's Refresh works for a source id containing an apostrophe.
+- The ingester's `POST /sources/{id}/refresh` and the app's proxy accept a source id containing `/`, such as the default `fs:` and `s3:` ids.
+- The docling-serve chunker sends the same convert options as the docling-serve converter (#769).
+- The `http` source records a permanent HEAD error as an `http-<status>` revision and fetches a failing URL once (#757).
+- The `http` source reads the revision from the headers of a GET when HEAD answers 405 or 501 (#757).
+- Under `delete_orphans`, the `http` source deletes the document of a URL that answers 404 on two sweeps with a permanently failed fetch between them (#757).
+- `IngestRequest.uri`, `DocumentRejected.uri` and the `HookError` message carry the URI the document is stored under, for an ingest given an explicit `uri` and for a path or `file://` URI through a symlink (#776).
+- Metadata written while a source-ingested PDF reconciles its attachments, or before an unchanged-bytes refresh, is kept, including an `after_ingest` hook's metadata-only `update_document` (#778).
+- `update_document` keeps metadata written while it waited for the write lock, `md5` and `source_revision` included (#778).
+
+## [0.102.0] - 2026-10-28
+
+### Added
+
+- `/health` lists each configured database that is not running in `failed_databases` and reports `degraded` while any is listed (#754).
+- `HaikuRAG.create_vector_index()` and `Store.create_vector_index()` build or retrain the vector index and return whether they built one (#753).
+- `init` and `migrate` record `schema_version`, and `doctor` checks it (#752).
+- The ingester's `/stats` reports `rejected_by_source`, and its dashboard and the app's sources panel show it (#762).
+
+### Changed
+
+- `haiku-ingester serve`, `run-batch` and reload skip a database that fails to start and run the others, and startup raises `NoDatabaseStartedError` only when every database fails. Callers of `IngesterApp.serve()` and `run_batch()` read `BatchReport.failed_databases` or `/health` `failed_databases` (#754).
+- `create_document`, `import_document`, `import_documents` and `create_document_from_source` drop a caller's `content_type`, `md5` and `source_revision` metadata (#760).
+- The ingester's `last_polled_at` records when the last successful sweep started, not when it ended (#762).
+- A writable open, `migrate` and `tag restore` raise `UpgradeRequiredError` for a newer `schema_version`, and a read-only open warns. Catch it beside `MigrationRequiredError` (#752).
+
+### Fixed
+
+- `update_document(metadata=...)` keeps the stored `content_type`, `md5` and `source_revision` and ignores a caller's value for them (#760).
+- `create-index` on LanceDB Cloud reports that Cloud manages the vector index instead of a successful build.
+
+## [0.101.2] - 2026-10-27
+
+### Added
+
+- Configuration strings support `${file:path}` references to UTF-8 secret files (#749).
+
+### Security
+
+- Lock filelock to 4.2.1, setuptools to 84.1.0, Undici to 7.30.1 and fast-uri to 3.1.9.
+
+### Fixed
+
+- Example configuration tests only discover files under `examples/` and `app/`.
+- Benchmark documentation renders all sections after the EnterpriseRAG leaderboard instructions.
+- `settings` masks URL userinfo containing an unencoded `/` or `#`.
+- Configuration validation errors omit the rejected value.
+- `docling-local` hybrid chunking no longer retains a semchunk token counter per oversized text item, which slowed long ingests and rebuilds (#724).
+
+## [0.101.1] - 2026-10-26
+
+### Fixed
+
+- `S3Source.fetch` reads the revision and size from the same GET response as the object body.
+- Source discovery and filesystem watch events accept uppercase and mixed-case file extensions.
+- Ingester DELETE jobs skipped for restored resources preserve the URI's sync state and dead or rejected jobs (#747).
+
+### Added
+
+- `enterprise_rag` evaluation dataset (EnterpriseRAG-Bench, `onyx-dot-app/EnterpriseRAG-Bench`) and its reference config `evaluations/configs/enterprise_rag.yaml`, with Recall@10 retrieval, citation MAP and answerability labels (`info_not_found` is `UNANSWERABLE`). Gmail threads stored as a Python list `repr` are decoded into text. `evaluations/scripts/build_erb_submission.py` writes the input of Onyx's leaderboard scorer (`answers.jsonl`) from a results file.
+- `AnswerFactsJudge` evaluator: `answer_completeness` from one judge call per `answer_facts` entry, using EnterpriseRAG-Bench's fact validator prompt. QA runs print mean completeness and mean `erb_score`, and result rows gain `answer_completeness`.
+
+## [0.101.0] - 2026-10-23
+
+### Added
+
+- `RAGCapability.open_question(messages)` and `haiku.rag.capabilities.evidence.open_questions(ctx)`.
+- `processing.conversion_options.fetch_headers_allowed_origins` controls which origins receive configured headers during `docling-local` HTML image fetching.
+
+### Security
+
+- Require `opentelemetry-api>=1.45.1` and lock virtualenv to 21.14.13.
+- `docling`, `jina` and `cross-encoder` extras require Transformers `>=5.17.0,<6.0.0`.
+- Web frontend requires Next.js `^16.4.2`.
+- Require Pillow `>=13.0.0,<14.0.0` (GHSA-4rr5-89j8-mwwm, GHSA-gg2r-wvfm-q9rx, GHSA-fc9g-5qg7-mf45, GHSA-cp9v-662q-vvx9, GHSA-j4m9-6w36-pw47).
+
+### Changed
+
+- Logfire 5.2.0 and OpenTelemetry 1.45.1; remove the backend’s unused `logfire[pydantic-ai]` extra.
+- `pydantic-ai-slim` requires `>=2.54.0,<2.60.0`.
+- `docling` 2.142.0, `docling-core` 2.104.0, `docling-parse` 7.23.0 and `docling-ibm-models` 4.0.4, paired with `docling-serve` v1.38.0.
+- Default PDF parsing uses `threaded_docling_parse`; `docling_parse` selects the same backend through a deprecated alias.
+- `conversion_options.fetch_headers` applies only to the HTML source document's origin by default; use `fetch_headers_allowed_origins` to permit other origins.
+
+### Known issues
+
+- Markdown HTML blocks convert to literal text with both converters; `<img>` blocks yield no pictures and retain base64 data URIs in text.
+- Wikipedia HTML ingestion can lose all image bytes unless `fetch_headers_allowed_origins` includes the Wikimedia image origins.
+
+## [0.100.0] - 2026-10-22
+
+### Added
+
+- `haiku-ingester serve` reloads `lancedb.databases` and `ingester.databases` from its configuration file on `POST /reload` or `SIGHUP`, adding, removing and replacing databases while the others keep ingesting. `POST /reload` returns a `ReloadReport`, with 500 when a database failed, and answers 409 for a change to any other section, 422 for a file that fails to load.
+- `IngesterApp.add_database(ref, sources)` and `IngesterApp.remove_database(name)`.
+- `JobRepo.cancel_sources(source_ids)` and `SyncStateRepo.delete_sources(source_ids)`.
+
+### Changed
+
+- `haiku-ingester serve` starts on an empty `ingester.databases`, deleting every queued and claimed job of its queue namespace. `run-batch` still refuses one.
+- `POST /sources/{id}/refresh` waits for a sweep of the same source in progress.
+- `IngesterApp` raises `NothingToIngestError` from `run_batch`, `run_batch_dry_run` and `run_batch_from_manifest` instead of its constructor.
+- `pydantic-ai-slim` requires `>=2.53.0,<2.54.0`.
+
+## [0.99.0] - 2026-10-21
+
+### Added
+
+- EPUB ingestion (`.epub`, `application/epub+zip`) through `docling-local` and `docling-serve`. Pictures carry no image data.
+- `reranking.model_kwargs`, passed to the Transformers model loader by the `cross-encoder` reranker. Other providers reject a non-empty value.
+- `GET /sources` reports each source's `database`, and `last_error` and `last_error_at` from its last failed discovery, cleared by the next successful sweep. The dashboard marks such a source.
+- Startup fails on two sources sharing an id (`DuplicateSourceError`), and on two `ingester.databases` keys at one location.
+- `haiku-ingester run-batch --db-name NAME` runs one database of `ingester.databases`. `IngesterApp(database_name=)` is the same in Python.
+- `haiku.rag.client.search.populate_image_data(client, results)`: attaches to search results the pictures and captions a search attaches.
+- `haiku.rag.utils.sql.title_or_uri_filter(term)`: the case-insensitive title-or-URI document filter the chat TUI's filter uses.
+- `haiku.rag.doctor.scan_vectors(store)`, `duplicate_families(...)` and `duplicates_yaml(families, label)`: the vector scan, the near-duplicate clustering and the YAML export that `doctor` runs.
+
+### Changed
+
+- The `cross-encoder` extra requires `sentence-transformers>=4.0.0` and `transformers>=4.56.0`.
+- `ingester.sources` replaced by `ingester.databases`, a map from a database name to its sources. A configuration carrying `ingester.sources` fails to load in every program that reads it, `haiku-rag` and the MCP server included. Migration: `ingester.databases: {NAME: {sources: <list>}}`, NAME the key in `lancedb.databases`, or `haiku.rag` when none is configured.
+- `haiku-ingester` writes every database `ingester.databases` names, each through its own client, from one process, queue and control plane. Other `lancedb.databases` entries, tagged ones included, no longer stop it from starting.
+- `GET /database` replaced by `GET /databases/{name}`. The dashboard's database panel selects among the ingested databases.
+- `serve` and `run-batch` refuse to start when `ingester.databases` names no database (`NothingToIngestError`).
+- `serve`, `run-batch` and manifest replay delete, at startup, the queued and claimed jobs of sources absent from `ingester.databases`.
+- `POST /jobs/{id}/retry` and `POST /dlq/{id}/retry` answer 409 for a job whose source is not configured.
+- `JobRepo.retry_failed` takes `source_ids=`, and `run-batch --retry` revives the failures of configured sources only.
+- `haiku-ingester serve` and `run-batch` no longer take `--db PATH`, and `IngesterApp` no longer takes `scope=`. Place databases in `lancedb.databases`.
+- `JobRepo.counts_by_status_since` and `batch_progress_counts_since` take `source_ids=`.
+- `JobRepo.claim_next(exclude_source_ids=)` replaced by `source_ids=`, the sources to claim from. `WorkerPool(client=)` replaced by `clients=`, a map from source id to client.
+- `pydantic-monty` bumped to 1.2. The sandbox iterates file objects and supports `match` statements, `os.walk`, `os.path`, `Path.glob`, `json.load` and `csv`.
+- `app/` is a web application over every configured database, with four pages. Chat keeps sessions on the backend, filters by document, takes images and shows each citation on its page. Ingestion follows the `haiku-ingester` service, run by the compose files. The inspector browses documents, chunks, pages and a map of the corpus, and searches by text or image. The doctor runs `haiku-rag doctor` in the background. The app is a Starlette backend, the `haiku_rag_app` package, and a Next.js frontend on `@ag-ui/client` in place of CopilotKit.
+
+### Removed
+
+- `recovery_hint` from `haiku.rag.sandbox`.
+
+### Fixed
+
+- `CitationPolicyCapability` enforces a question whose only evidence came from its first round when the question arrives inside `message_history`, as under `AGUIAdapter`. `RAGCapability` takes a new question's identity at its first model request, as the index of the request that opens it.
+- `ChunkRepository.get_by_document_id` with `limit` or `offset` returns that page of the document's chunks in `order`.
+
+## [0.98.0] - 2026-10-16
+
+### Added
+
+- `search.rerank_pool_factor` (default 10): candidates per requested result a reranker scores.
+- Client lifecycle hooks (`before_ingest`, `after_ingest`, `after_delete`, `before_search`, `after_search`) registered under the `haiku.rag.hooks` entry-point group and activated via the `hooks:` config list, whose entries are a name or `{name, options}` with keyword arguments for the hook's factory. Post-commit observer hooks are best-effort; failures are logged and do not change the completed operation's result. A client covering several databases fires hooks once, at the federating level. `before_ingest` receives an `IngestRequest` for each document fetched from a source and each PDF attachment, and may replace its body and add metadata. Raising `DocumentRejected` from it refuses the document: a directory `add-src` and a PDF's attachments skip it, and the ingester records the job with the new `rejected` status, which `run-batch` reports as a separate count and does not count as a failure. Its other exceptions raise `HookError`, which the ingester records dead unless its cause is transient. A FULL rebuild runs `before_ingest`, ends on a `HookError`, keeps a rejected document's stored content, and fires no post-commit hooks.
+- `SearchResult.annotations` carries notes attached by `after_search` hooks, preserved through context expansion and rendered in agent-facing output.
+- `Hook.lifespan`, an async context manager around the client's lifetime for hooks that own resources. Entered in configured order once the store is open, exited in reverse order while the store, embedder and reranker are still usable.
+- `haiku-ingester run-batch --retry {dead,rejected,all}` re-queues the latest failed job of each document not ingested since, after the sweep. `JobRepo.retry_failed` is the same in Python.
+
+### Changed
+
+- Rerankers score a chunk's document title and section headings, where present, before its content (`reranking.base.scored_text`).
+- Ingester queue schema 5. Run `haiku-ingester queue migrate` on a server queue before starting upgraded ingesters.
+- `haiku-ingester run-batch` prints `Batch complete: N succeeded, M dead, K rejected`.
+- `SingleDatabaseSession.delete_document` returns the deleted documents instead of a `bool`.
+- `JobRepo.prune_dead` renamed to `prune_unsuccessful`.
+
+### Fixed
+
+- `execute_code` stops a program still running `_DEADLINE_GRACE_SECONDS` (5 s) past `sandbox.code_timeout` by killing its worker, and fails a program that caught a refused read, with the time-limit message in either case.
+- Closing a client closes the HTTP client of an `ollama` embedder, and of an `openai` embedder with a `base_url` or `api_key`.
+
+## [0.97.0] - 2026-10-12
+
+### Added
+
+- `ingester.queue.namespace`: the ingester that owns its rows in a queue shared with other ingesters. `serve`, `run-batch` and `--dry-run` require it when `dburi` names a server.
+- `haiku-ingester queue init --dburi URL` and `queue migrate --dburi URL`, or `HAIKU_RAG_QUEUE_DBURI`: migrate the queue at that URL instead of the configured one.
+- `HaikuRAG.delete_document(document_id, source_id=...)` deletes only a document that source owns, checked under the write lock.
+
+### Changed
+
+- `serve`, `run-batch` and `--dry-run` no longer create or migrate a server queue: they fail naming `haiku-ingester queue init` or `queue migrate`. A SQLite queue still migrates at startup.
+- `haiku-ingester queue migrate` refuses a queue whose schema is newer than the release instead of reporting it up to date.
+- The Postgres queue pool is 2 connections plus 3 overflow per process.
+- Queue schema 4 adds `namespace` to `jobs` and `sync_state`, leading every job index and the `sync_state` key. Existing rows migrate under the empty namespace: assign them with `UPDATE jobs SET namespace = '<name>' WHERE namespace = ''` and the same on `sync_state` before starting an ingester under that name.
+
+### Fixed
+
+- An `fs` source whose root is missing, is a file, or has a directory that cannot be listed fails the sweep instead of deleting the documents under it. `add-src DIR` raises on a directory it cannot list.
+- A sweep whose listing returns nothing while the source has URIs it listed before fails with `EmptyListingError` instead of deleting them. A sweep that raises midway enqueues none of its deletes, and `--dry-run` reports no changes for it.
+- An ingester DELETE job deletes a document only when the document's `source_id` is the job's source. A document owned by another source, or by none, is left in place with a warning.
+- A URL removed from an `http` source's `urls` is deleted. A configured `HTTPSource` supports only its `urls`.
+- A source's `retry` sets the backoff of its jobs: `base_delay_s`, `max_delay_s` and `jitter` apply, not only `max_attempts`.
+- SQLite queue migrations run in one transaction, so an interrupted migration leaves the previous schema in place and reruns.
+
+## [0.96.1] - 2026-10-09
+
+### Changed
+
+- docling 2.127.0, docling-core 2.96.1, docling-ibm-models 4.0.2, docling-parse 7.19.1, paired with docling-serve v1.33.0. Conversion output changes for PDF table cells and the docx, xlsx, html and markdown backends: documents ingested before and after differ in items, chunk boundaries and chunk ids.
+
+### Fixed
+
+- `DoclingServeConverter` sends `.xml` files to docling-serve for its USPTO and JATS backends, as `DoclingLocalConverter` does, instead of as a fenced code block.
+
+## [0.96.0] - 2026-10-09
+
+### Added
+
+- `embeddings.model.query_prefix` and `embeddings.model.document_prefix`, prepended to query and chunk text on the ollama, openai, vllm and openrouter providers and part of the recorded embedder identity. `rebuild --set-embedder` records a changed query prefix and refuses a changed document prefix (#702).
+
+### Changed
+
+- `doctor` and the open-time embedder drift check report differing fields as `provider: 'a' -> 'b'` and `name: 'a' -> 'b'`, and an empty recorded `provider` or `name` counts as drift.
+
+### Fixed
+
+- `DoclingLocalConverter` raises `ImportError` naming the `docling` extra when docling is not installed, and `haiku-ingester serve`, `run-batch` and `haiku-rag add-src` exit at startup with `Error: docling is not installed` (#705).
+- `Failed to parse file` errors carry the message of the exception that caused them.
+- Concurrent `docling-local` ingester workers no longer fail PDF slices with `Failed to import pages` or `Failed to parse file` (#704).
+
+### Security
+
+- Bumped dependencies in `app/frontend/pnpm-lock.yaml` to patched versions for known advisories: `next` 16.3.8, `axios` 1.20.0, `sharp` 0.35.5, `@modelcontextprotocol/sdk` 1.32.1, `proxy-addr` 2.0.8, `source-map-js` 1.2.2, `fast-copy` 3.1.0, `dompurify` 3.4.16.
+
+## [0.95.0] - 2026-10-08
+
+### Added
+
+- `${HAIKU_RAG_CONFIG_DIR}` in config values expands to the config file's directory (#691).
+- `lancedb.databases` entries accept `{location, tag}` to read a database read-only at a tag (#693).
+
+### Changed
+
+- The `app/` backend opens its database read-only and no longer creates a missing one.
+
+### Fixed
+
+- A full rebuild re-converts PDF attachments from the bytes in their parent PDF, keeping their ids and metadata, and no longer re-ingests an attachment from its parent's file (#699).
+
+### Security
+
+- Bumped dependencies in `uv.lock` to patched versions for known advisories: `datasets` 5.0.1, `fsspec` 2026.6.0, `multidict` 6.9.1, `sentence-transformers` 5.7.0, `urllib3` 2.8.0, `virtualenv` 21.14.5.
+
+## [0.94.0] - 2026-10-07
+
+### Changed
+
+- Ingester metadata providers are called for PDF attachments, with the source id of the document they came from.
+- Metadata providers can no longer set `parent_uri`.
+- `parent_uri` is stripped from caller metadata and kept across `update_document` and re-ingestion, like `source_id` (#696).
+- `delete_document` and `haiku-rag delete` refuse a PDF attachment whose parent is stored, raising `AttachmentDeletionError`. Delete the parent instead (#696).
+
+### Fixed
+
+- Retrying an ingest that failed on a PDF attachment ingests the attachment.
+- `tag restore` restores a tag that needs no migration while the live database needs one or records another embedder (#692).
+- `tag restore` refuses a database missing a table, naming it, instead of re-creating the table.
+- Ingester reconciliation no longer reports PDF attachments of stored documents as unattributed (#696).
+
+## [0.93.0] - 2026-10-06
+
+### Added
+
+- Reading one database read-only at a tag: `--at TAG` on `search`, `ask`, `list`, `get`, `visualize`, `chat`, `inspect`, `info` and `mcp`, `HaikuRAG(..., tag=...)` and `Store(tag=...)`. A tag missing from any table raises `TagError`, a tag that needs a migration raises `MigrationRequiredError`, and a tag over several databases raises `AmbiguousDatabaseError` (#684).
+
+### Changed
+
+- lancedb 0.39.0, pylance 12.0.0. Tables created or recreated from now on are written in Lance file format 2.2. Existing tables keep their format.
+- `DoclingLocalConverter.convert_file` and `DoclingServeConverter.convert_file` raise `UnsupportedSourceError` for an extension outside `supported_extensions`. docling-local no longer reads an unknown extension as text.
+
+### Fixed
+
+- Plain text, code, Markdown, CSV and AsciiDoc files that are not UTF-8 are decoded in the encoding `charset-normalizer` detects, with a warning, instead of failing to convert. `charset-normalizer` is a direct dependency of `haiku.rag-slim` (#676).
+- A file whose name is only dots before its extension (`..md`) is handed to docling as `document.md` instead of `md`, which docling could not classify.
+- `rebuild` (full, `--rechunk`, `--descriptions`) writes `document_items` once per 50-document batch, split whenever the documents gathered reach 16 MiB of pictures, instead of once per document.
+- `vacuum` removes untagged versions older than the retention that were written after a tag, and their files. A tag keeps only its own version (#684).
+- A `rebuild` interrupted after dropping the chunks table (`--embed-only`, or a vector dimension change) retrains the vector index when run again.
+- Opening a database whose chunks-dropping `rebuild` was interrupted warns that it is incomplete, naming the rebuild to run again.
+- `rebuild --embed-only` refuses to finish an interrupted full rebuild, `--rechunk` or `--descriptions`.
+- `rebuild --title-only` keeps the staging copy an interrupted `--embed-only` resumes from.
+- `rebuild` prints `Error: …` and exits 1 on a `ValueError`.
+- `rebuild` and `create-index` fail when the vector index build fails, and the rebuild stays recorded as incomplete.
+
+## [0.92.0] - 2026-10-02
+
+### Added
+
+- `haiku-ingester` and `haiku-rag` one-shot commands join a parent trace passed in `TRACEPARENT` / `TRACESTATE`. `serve`, `mcp`, `chat` and `inspect` don't.
+- `evaluations.system_one.provider` (`vllm`, `ollama` or `openai`): the answer-equivalence
+  gate asks a decision model on a chat endpoint, reading p from the answer-letter
+  logprobs in both option orders. Experiment metadata gains `system_one_provider`.
+- `haiku-rag doctor --skip-providers`: skips the API-key check and the provider endpoint probes.
+- `haiku-rag doctor --json`: prints the report as JSON on stdout.
+
+### Changed
+
+- The outdated-version warning is printed on stderr.
+- **Breaking:** `doctor` reports `pending_migrations`, `documents_without_items`, `unembedded_chunks` and `documents_text_no_chunks` as failures and exits 1 on them.
+- A full `rebuild`, `--rechunk` and `--descriptions` report a document after its batch of 50 is written.
+- A full `rebuild`, `--rechunk` and `--descriptions` at an unchanged vector dimension record the configured embedder once they have finished, and `--title-only` does not record it.
+- The error and warning for an embedder that differs from the recorded one at the same vector dimension, and `doctor`'s `embedding_drift`, advise `rebuild --embed-only` or running an interrupted rebuild again, and `rebuild --set-embedder` only for an embedder that produces the same vectors.
+- The `evaluations.system_one` readiness check asks the judge's own question and
+  criteria, so an endpoint that rejects them stops the run before the first case.
+- `SystemOneJudge` takes an `endpoint` (`SystemOneEndpoint` or `ChatDecisionEndpoint`)
+  instead of `client` and `model`, and raises `DecisionError` when the endpoint fails.
+
+### Fixed
+
+- A failed or cancelled full `rebuild`, `--rechunk` or `--descriptions` at an unchanged vector dimension no longer leaves the documents it had not reached without chunks, and keeps the vector index (#670).
+- The vLLM and OpenRouter embedders and rerankers retry a request once when its connection drops, and expire idle pooled connections after 2s.
+- Re-ingesting a document, and a full `rebuild` or `--descriptions` batch, no longer fail with `Resources exhausted … HashJoinInput` when a document's docling blobs exceed lance's 150 MB query memory pool (#681).
+
+### Security
+
+- Bumped dependencies to patched versions for known advisories: `pyjwt` 2.15.1 in `uv.lock`, `ip-address` 10.7.2 and `fast-uri` 3.1.8 in `app/frontend/pnpm-lock.yaml`.
+
+## [0.91.0] - 2026-09-30
+
+### Added
+
+- `haiku-rag rebuild --reindex` (`RebuildMode.REINDEX`): rebuilds the full-text and
+  scalar indexes from scratch without rewriting rows.
+
+### Changed
+
+- Every `rebuild` mode except `--title-only` and `--set-embedder` ends by rebuilding
+  the full-text and scalar indexes, regardless of `storage.auto_vacuum`.
+- `doctor`'s `fts_index_coverage` warns when some rows are outside the full-text
+  index, and names `rebuild --reindex` for a missing index instead of
+  `rebuild --embed-only`.
+- Existing databases need `haiku-rag migrate`. It rebuilds a full-text index in
+  lance's v1 format as v2 without rewriting rows, and on a database already on v2
+  writes only the stored version.
+- `rebuild --rechunk`, `--descriptions` and `rebuild` delete `document_items` once per
+  batch of 50 documents instead of per document, and `--title-only` writes
+  `document_meta` once per batch.
+- A picture's text in picture chunks and `document_items` includes the text docling found inside it, captions excluded. Existing databases need `haiku-rag rebuild --rechunk`.
+
+### Fixed
+
+- `rebuild` modes that rewrite chunks dropping the vector index built by
+  `haiku-rag create-index`. They retrain it.
+- `rebuild --rechunk` failing with lance "Resources exhausted" on databases with page
+  images (#666). `--rechunk` rewrites no `documents` rows. `--rechunk` and
+  `--descriptions` no longer load or rewrite `docling_pages`. The stored-content
+  fallback of a full rebuild no longer loads the stored `docling_pages`, and writes
+  their replacement from the markdown conversion.
+
+## [0.90.0] - 2026-09-28
+
+### Added
+
+- `sources` on the RAG capability's `search` tool: a list narrows one search to those
+  collections, an empty list searches none, and a name outside the run's collections
+  fails the call and lists them. Offered only when the run spans more than one
+  collection.
+- `RAGCapability.collections`: the collections a run may search.
+
+### Removed
+
+- `enable_thinking` model setting. Use `thinking`.
+
+### Changed
+
+- `Collection:` lines on search results and image labels follow the run, not the
+  search: a search narrowed to one collection inside a run spanning several keeps them.
+- `pydantic-monty` 1.0.
+- `sandbox.code_timeout` bounds each `execute_code` call. A call stopped by it resets the sandbox session.
+- The sandbox's working directory is `/documents`. `time.sleep()` and `asyncio.sleep()` return immediately.
+- `Sandbox(executions=)` removed.
+- The multi-collection instructions list the run's collections and say when to narrow a
+  search with `sources`, when to search every collection, and to search without
+  `sources` before reporting that the knowledge base lacks the answer.
+
+## [0.89.0] - 2026-09-25
+
+### Added
+
+- `haiku-rag vacuum --retention-seconds N` overrides `storage.vacuum_retention_seconds` for one run; `HaikuRAG.vacuum(retention_seconds=)` likewise.
+- `evaluations.system_one` (`SystemOneConfig`: `base_url`, `model`), a
+  `/v1/systemone` endpoint for the evaluations answer-equivalence judge.
+- `evaluations.evaluators.SystemOneJudge`: a pydantic-evals evaluator asking a
+  `/v1/systemone` endpoint one yes/no question, deciding alone at
+  p >= `pass_at` (0.8) or p < `fail_below` (0.2) and deferring the rest, and
+  endpoint errors, to a `fallback` evaluator.
+- With `evaluations.system_one` set, `evaluations run` judges answer equivalence
+  with `AnswerEquivalenceJudge`, falling back to the LLM judge, and fails at
+  start when the endpoint does not answer. Result rows gain `judge_decided_by`,
+  `judge_probability` and `system_one_model`; experiment metadata gains
+  `system_one_base_url`, `system_one_model`, `system_one_served_model`,
+  `system_one_pass_at` and `system_one_fail_below`.
+- `evaluations pair` warns when one result file was judged through
+  `system_one` and the other was not, or when they were judged through
+  different `system_one` models.
+
+### Changed
+
+- `examples/docker/docker-compose.yml` publishes the MCP server and docling-serve on `127.0.0.1` only.
+- `haiku.rag.utils` is a package with no re-exports; import each helper from its module: `haiku.rag.utils.models` (`get_model`, `parse_model_option`, `check_api_key_supported`), `haiku.rag.utils.sql` (`escape_sql_string`, `build_document_id_filter`), `haiku.rag.utils.formatting` (`format_citations_rich`, `format_bytes`, `truncated`), `haiku.rag.utils.images` (`image_media_type`, `image_data_uri`, `image_binary_content`), `haiku.rag.utils.concurrency` (`gather_all`), `haiku.rag.utils.paths` (`get_default_data_dir`, `locate_database`), `haiku.rag.utils.packages` (`get_package_versions`, `is_up_to_date`), `haiku.rag.utils.dependencies` (`raise_missing_extra`).
+- `DocumentInfo`, `OutlineNode` and `DocumentSection` moved from `haiku.rag.tools.document` to `haiku.rag.mcp`.
+
+### Removed
+
+- `haiku.rag.tools`, including `create_search_toolset`, `create_document_toolset`, `RAGDeps` and `build_multi_document_filter`; use `RAGCapability` (`haiku.rag.capabilities.rag.create_capability`).
+- `haiku.rag.utils.cosine_similarity` and `build_prompt`.
+
+### Fixed
+
+- `haiku-rag doctor` prints a document title or URI containing Rich markup, such as `[/dim]`, as text instead of failing with `MarkupError`.
+- Deleting or re-ingesting a document whose URI contains `_` or `%` no longer deletes the PDF attachments of another document.
+- `evaluations run --no-telemetry` names the result file `<name>.notrace-<run id>.jsonl` and records no trace id, instead of the all-zero trace id.
+
+### Security
+
+- `ChunkRepository` escapes ids in `search`, `get_by_id`, `get_by_document_id`, `count_by_document_id` and `delete_by_document_id`. A chunk id passed to `cite` or to the app's `/api/visualize` route no longer selects other chunks.
+- `haiku-rag settings` and the ingester's `GET /config` mask the `ingester.queue.dburi` password, every value under `headers` and `fetch_headers`, and credentials embedded in any URL. `max_tokens` and `chunking_tokenizer` are no longer masked.
+- The `settings` table stores only the version and `embeddings.model` `provider`, `name` and `vector_dim`. Earlier releases stored the whole configuration, credentials and resolved `${VAR}` values included. Existing databases need `haiku-rag migrate`. To purge older table versions, stop every process using the database, delete tags taken before the migration, and run `haiku-rag vacuum --retention-seconds 0`. Rotate the credentials of any database that was shared or kept on object storage.
+
+## [0.88.2] - 2026-09-24
+
+### Added
+
+- `document.items` span.
+- `document.embed` reports `chunks_embedded`, `images` and `batch_size`, and is
+  emitted when no chunk needs embedding.
+- `document.store` reports `chunks`, `items` and `lock_wait_ms`; the batch path
+  reports `op=create_batch` and `documents`.
+
+### Changed
+
+- `document.store` covers the LanceDB write only; dashboards and alerts on
+  `document.store` duration need re-baselining.
+
+### Fixed
+
+- `document.embed` carries `scope.name = haiku.rag`.
+- `haiku.rag.yaml`, `init-config` output and the packaged capability
+  instructions are read and written as UTF-8.
+
+## [0.88.1] - 2026-09-23
+
+### Added
+
+- `evaluations run` records `git_sha`, `git_dirty`, `config_hash`, `db_path`,
+  `db_documents`, `db_chunks`, `db_embedder_provider`, `db_embedder_model`,
+  `db_embedder_dim`, `db_version` and `db_written_at` in experiment metadata,
+  and prints the code revision and config hash at start.
+- `TableInfo.latest_version_at`: the newest table version time.
+- `evaluations run` writes per-case results to
+  `<data dir>/evaluations/results/<name>.<trace id>.jsonl` (`--results DIR`), one
+  JSON line per case, appended to `<name>.<run id>.partial.jsonl` as each case
+  finishes. `--name` must be a file name. Live conversation runs write none.
+- `evaluations run --no-telemetry`. Without it a run refuses to start when
+  Logfire finds no token.
+- `evaluations pair TREATED BASELINE`: the paired table for two result files,
+  with exact McNemar on verdicts and the sign test on `cited_map`.
+- Database population prints cumulative throughput every 50 ingested
+  documents and at the end: documents seen and ingested, elapsed time,
+  documents per minute over the whole run, ETA. Documents skipped on resume
+  count as seen, not ingested.
+- `DatasetSpec.pair_key`: the case-metadata key two runs of a dataset pair on,
+  recorded as `pair_key` in experiment metadata.
+
+### Changed
+
+- Chat "Clear chat" keeps the selected document filter.
+- Docker images: the default `mcp` command binds `0.0.0.0`. The unused
+  `DEFAULT_DATA_DIR` variable is removed; set `storage.data_dir: /data` in the
+  mounted config.
+- `app/` compose files bind the frontend to `127.0.0.1`.
+
+### Fixed
+
+- `processing.conversion_options.ocr_engine`: `tesseract` and `tesserocr` selected
+  each other's engine on `docling-local`.
+- Picture-description `base_url` is accepted with or without `/v1` during conversion.
+- `provider: mistral` applies `temperature`, `max_tokens` and `thinking`. Other
+  providers passed to Pydantic AI by name log a warning when those settings are
+  set.
+- A missing `--db` path prints an error and exits 1 instead of a traceback.
+- `examples/docker`: the MCP service receives `INGESTER_TOKEN`, which the shared
+  config requires.
+
+### Removed
+
+- `evaluations run --capability-model` and the `capability_model_source`
+  experiment metadata key. Set the capability model in `qa.model`.
+
+## [0.88.0] - 2026-09-21
+
+### Added
+
+- `sources` on the `list_documents` MCP tool and `HaikuRAG.list_documents`.
+- `document.metadata["source_id"]` records the configured source that ingested a
+  document. Reserved, so a metadata provider cannot set it. Ad-hoc ingestion
+  writes no key and preserves an existing one; a second source ingesting the same
+  URI takes ownership and logs at WARNING.
+- `haiku-ingester serve` and `run-batch` reconcile `sync_state` against the
+  document store at startup: a document with no row gets one, a revision for a
+  URI the store lost is cleared, and a document with no `source_id` that a
+  source ingested is attributed. Documents of an unconfigured `source_id`, and
+  documents two sources both ingested, are reported and left alone.
+- Reconciliation warns when documents remain without source attribution,
+  counted after the attribution it just wrote.
+- `HaikuRAG.set_document_source(document_ids, source_id)`,
+  `DocumentRepository.update_meta_all`, `SyncStateRepo.invalidate(source_id,
+  uris)` and `SyncStateRepo.list_ingested_uris`.
+
+### Changed
+
+- An UPSERT carrying an observed revision no longer re-reads it from the source:
+  the ingester passes what discovery saw at enqueue time. Manifest replay still
+  revalidates its frozen revision before ingesting.
+- `haiku.rag.client` exports `HaikuRAG`, `RebuildMode`, `DatabaseScope`,
+  `DocumentImport` and `all_found`, each imported on first use; `HaikuRAG` is
+  defined in `haiku.rag.client.client`. Import any other name from the module
+  that defines it.
+
+### Fixed
+
+- Importing a source, a converter or the ingester no longer loads lancedb,
+  pyarrow and pydantic_ai through `haiku.rag.client`.
+- Losing the ingester queue database no longer strands documents in the index:
+  files removed from a source while the queue was gone are deleted on the next
+  sweep instead of accumulating (#643).
+
+## [0.87.0] - 2026-09-17
+
+### Added
+
+- Each in-code `search()` emits a `sandbox.search` span; `CodeExecutionEntry.search_calls`
+  records how many an execution made, and `evaluations run` records
+  `n_sandbox_search_calls` per case and `turn_n_sandbox_search_calls` per conversation.
+- Experiment metadata records `qa_max_executions`, `sandbox_code_timeout` and
+  `sandbox_max_output_chars`. Live conversations record `turn_n_executions`.
+
+### Changed
+
+- HTML content before the first heading is ingested.
+  `processing.conversion_options.infer_furniture: true` restores docling's rule
+  that files it as page furniture. docling-local only.
+- `AnalysisCapability` merged into `RAGCapability`: tools `search`, `execute_code`
+  and `cite`; `RAGState.executions`; `request_limit` default 30; the analysis
+  capability's instructions, without the refusal instruction for questions the
+  retrieved documents do not address. State stays under the `rag` namespace.
+- `analysis.max_executions` moved to `qa.max_executions`; `analysis.code_timeout`
+  and `analysis.max_output_chars` moved to `sandbox.code_timeout` and
+  `sandbox.max_output_chars`. The `analysis` config block is gone.
+- `create_capability` and the `RAGCapability` agent spec default to
+  `defer_loading=False`.
+
+### Removed
+
+- `analysis.model`. `qa.model` drives the capability.
+- `AnalysisCapability`, `AnalysisState`, `EvidenceState`, `RAGCapabilityBase`,
+  `AGENT_PREAMBLE`, `HaikuRAG.analyze`, `AnalysisResult`, `haiku-rag analyze`,
+  `haiku-rag chat --capability`, `evaluations run --target`, the `analysis` state
+  namespace and the `target` experiment-metadata key.
+
+## [0.86.0] - 2026-09-16
+
+### Added
+
+- `.eml` and `.msg` files convert through docling's email backend.
+- `provider: openrouter` under `embeddings.model`, text and `multimodal: true`.
+  `base_url` defaults to `https://openrouter.ai/api/v1`, the key to
+  `OPENROUTER_API_KEY`. `doctor` reports it missing.
+- `provider: openrouter` under `reranking.model`, including
+  `reranking.multimodal`. `base_url` and key default as above.
+- `api_key` on an `openrouter` chat model.
+- An embedding whose length is not `embeddings.model.vector_dim` raises on the
+  `vllm` and `openrouter` providers, naming the model and the returned length.
+
+### Fixed
+
+- `temperature`, `max_tokens`, `extra_body` and `thinking` on an `openrouter` chat
+  model reach the model.
+- Rerank candidates with nothing to score are skipped. `RerankerBase._scoreable`
+  is text for every reranker, text or picture bytes for `vllm` and `openrouter`.
+- Image data URIs carry the media type sniffed from the bytes. JPEG, GIF and
+  WebP pictures were declared `image/png` to the `vllm`, `openrouter` and
+  `cohere` embedders.
+- FRAMES caches the images its articles reference and inlines them as `data:`
+  URIs, so the corpus carries picture bytes. Parsoid writes protocol-relative
+  `//host/path`, which docling cannot resolve, so every picture was stored
+  empty. Fetches are paced and cached per article with a marker recording what
+  did not resolve.
+- Remote image fetching sends a `User-Agent`. `ConversionOptions.fetch_headers`
+  sets the headers for images referenced by URL in HTML input and defaults to
+  identifying haiku.rag; hosts with a user-agent policy answered 403 and docling
+  reported it as a warning, so the pictures arrived with no bytes. docling's
+  Markdown backend takes no headers.
+
+## [0.85.0] - 2026-09-11
+
+### Changed
+
+- `ModelConfig.enable_thinking` renamed to `thinking`, typed `bool | minimal | low |
+  medium | high | xhigh | None` (pydantic-ai's `ThinkingLevel`). On `ollama`,
+  `vllm`, `openai` with a `base_url` and the picture-description VLM it is sent as
+  `reasoning_effort` under every model name: `false` sends `none`, `true` sends
+  `medium`, a level is sent as written. `openai` without a `base_url`,
+  `anthropic`, `google`, `groq` and `bedrock` pass it through as pydantic-ai's
+  unified `thinking` setting. `gpt-oss` with `false` sends `none`, was `low`.
+- `evaluations run` records `capability_thinking`, `judge_thinking` and
+  `capability_model_source` in experiment metadata, and no longer records
+  `qa_provider`, `qa_model`, `qa_temperature`, `qa_max_tokens`,
+  `qa_enable_thinking` or `qa_extra_body`.
+
+### Deprecated
+
+- `enable_thinking` still loads as `thinking` with a `FutureWarning`; removed in
+  0.90.0. Setting both keys is an error.
+
+### Fixed
+
+- Conversion flattens each inline group of text runs into the item that owns
+  it. Hyperlinks are dropped from heading text. A full `haiku-rag rebuild`
+  applies the fix to existing databases.
+- `import_document` and `import_documents` store an item whose text docling
+  placed in a child `InlineGroup` with that group's text. The group's own
+  rows remain. An inline image in the group contributes no text. Table rows
+  in `document_items` are stored without markdown escaping.
+
+## [0.84.0] - 2026-09-10
+
+### Added
+
+- `sources` on `create_capability` and `from_spec` for the RAG and analysis
+  capabilities, naming the configured databases the capability covers. Refused
+  beside `db_path` or `rag=` with `AmbiguousDatabaseError`.
+- `storage.compaction_target_bytes` (default 2 GiB): target size for the fragments compaction writes on the tables holding docling blobs.
+- `source` on `HaikuRAG.visualize_chunk`, naming the database the chunk came from. Without one a client covering a set raises `AmbiguousDatabaseError`.
+
+### Changed
+
+- `Store.vacuum` compacts `documents` and `document_items` through `lance` with a fragment target derived from `compaction_target_bytes`, instead of `AsyncTable.optimize`. The other tables are unchanged. New dependency: `pylance`.
+
+### Fixed
+
+- The sandbox holds at most `analysis.max_output_chars` of a program's printed output while it runs.
+
+## [0.83.0] - 2026-09-09
+
+### Added
+
+- `ConversionTimeoutError` and `ConverterWedgedError` in
+  `haiku.rag.converters.exceptions`. The ingester dead-letters the document
+  that exceeded the deadline and retries one refused by a converter another
+  document stranded. `PermanentError` carries `conversion_stalled` and
+  `fatal_to_process`; on the latter the worker records the job dead and exits
+  non-zero, so `haiku-ingester` needs a restart policy. `BlockingTombstoneError`
+  names the row blocking a retry, which the API returns as 409.
+- Queue schema 3: `jobs.conversion_stalled` and `uq_jobs_blocking_op`, a
+  partial unique index over `(source_id, uri, op, COALESCE(revision, ''))`
+  covering live jobs and stalled ones. Discovery cannot re-enqueue a stalled
+  document at the same revision; a changed revision, a different op, a DLQ
+  retry and a successful DELETE all can, and retention leaves the row alone.
+  Existing queues migrate in place on open.
+- `processing.conversion_timeout`, seconds one document conversion may take,
+  default 600. Past it `convert_file` raises `ConversionTimeoutError`. The
+  thread is never cancelled: for PDFs and office formats it keeps the shared
+  docling converter, so later conversions raise `ConverterWedgedError` until
+  the process is restarted; HTML and Markdown keep one OS thread each. Waiting
+  for the shared converter is not counted against the deadline, and a
+  conversion runs on a daemon thread, so an abandoned one does not hold up
+  process exit.
+- `processing.conversion_options.pdf_backend`, one of `docling_parse`
+  (default), `threaded_docling_parse` or `pypdfium2`, sent by both converters.
+  docling's own default is `threaded_docling_parse`; on some documents it never
+  returns, so it is not ours.
+- `provider: vllm` on a model config, served by pydantic-ai's
+  `VLLMProvider`. `base_url` is accepted with or without `/v1`, and
+  `api_key` is honored.
+- Claude Code and Codex plugin under `plugins/haiku-rag/`: two client manifests
+  sharing the server configuration and the `haiku-rag` Agent Skill.
+- MCP tool `execute_code(code, filter, sources)`: runs a program in the
+  analysis sandbox over the selected documents and returns what it printed;
+  one sandbox per call.
+- In the analysis sandbox, `search()` results carry `chunk_meta`,
+  `list_documents()` rows and `metadata.json` carry the document `metadata`,
+  and `/documents/{id}/chunks.jsonl` lists chunk ids with their metadata.
+  `recovery_hint` in `haiku.rag.sandbox`.
+- MCP tools `get_document_outline` (heading tree with page numbers) and
+  `get_document_section` (one section's text, subsections included), built
+  on `document_items`. `build_toc` in `haiku.rag.context`.
+- MCP server `instructions`, `version`, and read-only `ToolAnnotations` on
+  every tool; every parameter carries a description. `filter` on
+  `search_documents` and `search_documents_by_image`. `DocumentInfo.metadata`.
+
+### Changed
+
+- `pydantic-ai-slim>=2.40.0,<3.0.0`.
+- The docling stack is pinned exactly to what docling-serve `v1.32.0` ships,
+  read from the image: `docling==2.124.0`, `docling-core==2.93.0`,
+  `docling-ibm-models==4.0.1`, `docling-parse==7.16.0`. The compose images
+  are pinned to `v1.32.0` to match.
+- Conversion output moves with docling 2.124.0: adjacent text items merge and
+  chunk boundaries fall in different places. An existing database is untouched
+  until a document is re-ingested; re-ingesting a corpus produces different
+  chunk ids.
+- `processing.split_pages` no longer reproduces single-pass conversion
+  exactly. A slice sees only its own pages, so a paragraph spanning a slice
+  boundary stays two items and a caption near one can order differently:
+  about one text item and one chunk per boundary on a 9-page document.
+  Re-ingesting a PDF after changing `split_pages` re-chunks those places.
+- ruff 0.16.6, ty 0.0.78 and pytest-asyncio 1.4.0 in the dev group.
+  `[tool.ruff] include` excludes Markdown, and `evaluations/` extends the
+  root ruff config instead of resolving as its own project.
+- lancedb 0.38.0.
+- `pyarrow` is a declared dependency, `>=16,<25`.
+- Dependency upper bounds: `typer<0.27.0` (was `<0.22.0`),
+  `transformers<6.0.0` on the `jina` extra, `sentence-transformers<6.0.0` on
+  the `cross-encoder` extra.
+- `pydantic-monty>=0.0.23,<0.0.24`. The analysis sandbox gains `collections`,
+  `itertools`, `functools`, `dataclasses`, function decorators and
+  `str.format`.
+- `fastmcp>=4.0.2,<5.0.0`, on MCP Python SDK 2. The MCP server answers both the
+  session-based and the sessionless (2026-07-28) protocol.
+- Default models are `ollama:qwen3.8`: `ModelConfig`, `qa.model`,
+  `processing.title_model` (was `ollama:gpt-oss`) and
+  `processing.conversion_options.picture_description.model` (was
+  `ollama:ministral-3`). Run `ollama pull qwen3.8`.
+- `qa.model.vision` defaults to `true`, matching `qwen3.8`. Set it `false` when
+  pointing `qa.model` at a text-only model.
+- `enable_thinking` on `provider: ollama` maps to `reasoning_effort` for every
+  model, not only `gpt-oss`: `false` sends `none`, `true` sends `high`.
+  `gpt-oss` keeps `low` for `false`.
+- `processing.conversion_options.picture_description.model` defaults to
+  `enable_thinking: false`, and the field now reaches the VLM: docling's
+  picture-description request carries `reasoning_effort` in `params`.
+- MCP `search_documents` and `search_documents_by_image` expand results to
+  their section (`HaikuRAG.expand_context`) and return the agent rendering
+  as text (rank, `Document ID`, `Collection` over several databases, title,
+  headings, the matched chunk's metadata, passage) and pictures as
+  `ImageContent` blocks, with no structured content.
+  `SearchResult.format_for_agent(include_document_id=, include_chunk_meta=)`;
+  `collect_pictures` in `haiku.rag.tools.search`.
+- MCP tools raise on failure, with the error's message; an empty result no
+  longer doubles as an error.
+- `haiku-rag mcp` covers the configured `lancedb.databases` set. `sources` on
+  `search_documents`, `search_documents_by_image` and `execute_code`; `source`
+  on `get_document`; an unknown name is a tool error. `DocumentInfo.source`.
+- `footnote` items are no longer filtered from expanded context. The noise
+  labels are `page_header`, `page_footer` and `document_index`.
+
+### Fixed
+
+- `DoclingLocalConverter.convert_file` chains the exception that caused
+  `Failed to parse file` instead of discarding it.
+- Page and picture images are re-encoded at PNG compression level 6 before
+  storage.
+- `toc.json` `item_range` in the analysis sandbox is a line slice into
+  `items.jsonl`, as documented; it held item positions.
+- Past `analysis.code_timeout` a sandbox program starts no further host call.
+  Files served from memory and in-code `search()` / `list_documents()` were
+  not checked against the deadline.
+- Context expansion keeps the item a result matched on when it carries a
+  noise label, and counts it toward the character budget.
+
+### Removed
+
+- MCP tools `ask_question` and `analyze`.
+- `format_citations` in `haiku.rag.utils`; `format_citations_rich` stays.
+- MCP write tools `add_document_from_file`, `add_document_from_url`,
+  `add_document_from_text` and `delete_document`. The server opens the
+  database read-only; ingest with `haiku-rag add`, `add-src`, `delete` or
+  `haiku-ingester`. `create_mcp_server` loses `read_only`.
+
+## [0.82.1] - 2026-09-03
+
+### Fixed
+
+- Document timestamps include timezone information and satisfy the MCP
+  date-time output schema. Stored timestamps without an offset are read as
+  host-local time; a database written under a different host timezone shifts
+  by that offset.
+
+## [0.82.0] - 2026-09-03
+
+### Removed
+
+- `lancedb.uri`. Write `lancedb.databases: {NAME: <location>}`; a config carrying
+  `uri` fails to load with that message. Configurations generated by
+  `init-config` through 0.81 carry `uri: ""` and must drop the key.
+- `HAIKU_RAG_DB`. Capabilities cover the databases the configuration places, or
+  the `db_path` argument.
+- `DB_PATH` in the `app/` backend and `examples/custom_agent_agui.py`. Both load
+  the configuration as the CLI does (`HAIKU_RAG_CONFIG_PATH`, `./haiku.rag.yaml`,
+  the platform directory); the compose files set
+  `HAIKU_RAG_CONFIG_PATH=/app/haiku.rag.yaml` and mount `DB_VOLUME` at `/data`.
+
+### Changed
+
+- `qa.max_searches` counts search units: searches a model emits in one
+  response share a unit, up to 3 per unit; sequential searches pay one unit
+  each.
+- Searches in one model response deduplicate their results: evidence a sibling
+  search already showed collapses to a reference line, and a picture attaches
+  once per response.
+- Every database has a name: the key in `lancedb.databases`, or the path's stem
+  for `--db PATH`, `db_path=` and the default database, which is the entry
+  `haiku.rag` under `storage.data_dir` and selectable by that name.
+  `SearchResult.source`, `Document.source` and `Citation.source` carry it on
+  every value a database produces.
+- `db_path=` beside a configured `lancedb.databases` raises
+  `AmbiguousDatabaseError` (`HaikuRAG`, `create_capability`, `create_mcp_server`,
+  `Sandbox`). `haiku-rag --db PATH` and `haiku-ingester --db PATH` open that path
+  whatever is configured.
+- `DatabaseRef(name, location, given)` replaces `DatabaseRef(name, uri, db_path)`;
+  `DatabaseScope.at(path)` added; `locate_database` returns `Path | str`.
+  `IngesterApp(config, scope)` takes a resolved scope in place of `db_path`.
+  `SingleDatabaseSession(ref, config)` replaces `SingleDatabaseSession(db_path,
+  config, source=)`. `Store.db_path` is `None` for a database behind a URI.
+- Opening a configured or default database that does not exist raises
+  `SourceUnavailableError` naming the database and the remedy (`haiku-rag init`
+  or `create=True`), where the default database raised `FileNotFoundError` with
+  its path. A database given as a path still raises `FileNotFoundError`.
+- `Store(location, config)`, `connect_lancedb(location, config)`,
+  `gather_database_info(location, config)` and `run_doctor(config, location, ...)`
+  take the database location, a path or a URI. `ConnectionMode.of(location)`
+  replaces `ConnectionMode.from_config`. `DatabaseRef.connection()` and
+  `default_db_path` removed.
+
+## [0.81.0] - 2026-09-01
+
+### Added
+
+- `search.vector_nprobes` (default 20) sets the IVF partitions each vector query searches.
+
+### Documentation
+
+- `docs/configuration/storage.md` "Vector Indexing" carries the measured with/without IVF_PQ retrieval comparison; `docs/benchmarks.md` states the published numbers are measured without a vector index.
+- Re-indexing note corrected: `optimize()` adds new chunks to an existing vector index, a rebuild retrains centroids.
+
+### Fixed
+
+- Cross-database fusion without a reranker orders the union by cosine
+  similarity to the query, with within-database rank breaking ties, instead
+  of round-robin by database declaration order. Full-text-only searches order
+  by retrieval score. Fused results carry the ordering score.
+
+## [0.80.0] - 2026-08-31
+
+### Changed
+
+- lancedb 0.37.1.
+- An invalid search `filter` raises `ValueError`.
+
+### Added
+
+- `--full-citations` on `haiku-rag ask` and `haiku-rag analyze` renders citation
+  text untruncated. `format_citations_rich` takes a `full` argument.
+- `doctor` fails when the chunks FTS index covers no rows.
+- FTS and hybrid searches log a warning when the FTS index covers no rows.
+
+### Removed
+
+- `dot` removed from `search.vector_index_metric`; switch to `cosine` or `l2`
+  and rerun `create-index`.
+
+### Fixed
+
+- FTS and hybrid search on a database whose FTS index covers no rows. Chunk
+  writes now build the index and rebuild it if it covers none; `haiku-rag
+  vacuum` also repairs it.
+- Migration to 0.38.0 no longer fails with `UnicodeDecodeError` on a
+  `docling_document` blob written as zstd.
+- Vector search sets `search.vector_index_metric` on every query.
+
+## [0.79.0] - 2026-08-28
+
+### Changed
+
+- Chat model provider `gemini` renamed to `google`, matching pydantic-ai. Update `provider: gemini` to `provider: google`.
+
+### Added
+
+- `lancedb.databases` configures a named set of local or remote databases.
+  `search`, `ask` and `analyze` accept a `sources` subset; results, documents and
+  citations carry the originating database in `source`, and model context names
+  it as `Collection:` when a search spans more than one. Candidates are combined
+  with the configured reranker, or reciprocal rank fusion when reranking is
+  disabled. Operations that need one database raise `AmbiguousDatabaseError`, an
+  unknown name raises `UnknownDatabaseError`, and a cited chunk ID retrieved from
+  or previously cited from more than one selected database raises
+  `AmbiguousCitationError`. An unavailable configured database raises
+  `SourceUnavailableError`, which names the database and not its location.
+- `haiku-rag search`, `ask`, `analyze` and `chat` cover a configured set.
+  Commands that access one database select it with `--db-name NAME` or
+  `--db PATH`.
+- `HaikuRAG.aclose()` releases a client whatever it covers. `close()` remains
+  limited to clients covering one database.
+
+### Fixed
+
+- `haiku-rag settings` prints YAML.
+- The chat document filter pages results and lists the selected separately.
+  Selection is by document ID and database, and a typed search applies on enter.
+- `haiku-rag list` prints only the fields a document has.
+- `haiku-rag` and `haiku-ingester` exit with a message on an embedder mismatch.
+- Capabilities created without a client honor `lancedb.uri`.
+- A `lancedb.uri` without a scheme is treated as a local path. `--db PATH`
+  overrides it.
+- Inspector search results mark truncated previews with an ellipsis.
+- Document titles, URIs, headings and database names render as text, not Rich
+  markup, in `search` output, chat citations and the chat document filter.
+- `reranking.model.base_url` accepts the endpoint with or without the `/v1` path, matching the `vllm` embedder. Writing `/v1` produced a request to `/v1/v1/rerank`.
+- An unrecognized chat model provider raises `Unknown model provider '<name>'` instead of reaching pydantic-ai as a `provider:name` string, and outranks the `api_key` check, so an unusable provider is no longer reported as a missing vendor environment variable.
+
+## [0.78.0] - 2026-08-24
+
+### Added
+
+- `api_key` on model and embedding-model config, overriding the provider's environment variable. Honored on the `openai` and `ollama` providers, `vllm` embedders and rerankers, the picture-description VLM endpoint, and `doctor`'s endpoint probes; other providers raise.
+
+### Fixed
+
+- `doctor`'s docling-serve probe sends `X-Api-Key`, so an instance requiring a key is reported reachable rather than unreachable.
+- The picture-description request to the public OpenAI endpoint sends `OPENAI_API_KEY`; it carried no authorization header.
+
+## [0.77.0] - 2026-08-21
+
+### Added
+
+- The four capabilities support Pydantic AI agent specs via `from_spec`, registered with
+  `Agent.from_spec(..., custom_capability_types=[...])`. `RAGCapability` and `AnalysisCapability` take
+  `db_path`, `config`, `defer_loading`, `request_limit` and `vision`.
+
+### Fixed
+
+- `Store`, `HaikuRAG` and `create_capability` coerce a string `db_path` to `Path`, as the documented
+  `HaikuRAG("knowledge.lancedb")` and `rag(db_path="my.lancedb")` forms require.
+- A capability search that matches nothing returns `No results found.` instead of an empty string.
+- Repeating a search query within a question accumulates the results of both calls instead of replacing the earlier ones.
+- `file://` URIs resolve to a Windows path through `url2pathname`: `file:///C:/docs/a.pdf` was read as `\C:\docs\a.pdf`, so ingestion reported `File does not exist` for every discovered file. A URI authority is kept as a UNC server/share (`file://server/share/a.pdf`) except `localhost`, which is dropped.
+- A Windows drive letter is no longer read as a URI scheme, so `C:\docs\a.pdf` is accepted by `create_document_from_source`, `convert` and `resolve_adhoc_fetcher`.
+- `convert` and `check_source_accessible` decode percent-escapes in `file://` URIs, so a path containing `[`, `]` or a space resolves.
+
+## [0.76.0] - 2026-08-20
+
+### Added
+
+- `haiku.rag.capabilities.EvidenceState`: the state base `RAGState` and `AnalysisState` derive from, with `begin_invocation()` for the per-question reset. `RAGCapabilityBase.evidence_record()` and `citation_index()` expose what a capability recorded, so a host reads it without reaching into `capability.state`.
+- The `haiku.rag` package declares the `jina` extra, so `provider: jina-local` is supported by declaration rather than through `cross-encoder`'s transitive `transformers` and `torch`. Raises the full package's torch floor to 2.0.
+- `providers.docling_serve.timeout` (default 300 seconds), forwarded to the docling-serve client's per-request timeout.
+
+### Changed
+
+- `haiku.rag.store.engine` split: table records, Arrow schemas, `index_specs`, `ensure_indexes`, `REQUIRED_TABLES` and `query_to_pydantic` are in `haiku.rag.store.schema`; `gather_database_info`, `get_database_stats`, `DatabaseInfo` and its result models are in `haiku.rag.store.info`. `Store` keeps lifecycle, locks, migration coordination, vacuuming and tags. Update imports.
+- Source adapters moved from `haiku.rag.ingester.sources` to `haiku.rag.sources`: `FetchResult`, `SourceEvent`, `SourceEventKind`, `RevisionSnapshot`, `Source` and the `FSSource`/`HTTPSource`/`S3Source`/`WebDAVSource` adapters. One-shot client ingestion uses them too, so they were never ingester-only. Update imports; the `haiku.rag.sources` plugin entry-point group is unchanged.
+- `HaikuRAG.convert(url)` fetches through `HTTPSource`, the same adapter the ingester uses, instead of its own httpx client. `_write_fetch_body` moved from `client.documents` to `client.processing`.
+- Chunk embedding is owned by the persistence funnels: `create_document`, `update_document` and source ingestion no longer embed eagerly before handing chunks to a check that would embed them anyway. The `document.embed` span moved onto `ensure_chunks_embedded`, so every path is instrumented rather than only ingest.
+- One-shot directory ingestion and `FSSource.discover` share `walk_files`, so the symlink-escape guard lives in one place.
+- Configuration sections reject unknown keys. A typo or a setting that has been renamed or removed now fails validation with its path (`providers.docling_serve.bogus: Extra inputs are not permitted`) instead of being silently ignored.
+- `processing.converter`, `processing.chunker` and `processing.chunker_type` are constrained to their supported values, so an unsupported one fails at load rather than at first use.
+- Numeric settings carry bounds: sizes, limits, dimensions, token budgets, attempt counts, breaker thresholds and `min_chunks` must be positive; retention, delays, intervals and cooldowns non-negative; `doctor.duplicates.similarity_threshold` within 0-1; `ingester.api.port` within 0-65535 (0 keeps its OS-assigned meaning); `ingester.workers.worker_count` allows 0 for an API-and-reaper-only process.
+- A configured reranker whose optional dependency is missing raises instead of silently disabling reranking, and names the extra to install (`uv pip install 'haiku.rag-slim[cohere]'`). A failure raised from inside an installed dependency propagates untouched rather than being reported as a missing package.
+- Multi-table writes (document create, update, batch import, cascade delete) go through `Store.write_transaction()`. Rollback restores in `RESTORE_TABLE_ORDER` and is shielded from cancellation, so a cancelled write rolls back instead of committing part of itself. `Store.restore_table_versions()` is removed.
+
+### Removed
+
+- `haiku.rag.config.Config`, the eagerly loaded configuration instance. Use `get_config()` for the current global config, or pass an `AppConfig`. Every internal default (`get_embedder`, `get_converter`, `get_chunker`, `get_reranker`, `embed_chunks`, `HaikuRAG`, `Store`, `HaikuRAGApp`, `create_mcp_server`) now takes `config: AppConfig | None = None` and resolves it per call, so `set_config()` reaches them. `RerankerBase._model` no longer defaults to the configured reranker name; `CohereReranker` takes its model name as an argument.
+
+### Fixed
+
+- `haiku-rag settings` masked only top-level secret-named fields, printing nested ones in full (`lancedb.api_key`, `providers.docling_serve.api_key`, WebDAV source passwords). It redacts the whole dump.
+- `haiku-rag chat` reports a missing `tui` extra instead of raising `ImportError`, matching `haiku-rag inspect`.
+- `storage.data_dir: ""` resolves to the platform data directory, as documented; it coerced to `Path("")`, so the database was created in the process's working directory. Set `data_dir: .` to keep the old placement.
+- Documented `search.limit` default is 5, was stated as 10.
+- The documented way to disable reranking is omitting `reranking.model` or setting it to `null`; the previous `provider: ""` example raised `Unknown reranking provider`.
+- `prompts.picture_description: null` is not valid; the documented example sets a string or omits the key.
+- `create_document_from_source` closes the source adapter it builds for the call; adapters passed in through `sources` are left to their owner.
+- Directory ingestion skips symlinked files resolving outside the given directory, matching `FSSource.discover`.
+- A FULL rebuild no longer deletes a source-backed document before re-ingesting it: it refreshes the document in place, so the document id is preserved and a failed fetch or conversion falls back to rebuilding from stored content instead of losing the document.
+
+## [0.75.0] - 2026-08-19
+
+### Added
+
+- `evaluations run --filter/-f CLAUSE`: SQL `WHERE` clause over document columns, applied to the retrieval benchmark's searches and to every capability search during QA. Recorded as `document_filter` in experiment metadata.
+- `mtrag_clapnq` / `mtrag_clapnq_rewrite` / `mtrag_clapnq_live` / `mtrag_clapnq_live_uncompacted` evaluation datasets: multi-turn QA with gold-prefix and live-session conversation replay, live arms with and without `EvidenceCompactionCapability`, Recall@k/nDCG@k retrieval metrics, eligibility-aware citation scoring, refusal precision/recall, per-turn tool-traffic attributes, and `citation_status` / `turn_citation_status` eval attributes.
+- Raw chunk metadata is now exposed to search and citation results, through `SearchResult.chunk_meta` and `Citation.chunk_meta`. For context-expanded results, the metadata is that of the anchor chunk.
+- BTree indexes on `chunks.id`, `chunks.document_id` and `documents.id`, and a Bitmap index on `document_items.label`. Existing databases need `haiku-rag migrate`.
+- `lancedb.read_consistency_interval_seconds` (default 30), `lancedb.index_cache_size_bytes` and `lancedb.metadata_cache_size_bytes`. The LanceDB session is shared across connections in a process, so its index and metadata caches survive a connection being closed.
+
+### Changed
+
+- Search enrichment, the multimodal reranker's picture fetch, and context expansion each issue a fixed number of `document_items` queries regardless of how many documents a result set spans, instead of one set per document. `expand_with_items` takes the items to expand from rather than fetching them, and `DocumentItemRepository` gains `resolve_refs_grouped`, `get_items_in_ranges`, `get_pictures_grouped` and `get_caption_picture_refs_grouped`. The superseded methods are removed: `resolve_refs`, `get_items_in_range`, `get_caption_picture_refs`, `get_text_for_refs` and `get_all_items_grouped`. `get_pictures_grouped` returns each picture's text alongside its bytes under `with_text`, off by default so the reranker's blob fetch does not read a column it discards.
+- Eval judge pinned to `qwen3.8`: `DEFAULT_JUDGE_MODEL` is `ollama:qwen3.8`, and the reference configs use `Inferact/Qwen3.8-27B-NVFP4` with `extra_body.chat_template_kwargs.reasoning_effort: low`. Results in `docs/benchmarks.md` were judged by `Qwen3.6-35B-A3B-NVFP4` and are not re-judged.
+- `create_capability(rag=...)` lends a capability an open client rather than having it open its own; `client.ask`/`client.analyze` now pass theirs.
+- The MCP server opens one database client for its lifetime instead of one per tool call, and fails at startup if the database cannot be opened. `delete_document` no longer opens its own connection with `skip_validation=True`, so the server no longer opts out of embedding-config validation: drift that validation rejects (any `vector_dim` mismatch, or identity drift on a writable server) now fails MCP startup instead of serving a delete-only server. Use the CLI to delete under drift.
+- `import_documents` embeds chunks across the whole batch in one pass instead of per document.
+- `haiku.rag` and `haiku.rag-slim` summaries and keywords; both packages now publish `[project.urls]`.
+- `server.json` declares `title` and `websiteUrl`, and drops the `keywords` and `license` keys, which are not in the server schema.
+
+### Removed
+
+- `wix` evaluation dataset and its reference config `evaluations/configs/wix.yaml`.
+
+### Fixed
+
+- `DocumentRepository.delete_all` recreated `document_items` from `DocumentItemRecord` instead of `get_document_items_arrow_schema()`, returning `picture_data` as `binary` rather than `large_binary`.
+- `server.json` runtime arguments are `mcp --stdio`, was `serve --mcp`.
+
+## [0.74.0] - 2026-08-13
+
+### Added
+
+- `CitationPolicyCapability` (`haiku.rag.capabilities.policy.create_capability`): registering it requires every answer to declare its grounding, in any conversation that has something to declare — this question retrieved evidence, or something was cited earlier. A question that ends undeclared is sent back once to record what grounded the answer already given, and is recorded in `CitationPolicyState.violations` if it finishes undeclared regardless. A conversation with neither a current-question evidence outcome nor any earlier citation is not enforced.
+- `haiku.rag.capabilities.evidence.discover_evidence()` and `DiscoveredEvidence`, moved out of `compaction` so both optional capabilities share them. `RAGCapabilityBase.cite_available`.
+- `EvidenceCompactionCapability` (`haiku.rag.capabilities.compaction.create_capability`): registering it replaces earlier questions' evidence on the model request with the evidence that was cited, grouped by the question that cited it, cited page images re-attached, other earlier evidence returns reduced to a receipt. Requests only; `all_messages()` is untouched. No configuration.
+- `RAGState.evidence` / `AnalysisState.evidence` (`CapabilityEvidenceRecord`): which evidence a capability retrieved and cited, per question, keyed by message-count question identities and epochs, and whether that question is still being answered. `haiku.rag.capabilities.ledger.citation_status(records, question=...)` derives `missing` / `grounded` / `ungrounded` across capabilities.
+- `RAGCapabilityBase.evidence_tool_names()` and `get_picture_bytes()`.
+- `haiku.rag.tools.search.decode_picture()`.
+
+### Changed
+
+- `rag_cite` / `analysis_cite` accept an empty `chunk_ids`, recording the answer as ungrounded rather than failing the call, and the instructions no longer exempt a refusal or a corpus-level computation from citing.
+- `RAGCapability` and `AnalysisCapability` no longer rewrite the model request. Register `create_capability()` from `haiku.rag.capabilities.compaction` alongside them to keep earlier questions compacted.
+- Resuming a run (deferred tool results, an unfinished history tail) raises `RuntimeError` unless the host carries the capability state from the run being resumed.
+
+### Removed
+
+- `PRIOR_TURN_NOTICE` and `_compact_old_tool_returns` from `haiku.rag.capabilities._base`, and `RAGCapabilityBase.turn_start`.
+
+### Fixed
+
+- `rag_cite` and `analysis_cite` no longer ask for another call when a call resolved some ids and not others.
+- `cross-encoder` reranking no longer ties the scores of strongly-relevant candidates, which left their order to the sort. Scores remain 0-1.
+- `haiku-rag` and `haiku-ingester` CLI startup no longer imports `lancedb`, `pyarrow` and `pydantic_ai`.
+- `haiku.rag.store` no longer re-exports `Store`; import it from `haiku.rag.store.engine`.
+- `docling-local` reuses one docling `DocumentConverter` per set of conversion options instead of building one per document, so local layout, table and OCR models are no longer loaded per document. Conversions through a shared converter are serialized.
+- A resumed run keeps the searches, citations and executions of the question in progress instead of clearing them.
+- Each page image attached to a search result is preceded by a line giving its position and the chunk id it came from. `build_binary_parts_from_results` is now `build_image_content_from_results` and returns those labels interleaved with the pictures.
+
+## [0.73.0] - 2026-08-06
+
+### Added
+
+- `evaluations run` records `judge_extra_body`, `qa_extra_body` and `capability_extra_body` in experiment metadata.
+
+### Changed
+
+- `get_document_by_id` / `get_document_by_uri` no longer load the docling structure and page-image blobs. Load them with `DocumentRepository.get_docling_data` / `get_pages_data`, or `get_by_id(..., include_blobs=True)`.
+- Pinned judge sampling in every reference config under `evaluations/configs/` whose dataset is judged: `temperature` 0.6, `max_tokens` 16384, `extra_body` `top_p` 0.95 / `top_k` 20 / `min_p` 0 / `chat_template_kwargs.enable_thinking` true. `DEFAULT_JUDGE_MODEL` takes `temperature` 0.6, `max_tokens` 16384 and `top_p` 0.95, the subset ollama honours.
+- Reranker in the `orb_text`, `wix` and `t2_finqa` reference configs and in the reranking provider docs: `mixedbread-ai/mxbai-rerank-base-v2` → `Qwen/Qwen3-Reranker-4B` on the `vllm` provider.
+
+### Fixed
+
+- Ingester jobs failing with an `obstore` `PermissionDeniedError`, `UnauthenticatedError`, `UnknownConfigurationKeyError` or `InvalidPathError` are dead-lettered instead of retried to `max_attempts`.
+
+## [0.72.1] - 2026-07-31
+
+### Changed
+
+- `list_documents(include_content=True)` returns `content` only; the docling structure and page-image blobs are no longer loaded by a listing.
+
+## [0.72.0] - 2026-07-30
+
+### Added
+
+- `evaluations run` records `cited_chunk_ids`, `searched_uris`, `n_searches`, `n_search_calls`, `n_rejected_searches`, `n_failed_tools`, `n_executions` and `n_requests` as eval attributes alongside `cited_uris`.
+
+### Changed
+
+- A capability whose search or code-execution budget is spent says so in its instructions on every following request, naming the exhausted tools.
+
+### Fixed
+
+- A failed `analysis_execute_code` call that iterated a file object reports the `.readlines()` workaround alongside the `TypeError`.
+- A capability that reaches its request limit keeps its cite tool for two further requests that call one of its tools, while its other tools are removed.
+- A cited chunk id that does not match a retrieved id exactly resolves to the closest one above a 0.75 similarity cutoff.
+- Dotfiles are parsed as their actual format instead of a single unstructured text block. Docling ignores the extension of a name starting with a dot, so converters strip leading dots from the name they hand it.
+
+### Documentation
+
+- `qa.max_searches` is documented as defaulting to 5 in `docs/configuration/qa.md` and `docs/configuration/index.md`, was 3.
+- New "Vacuum Memory Requirements" subsection in `docs/configuration/storage.md` documenting the ~5x peak memory of vacuum compaction relative to the `documents` table, the mitigations, and upstream issue lancedb/lancedb#2325.
+
+## [0.71.0] - 2026-07-29
+
+### Added
+
+- Analysis sandbox supports `open()` and `with` blocks for reading document files, including `.read()`, `.readline()`, and `.readlines()`.
+
+### Changed
+
+- Require `pydantic-ai-slim>=2.18,<3`.
+- `pydantic-monty` bumped to `>=0.0.19`; sandbox code now runs in a subprocess worker pool. A crashed or timed-out worker fails one call and the next call gets a replacement session.
+- The analysis sandbox gives Monty a duration budget of `analysis.code_timeout * analysis.max_executions` for the session, was `analysis.code_timeout`.
+- `enable_thinking` maps onto Pydantic AI's unified `thinking` setting for the `anthropic`, `gemini`, `groq` and `bedrock` providers. The Anthropic thinking budget is now Pydantic AI's default of 10000 tokens, was 4096, and `max_tokens` must exceed it on budget-based Claude models; `enable_thinking: false` disables Gemini thinking rather than only hiding thoughts; Groq maps reasoning effort rather than `groq_reasoning_format`; Bedrock Qwen with `enable_thinking: false` no longer sends `reasoning_config`, while Bedrock-served Claude keeps an explicit `thinking: disabled`. The `openai` and `ollama` providers still map to `openai_reasoning_effort`.
+- `provider: bedrock` with a proprietary OpenAI model such as `openai.o3-mini-v1:0` raises `UserError`: Bedrock Converse serves only the `gpt-oss` family. Use `provider: bedrock-mantle`.
+- Tool failures raise `pydantic_ai.ToolFailed` instead of returning failure text: search and code-execution limits, sandbox execution errors, and `get_document`/`summarize_document` misses.
+
+### Fixed
+
+- `Store.set_haiku_version` stamps the store's own config into a recreated settings row instead of the process-global `Config`.
+- `check_source_accessible` returns `False` for a URI it cannot resolve (unparseable host, unreadable path) instead of raising and aborting a full rebuild.
+- `evaluations run` opens the database read-only outside the population phase, so an embedder identity differing from the stored one warns instead of aborting the run.
+- `docs/installation.md` documents the `jina`, `s3` and `ingester` extras, names the extras the full package actually pulls, drops the removed MixedBread AI reranker, and no longer lists Anthropic as a built-in provider.
+- `docs/tuning.md` no longer points at the removed `claim_timeout_s` setting.
+- `analysis.code_timeout` is enforced before each document read, bounding a call that reads in a loop.
+- `metadata.json` in the document VFS rejects writes, matching `content.txt`, `items.jsonl` and `toc.json`.
+
+### Removed
+
+- `SettingsRepository.create`, `get_by_id`, `update`, `delete`, `list_all` and `ChunkRepository.update`, `delete`, `get_chunks_in_range`.
+
+## [0.70.0] - 2026-07-25
+
+### Added
+
+- `HaikuRAG.ask` and `HaikuRAG.analyze` accept `images: Sequence[bytes]`, attached to the question as model input; requires `vision: true` on the driving model.
+- `haiku-rag ask` and `haiku-rag analyze` accept `--image PATH` (repeatable).
+- MCP `ask_question` and `analyze` tools accept `images_base64`.
+- Chat TUI: `Ctrl+I` opens an image picker; attached images insert `[Image #N]` tokens in a multi-line prompt and are sent to the model with the message.
+
+### Fixed
+
+- Chat and inspector TUIs report the actual database-open error instead of an `AttributeError` from teardown.
+
+## [0.69.0] - 2026-07-24
+
+### Added
+
+- Native deferred Pydantic AI `RAGCapability` and `AnalysisCapability` implementations under `haiku.rag.capabilities`, with namespaced host state and lazy per-run database and sandbox resources.
+- Prior-turn RAG and analysis tool results are compacted before model requests while current-turn evidence remains intact.
+- Per-question capability request limits force a final answer from gathered evidence by removing only the exhausted capability's tools; unrelated agent and capability tools remain available.
+
+### Changed
+
+- Require `pydantic-ai-slim>=2.11,<3`; the `vertexai` optional extra now installs Pydantic AI's `google` extra.
+- The chat TUI consumes native Pydantic AI stream events. The web example uses the standard `AGUIAdapter` and emits one final state snapshot instead of forwarding sub-agent activity and per-tool state events.
+- Chat capability selection is now `haiku-rag chat --capability/-c {rag,analysis}`. Migrate from `--skill/-s`.
+- Evaluation targets are now `rag-capability` and `analysis-capability`, and the model override is `--capability-model`. Migrate from `rag-skill`, `analysis-skill`, and `--skill-model`.
+
+### Removed
+
+- The `haiku.skills` dependency, `haiku.rag.skills` modules, Python entry-point discovery, and sub-agent execution layer. Migrate `create_skill(...)` plus `SkillToolset` usage to `haiku.rag.capabilities.*.create_capability(...)` passed through `Agent(capabilities=[...])`.
+- The `haiku-rag create-skill` package generator. Compose native capabilities directly and package application-specific instructions and data in the consuming project.
+- Legacy sub-agent `ActivitySnapshotEvent` plumbing and per-tool `StateDeltaEvent` generation.
+
+## [0.68.0] - 2026-07-24
+
+### Added
+
+- `reranking.multimodal` config flag: picture chunks are sent to a vllm reranker as image documents.
+
+### Fixed
+
+- `list`, `get`, and `visualize` no longer require an embeddings config matching the database.
+
+## [0.67.3] - 2026-07-23
+
+### Changed
+
+- Security dependency updates: pillow 12.3.0, mcp 1.28.1, pydantic-ai 1.102.0, torch 2.13.0, transformers 5.5.0, soupsieve 2.9.1, joserfc 1.7.4, pyasn1 0.6.4, setuptools 83.0.0; frontend next 16.2.11, sharp 0.35.3, fast-uri 3.1.4, dompurify 3.4.12, body-parser 1.20.6.
+
+## [0.67.2] - 2026-07-23
+
+### Added
+
+- `SearchResult.document_meta` and `Citation.document_meta` carry the parent document's metadata.
+
+## [0.67.1] - 2026-07-22
+
+### Added
+
+- `hotpotqa` evaluation dataset.
+
+### Changed
+
+- `cite` skill tool names unresolvable chunk ids in its response when at least one id resolves.
+
+### Fixed
+
+- Document deletion no longer raises `ConfigMismatchError` on embedding config drift.
+
+## [0.67.0] - 2026-07-16
+
+### Added
+
+- Database tags: `haiku-rag tag create/list/delete/restore`, tags shown in `history`. `tag restore` creates a `before-restore-*` safety tag before changing live state. Vacuum retains versions back to the oldest tag.
+
+### Changed
+
+- `lancedb` bumped to 0.34.0.
+
+### Removed
+
+- `--before` global flag and the `before` constructor arguments on `HaikuRAG`, `Store`, `HaikuRAGApp`, `ChatApp`/`run_chat`, and `InspectorApp`/`run_inspector`. There is no read-only replacement; create tags prospectively before important changes and use `tag restore` during a maintenance window.
+
+### Fixed
+
+- `docling-local` text conversion no longer misroutes markdown/HTML content whose first bytes collide with a binary magic signature (e.g. `BM`, `ID3`) to an image or audio backend.
+
+## [0.66.0] - 2026-07-14
+
+### Changed
+
+- Unknown `reranking.model.provider` raises `ValueError` instead of silently disabling reranking.
+- `search.max_context_chars` default lowered from 10000 to 5000.
+
+### Removed
+
+- `mxbai` reranking provider and extra; the `transformers<5.0.0` cap goes with it. Migrate to `provider: cross-encoder` with the same model name (`mixedbread-ai/mxbai-rerank-base-v2`), installed via the `cross-encoder` extra.
+
+### Fixed
+
+- Context expansion no longer drops a retrieved result from a merged group when clipping to `search.max_context_chars`; groups whose clip would evict a constituent's evidence are returned as separate expanded results.
+- Context expansion now fills missing page metadata from input search results when the referenced items survive in the expanded result.
+
+## [0.65.1] - 2026-07-10
+
+### Added
+
+- `debug-evals` and `debug-ingestion` Claude skills (`.claude/skills/`) with canned Logfire queries for eval-run and ingestion debugging.
+
+### Changed
+
+- Logfire spans carry `service.version` and a per-process `service.name` (`haiku-ingester`, `haiku-rag`, `haiku-rag-app`); `OTEL_SERVICE_NAME` / `LOGFIRE_SERVICE_NAME` override the default.
+- Each docling-serve request emits a `docling_serve.request` span carrying the instance `url` and `attempt`.
+- The ingester worker circuit breaker opening emits a `ingester.worker breaker opened` Logfire event with `source_id`, `threshold`, `cooldown_s`.
+
+## [0.65.0] - 2026-07-09
+
+### Added
+
+- `SearchResult.chunk_ids` and `Citation.chunk_ids` carry the chunk ids merged into an expanded result.
+- `Citation.doc_item_refs` carries the items the model saw; `visualize_chunk` accepts a `refs` argument and resolves bounding boxes from them, so visualizations match the cited content instead of re-expanding.
+- Chunk visualizations draw matched content in a stronger highlight than surrounding context.
+- `haiku-rag visualize --no-expand` highlights only the chunk itself, without its expanded context (`visualize_chunk` gains an `expand` argument).
+
+### Changed
+
+- Duplicate images within a document produce a single picture chunk.
+- Pictures smaller than `processing.min_picture_size` pixels on the smaller side (default 64) no longer become picture chunks; `0` disables the filter.
+
+### Fixed
+
+- vLLM embedding and vLLM/Jina reranking reuse one HTTP client across requests instead of opening one per request.
+- Picture and table search hits expand within their section, never across section boundaries.
+- A merged search result anchors its `chunk_id` on the highest-scoring constituent chunk instead of the one earliest in the document.
+- A clipped citation's `page_numbers` and `doc_item_refs` reflect only the content that survived the budget, not the full expanded range.
+
+## [0.64.0] - 2026-07-08
+
+### Added
+
+- `update_document` accepts a `uri` argument to change a document's URI.
+- docling-serve requests fail over to another instance on transport/5xx errors and skip instances whose circuit breaker is open; tune via `providers.docling_serve.max_attempts` and `providers.docling_serve.circuit_breaker`.
+
+### Fixed
+
+- Concurrent ingestion of the same URI no longer creates duplicate documents; the URI is re-checked under the write lock and a colliding create becomes an update.
+- Document filters can reference `id` (`list_documents`/`count_documents`/`search`/`analyze` `filter=`); the `document_meta` identity column is renamed `document_id` → `id` with a migration.
+
+## [0.63.2] - 2026-07-03
+
+### Changed
+
+- Custom rerankers override `RerankerBase._rerank` instead of `rerank`; the base `rerank` handles the empty-input short-circuit.
+
+### Fixed
+
+- A search result whose matched refs include a figure's caption now attaches that figure's picture bytes for vision-capable models, resolved through the caption's adjacent picture item.
+
+## [0.63.1] - 2026-06-29
+
+### Changed
+
+- Require `haiku.skills>=0.18.0`.
+
+### Added
+
+- `orb_multimodal_nemotron` pre-built evaluation database (`nvidia/llama-nemotron-embed-vl-1b-v2` embedder).
+- `t2_finqa` pre-built evaluation database (T²-RAGBench FinQA).
+- Reference configs under `evaluations/configs/` for the pre-built evaluation databases (`wix`, `orb_text`, `orb_multimodal`, `orb_multimodal_nemotron`, `t2_finqa`).
+
+## [0.63.0] - 2026-06-28
+
+### Added
+
+- `doctor` shows a spinner naming the check currently in progress while it runs.
+
+### Changed
+
+- `doctor` near-duplicate detection compares whole-document embedding centroids instead of per-chunk overlap, and no longer flags a small document contained in a larger one. The per-chunk check could take hours and tens of GB of memory on corpora with large documents. The centroid check is independent of document size and reduces each document to a centroid during the vector scan without a second copy of the matrix.
+- **Breaking:** the `doctor.duplicates` keys `containment_threshold`, `candidate_threshold`, and `twin_similarity` are replaced by a single `similarity_threshold` (default `0.97`). `min_chunks` is unchanged.
+- `doctor --duplicates-out` YAML reports `similarity` per document instead of `contained_fraction`.
+
+## [0.62.1] - 2026-06-27
+
+### Fixed
+
+- Context expansion now hard-caps each expanded search result at `search.max_context_chars`, anchored on the matched chunk. A single oversized `document_items` row (e.g. a spreadsheet converted to one table) no longer pushes a result far past the budget and overflows the model context window.
+
+## [0.62.0] - 2026-06-26
+
+### Added
+
+- `doctor` reports groups of near-duplicate documents (revisions sharing most of their chunks), flagging the largest member as the likely one to keep; `--duplicates-out PATH` writes the groups to a YAML file. Tuned via the `doctor.duplicates` config block (`containment_threshold`, `candidate_threshold`, `twin_similarity`, `min_chunks`).
+
+### Security
+
+- Bumped dependencies in `uv.lock` to patched versions for known advisories: `aiohttp` 3.14.1, `cryptography` 49.0.0, `idna` 3.18, `langchain-core` 1.4.8, `langchain-text-splitters` 1.1.2, `langsmith` 0.9.1, `lxml` 6.1.1, `pillow` 12.2.0, `pydantic-settings` 2.14.2, `pyjwt` 2.13.0, `pytest` 9.1.1, `python-multipart` 0.0.32, `requests` 2.34.2, `starlette` 1.3.1, `urllib3` 2.7.0, `vcrpy` 8.2.1.
+- `app/frontend`: bumped `next` to 16.2.9 and `@copilotkit/*` to 1.61.1 (clearing their transitive advisories) and added `openai` (now a peer dependency of `@copilotkit/runtime`).
+
+### Changed
+
+- Ingester reaping is lease-based: a worker renews `last_heartbeat_at` on its in-flight jobs every `heartbeat_interval_s`, and the reaper reclaims a claim only once its lease is older than `lease_ttl_s`. A job slower than the timeout is no longer reaped and reprocessed while still running. Adds queue schema v2 (`last_heartbeat_at` on `jobs`); existing queue databases migrate in place on open.
+- **Breaking:** `ingester.workers.claim_timeout_s` removed; set `lease_ttl_s` (default 120) and `heartbeat_interval_s` (default 30) instead. `WorkerConfig` rejects unknown keys.
+- A bare `${VAR}` in YAML config now raises `MissingEnvVarError` when the variable is set but empty, matching the unset case. Use `${VAR:-default}` to allow an empty/absent value.
+
+### Fixed
+
+- A failed FTS index build is logged at `WARNING` instead of `DEBUG`, so silent full-text search degradation is visible.
+- Ingester worker ids are now globally unique (`{pid}-{uuid}-{n}`); the `claimed_by` guards on job completion/reschedule/release distinguish workers across processes sharing one Postgres queue.
+
+## [0.61.2] - 2026-06-24
+
+### Fixed
+
+- `fastmcp` is now a direct dependency instead of being pulled via the `pydantic-ai-slim[fastmcp]` extra, which `pydantic-ai-slim` 2.0 dropped. Clean installs resolving that release got only `fastmcp-slim` (client), so `haiku-rag mcp` failed with `ImportError: FastMCP server support is not installed`.
+
+## [0.61.1] - 2026-06-24
+
+### Fixed
+
+- zstd compression uses a fresh `zstandard` compressor/decompressor per call instead of shared module-level singletons, fixing process segfaults when ingester workers compress documents concurrently (Python < 3.14).
+- Ingestion compresses the DoclingDocument structure directly from the in-memory dict, removing one full-size serialized copy from per-document peak memory.
+- Document item extraction builds one `MarkdownDocSerializer` per document (reused across tables) and derives description-less picture text from captions, instead of constructing a serializer per picture and table.
+
+## [0.61.0] - 2026-06-23
+
+### Added
+
+- `haiku-rag doctor` checks a database for consistency (orphaned chunks/items, chunk-less documents classified by content and embedder modality, dangling `doc_item_refs`, vector-dimension mismatch, unembedded chunks, missing picture data, settings/embedding drift, pending migrations, vector-index coverage, provider API keys) and probes configured provider endpoints (Ollama `/api/tags` with model presence, docling-serve `/health`, OpenAI-compatible/vLLM `/models`); exits 1 when any check fails.
+- `embeddings.model.multimodal` (bool, default false) gates image embedding; `supports_images` derives from it instead of the provider name.
+- VoyageAI multimodal embedder (`provider: voyageai`, `multimodal: true`, e.g. `voyage-multimodal-3`) embedding text and pictures into a shared vector space.
+- Cohere multimodal embedder (`provider: cohere`, `multimodal: true`, e.g. `embed-v4.0`) embedding text and pictures into a shared vector space.
+
+### Changed
+
+- `provider: vllm` is text-only unless `embeddings.model.multimodal: true` is set. Existing multimodal vLLM configs must add the flag; `multimodal` is not part of the stored embedding identity, so changing it raises no drift error — re-ingest or `rebuild` to add or drop picture chunks.
+
+### Fixed
+
+- More CPU-bound steps run off the event loop: docling item extraction, local chunking, rebuild picture-description patching, and picture-chunk merging no longer stall concurrent workers on large documents.
+- `docling-serve` converter requests `include_page_images`, so `generate_page_images` produces page rasters on docling-serve versions that gate them behind that flag.
+- `docling-serve` chunker stores chunk bodies via `raw_text`, so section headings aren't duplicated into chunk content on docling-serve versions where the chunk `text` field is heading-contextualized.
+
+## [0.60.0] - 2026-06-22
+
+### Added
+
+- `haiku-ingester run-batch --dry-run` writes a YAML manifest of planned upserts/deletes without mutating queue jobs or `sync_state`; `run-batch --manifest <path>` replays that frozen changeset without another discovery sweep.
+- `haiku-ingester run-batch` and `run-batch --manifest` show an interactive progress bar with ETA while draining queued jobs.
+
+### Fixed
+
+- CPU-bound ingest steps now run off the event loop: Docling document serialization, docling-serve zip parsing, split-PDF concatenation, fetched-body temp writes, and filesystem read/hash work no longer stall concurrent ingester workers on large image-bearing documents.
+
+## [0.59.1] - 2026-06-19
+
+### Changed
+
+- `textual-image` moved to base dependencies; `ask`/`analyze`/`visualize` render image citations without the `tui` extra.
+
+### Fixed
+
+- Embedded-PDF attachment scanning runs in a worker thread instead of on the event loop; ingesting PDFs with embedded attachments no longer stalls concurrent workers.
+
+## [0.59.0] - 2026-06-16
+
+### Added
+
+- Custom ingester sources: a source config with `type: plugin` names a source factory registered under the `haiku.rag.sources` entry-point group via its `plugin` field, with an opaque `options` mapping the plugin validates itself. Only the referenced plugin is imported.
+
+### Changed
+
+- Bump `docling>=2.102.2,<3.0.0` and `docling-core>=2.82.0,<3.0.0`; the `<3.0.0` cap holds the DoclingDocument schema at 1.10.0.
+- Relax `opencv-python-headless` to `>=4.6.0.66,<5.0.0.0` (was `>=4.13.0.92`) to match `docling-ibm-models`' declared range.
+- `haiku.rag.metadata_providers` callables take a third argument, the fetched `FetchResult`: `__call__(source_id, uri, result)`. The provider runs after fetch instead of before; on revision-unchanged sweeps it is skipped and existing provider metadata is preserved.
+
+### Fixed
+
+- SQLite ingester queue runs with a multi-connection pool (`pool_size=5, max_overflow=5`) instead of a single connection. API reads (`/stats`, `/jobs`) no longer time out with `QueuePool limit of size 1 reached` while workers hold the connection.
+- Permanently-failed ingester documents (revisioned sources) record their revision in `sync_state`, so discovery no longer re-enqueues them every sweep; re-attempted only when the file's revision changes or via explicit retry/rebuild.
+- Retrying a dead ingester job (`/jobs/{id}/retry`, `/dlq/{id}/retry`) when a live job already exists for the same `(source_id, uri)` returns the live job instead of failing with a 500 (`uq_jobs_live` violation).
+
+## [0.58.0] - 2026-06-15
+
+### Added
+
+- Ingester metadata providers: a source config's `metadata_provider` names a callable registered under the `haiku.rag.metadata_providers` entry-point group; the ingester calls it per document with `(source_id, uri)` and attaches the returned dict as document metadata. System-derived keys (`md5`, `source_revision`, `content_type`) take precedence on collision.
+
+### Changed
+
+- Mutable document attributes (`uri`, `title`, `metadata`, `created_at`, `updated_at`) moved from the `documents` table into a new `document_meta` table (1:1 on `document_id`); metadata/title/`source_revision` updates no longer rewrite the docling blobs. Migration `v0_58_0` relocates existing data and runs a one-time `vacuum` to reclaim prior bloat.
+- Background auto-vacuum is throttled to at most once per 5 minutes; a final vacuum on close collapses any throttled writes. Sustained ingestion no longer triggers back-to-back compaction of the `documents` table.
+
+### Fixed
+
+- WebDAV source follows HTTP redirects (`PROPFIND` and `GET`); front-ended servers that 301/302 on trailing-slash or virtual-host rewrites no longer error.
+- All in-process pdfium access (page slicing and embedded-attachment scanning) is serialized under a single shared lock. Concurrent ingester workers no longer corrupt libpdfium's global state, which previously failed valid PDFs with "Data format error".
+- Embedded PDF attachment extension is derived from the attachment filename, not the parent's synthetic `...#attachment=<name>` URI; non-PDF attachments (e.g. `.joboptions`) are no longer misrouted to docling's PDF backend, and unsupported extensions are skipped.
+
+## [0.57.0] - 2026-06-11
+
+### Added
+
+- `ingester.api.root_path` (and `haiku-ingester serve --root-path`) serves the control plane under a sub-path for reverse-proxying; forwarded to FastAPI/uvicorn `root_path` and reflected in the dashboard's `<base href>`.
+- YAML config string values support `${VAR}` / `${VAR:-default}` environment-variable interpolation, expanded at load time. `${VAR}` referencing an unset variable raises `MissingEnvVarError`; `$$` is a literal `$`.
+
+## [0.56.0] - 2026-06-09
+
+### Added
+
+- Ingester control plane gains `GET /database` (LanceDB snapshot: stored version, embeddings, per-table counts/sizes, vector index, pending migrations, package versions — the data `haiku-rag info` prints) and `GET /config` (full effective config as YAML, secrets redacted). The dashboard surfaces both as on-demand collapsible Database and Configuration panels.
+- `HaikuRAG.import_documents(imports)` batch-imports prepared documents (`DocumentImport`), writing the `documents`, `chunks`, and `document_items` tables once each regardless of batch size. `DocumentRepository.create` accepts `Document | list[Document]`.
+
+### Changed
+
+- Ingester control-plane per-request access logs are emitted only when the `haiku.rag` logger is at DEBUG.
+
+### Fixed
+
+- Ingester worker circuit breaker is now per-source: a streak of transient failures pauses claims only for the affected source's jobs while healthy sources keep flowing, instead of pausing the whole worker pool. Paused sources are excluded at the claim query.
+
+## [0.55.1] - 2026-06-08
+
+### Changed
+
+- Bump `haiku.skills>=0.17.2`: skill runs use a retry budget of 3 for tool calls and output validation (was 1).
+- Evaluations disable Logfire scrubbing (`scrubbing=False`) so financial answers containing words like "authorized" aren't redacted from logged outputs.
+
+### Added
+
+- `analysis.max_executions` (default 15): caps `execute_code` calls per analysis question. Past the cap the tool returns a notice telling the skill to answer from what it has, instead of spiralling into `request_limit` and returning nothing. The analysis skill sets `request_limit` to 30 as a backstop.
+- `t2_finqa` and `t2_tatdqa` evaluation datasets (T²-RAGBench subsets, `G4KMU/t2-ragbench`): financial-report PDFs ingested via docling with `uri = context_id` and gold retrieval keyed on `context_id`. QA is scored with a deterministic `NumberMatchEvaluator` (relative tolerance 0.01) via the new `DatasetSpec.qa_evaluator`, bypassing the LLM judge.
+- `evaluations run --filter-ids <file>`: run QA on just the case ids listed in a file (failure-subset rerun); retrieval is unaffected.
+- `evaluations/scripts/build_t2_submission.py` + `evaluations.submission`: build a T²-RAGBench leaderboard submission JSONL (`{id, subset, context_id, prediction}`) by joining QA predictions with retrieval rankings by question.
+
+### Fixed
+
+- Skill tools (`search`/`cite`/`list_documents`/`get_document`) and the analysis sandbox serialize access to the shared LanceDB connection through one lock, so a turn's concurrently executed tool calls no longer trigger `RuntimeError: Already borrowed`.
+
+## [0.55.0] - 2026-06-05
+
+### Added
+
+- `haiku-rag rebuild --set-embedder`: adopt the current embedder identity (provider/name) without re-embedding, when the vector dimension is unchanged.
+
+### Fixed
+
+- Opening a database no longer writes to it: reads no longer rewrite the stored embedding settings or change the stored version, and the version is never downgraded. Embedding provider/name drift (matching `vector_dim`) warns on read-only opens and raises `ConfigMismatchError` on writable opens; reconcile with `rebuild --set-embedder`.
+- Read CLI verbs (`list`, `get`, `search`, `visualize`, `ask`, `analyze`, `inspect`, `chat`, `info`, `history`) open the database read-only.
+- Analysis-skill `execute_code` no longer crashes with LanceDB `Already borrowed` when sandboxed code reads the document VFS (`content.txt`, `items.jsonl`, `toc.json`); reads run on one background event loop with a single read-only connection for the sandbox's lifetime.
+
+## [0.54.0] - 2026-06-04
+
+### Added
+
+- `ingester.queue.dburi`: a SQLAlchemy async URL (e.g. `postgresql+asyncpg://user:pw@host/db`) points the ingester queue at a database server. SQLite remains the default when unset. The Postgres path claims jobs with `FOR UPDATE SKIP LOCKED`, so multiple ingester processes can share one queue.
+
+## [0.53.0] - 2026-06-03
+
+### Added
+
+- `ingester.queue.retention_days` (default 30): the reaper deletes succeeded/dead jobs whose `completed_at` is older than the window. `null` disables pruning.
+
+### Fixed
+
+- `rebuild --embed-only` re-embeds picture chunks through the image path instead of overwriting their vectors with a text embedding of the caption.
+- DELETE jobs re-check the source with `head()` before deleting and skip when the resource is back, so an atomic-rename save (vim, `git checkout`) no longer blackholes a live document.
+
+## [0.52.0] - 2026-06-01
+
+### Added
+
+- `haiku-ingester run-batch`: one discover sweep across every configured source, drains the queue, then exits. Orphan deletion requires a persisted `ingester.db`.
+- `max_file_size` (bytes) on every source type rejects oversized files before they are read into memory; they dead-letter as a permanent `FileTooLargeError`. FS and S3 check the size from metadata before fetching; HTTP and WebDAV rely on a `Content-Length` response header, so a server that omits it is not enforced.
+
+### Changed
+
+- Idle workers wake on enqueue via an `asyncio.Condition` instead of polling on `poll_idle_interval_s`.
+- `sync_state` writes are batched into one transaction per sweep (`SyncStateRepo.batch_upsert`) instead of one commit per file.
+- HTTP and WebDAV sources reuse a single `httpx.AsyncClient` across `head`/`fetch`/`discover` instead of opening one per request.
+- Periodic poll sweeps start after a random jitter of 0–25% of `poll_interval_s`.
+- New partial index `idx_jobs_succeeded_completed` backs the dashboard rolling-throughput query.
+
+### Removed
+
+- `haiku-ingester run-once`. Use `run-batch` to ingest configured sources, or `serve` for continuous operation.
+
+### Fixed
+
+- Revision-less HTTP/S3/WebDAV resources (no ETag or Last-Modified) emit `UNCHANGED` once known instead of re-ingesting on every sweep.
+- Deleted, unreadable, and directory paths (`FileNotFoundError`, `PermissionError`, `IsADirectoryError`, `NotADirectoryError`) classify as permanent failures instead of exhausting retries first.
+- FS `discover()` and the watch loop no longer crash when a file is removed between listing and `stat()`.
+- HTTP `discover()` catches only `httpx.TransportError`; other exceptions propagate instead of being emitted as UPSERT.
+- A `sync_state` write that fails after a job is marked succeeded is logged instead of crashing the worker.
+
+## [0.51.0] - 2026-05-29
+
+### Added
+
+- PDF `/EmbeddedFiles` attachments are ingested as separate Documents linked to the wrapper through `metadata.parent_uri`. Child URIs use a `#attachment=<percent-encoded-name>` fragment on the parent URI. Re-ingest reconciles the child set (add / update / delete) against the wrapper's current attachments; `delete_document` cascades through `parent_uri`. Nested chains are bounded at 3 levels. Toggle with `processing.extract_pdf_attachments` (default `true`).
+
+### Changed
+
+- A successful DELETE job auto-prunes dead jobs with the same `(source_id, uri)`. New `JobRepo.prune_dead(source_id, uri)`.
+- Reranker built once per `HaikuRAG` client instead of per `search()` call.
+- Embedder built once per `HaikuRAG` client instead of rebuilt per ingest/search operation. `embed_chunks` now takes it explicitly: `embed_chunks(chunks, embedder, config)` (was `embed_chunks(chunks, config)`). New `HaikuRAG.embedder` property exposes it.
+- `HaikuRAG` close runs a final vacuum after draining in-flight background vacuums when `storage.auto_vacuum` is enabled.
+
+## [0.50.0] - 2026-05-27
+
+### Added
+
+- `haiku-ingester` service for continuous document ingestion. Persistent SQLite job queue, async worker pool with retries and dead-letter queue, FS/HTTP/S3/WebDAV source adapters, per-source and pool-wide circuit breakers, and a FastAPI control plane on `127.0.0.1:8765` exposing `/health`, `/sources`, `/jobs`, `/dlq`, `/stats`, and a browser dashboard at `/`. Configured under `ingester:` in `haiku.rag.yaml`; shipped behind the `[ingester]` extra. See [docs/ingester.md](docs/ingester.md).
+- `processing.split_pages` (default `0`): split PDFs into N-page slices, convert each, merge via `DoclingDocument.concatenate()`. `0` disables.
+- Logfire spans for ingestion: `ingester.poller.sweep`, `ingester.poller.watch_event`, `ingester.job`, `document.{fetch,convert,chunk,embed,store}`, `document.convert_slice`.
+
+### Removed
+
+- File monitor (`haiku.rag.monitor`, `MonitorConfig`, `S3MonitorEntry`, `AppConfig.monitor`, `haiku-rag serve --monitor`). Migrate `monitor.directories` to `ingester.sources[type=fs]` and `monitor.s3` to `ingester.sources[type=s3]`.
+
+### Changed
+
+- `haiku-rag serve` renamed to `haiku-rag mcp`. `--mcp-port` renamed to `--port`.
+- `document.metadata` keys renamed: `etag` → `source_revision`, `contentType` → `content_type`. v0.50.0 startup migration rewrites existing documents and compacts the `documents` table at the end (12 GB → 25 GB mid-migration on a 1000-doc PDF corpus, reclaimed back to 12 GB).
+- `providers.docling_serve.base_url` now accepts a list. Jobs round-robin across the entries; each job's submit/poll/result pinned to one instance.
+- `DoclingServeClient.submit_and_poll` and `submit_and_poll_zip` no longer wrap `httpx` errors into `ValueError`. `httpx.ConnectError`, `HTTPStatusError`, `TimeoutException`, etc. propagate with their type intact.
+- Logfire spans report `instrumentation_scope.name = "haiku.rag"` (was the SDK default `logfire`).
+- Default RAG skill exposes only `search` and `cite`. `list_documents` and `get_document` are still available in `create_skill_tools` and `skill_generator`'s `AVAILABLE_TOOLS` for custom skills.
+
+## [0.48.1] - 2026-05-21
+
+### Changed
+
+- Bump `haiku.skills>=0.17.1` and `pydantic-ai-slim>=1.100.0` (the last pre-2.0 release). Migrate off two APIs slated for removal in pydantic-ai 2.0: `Agent(tool_retries=, output_retries=)` → `Agent(retries={"tools": …, "output": …})` in the LLM-as-judge evaluator, and `Evaluator.evaluation_name` class attribute → overriding `get_default_evaluation_name()` on `CitationMRREvaluator` / `CitationMAPEvaluator`.
+- Drop the `item.annotations` fallback in `_picture_description_text`. Docling's `PictureItem` runs a `@model_validator(mode="after")` on load that migrates the deprecated `annotations` field into `meta.description`, so reading `meta.description.text` covers both legacy and current blobs. Tests in `test_converters.py` switched to `meta.description.text` for the same reason.
+- Chat TUI now generates a stable per-launch `thread_id` (rotated on "Clear chat") instead of hardcoding `"tui"`. AGUIAdapter forwards it as the `gen_ai.conversation.id` OTel attribute, so multi-turn TUI sessions group into one Logfire conversation instead of collapsing every launch into a single bucket.
+- Documentation generator swapped from `mkdocs-material` to `zensical`. Drops `mkdocs` / `mkdocs-material` dev deps, replaces `mkdocs.yml` with `zensical.toml`, adds `overrides/main.html` (OG/Twitter share meta) and `docs/stylesheets/extra.css`. `build-docs` workflow now runs `uv run zensical build` and publishes via the GitHub Pages artifact actions instead of `mkdocs gh-deploy`.
+
+### Fixed
+
+- mxbai reranker crashing inside the chat TUI with `ValueError: bad value(s) in fds_to_keep`. tqdm constructs a `multiprocessing.RLock` on first use, whose `resource_tracker` spawn picks up `sys.stderr.fileno()`; Textual's redirected stderr returns `-1`, failing the `fork_exec` validation. The reranker now pins tqdm's class lock to a `threading.RLock`.
+- `migrate` failing on DBs upgrading through v0.45.0 with `Field 'heading_level' not found in target schema`. The v0.45.0 picture-data backfill was building rows from the current `DocumentItemRecord` Pydantic model — which now carries `heading_level` / `tree_depth` added in v0.48.0 — and feeding them to `merge_insert` against a pre-v0.48.0 schema. Both v0.40.0 and v0.45.0 now build their PyArrow inputs from explicit per-migration column sets so future model additions can't retroactively break them.
+
+## [0.48.0] - 2026-05-20
+
+### Added
+
+- `heading_level` and `tree_depth` on `DocumentItem`, populated by `extract_items` and persisted on `document_items`. 0.48.0 migration backfills existing rows from each doc's docling structure blob.
+- `toc.json` in the analysis sandbox VFS at `/documents/{id}/toc.json`. Nested tree on HTML/markdown sources, flat sibling list on PDFs. Each node carries `{self_ref, level, title, page_numbers, item_range, chunk_ids, children}`. `chunk_ids` aggregates the citable chunks across the section's `item_range`, so the analysis skill can `cite()` a section from one VFS read instead of falling back to a corpus-wide `search()` that risks cross-document hits.
+- `chunk_ids` on every `items.jsonl` row (the citable chunks that contain that item).
+- `picture_refs` on sandbox `search()` result dicts and on `Citation` (subset of `doc_item_refs` starting with `#/pictures/`).
+- `picture_captions: dict[str, str]` on `SearchResult`, populated alongside `image_data` and rendered as a labelled line in `format_for_agent` for picture-bearing chunks.
+- Chat TUI renders picture citations inline via `textual_image.widget.Image` inside the existing `CitationWidget`.
+- CLI citation panel renders `picture_refs` inline via `textual_image.renderable.Image` next to the text preview. `format_citations_rich` is async and takes an optional `HaikuRAG` client; without one, figures fall back to `[Figure: <ref>]` markers.
+- BTree scalar indexes on `document_items.{document_id, position, self_ref}`. The 0.48.0 migration creates them on existing DBs. Per-doc lookups go from full-table scans (~100–300 ms) to point queries (~3–21 ms) on small/medium corpora.
+- Per-doc lazy cache for `items.jsonl` and `toc.json` in the analysis sandbox. First read fetches; subsequent reads of either file in the same `execute_code` session hit a serialized cache. One DB fetch per doc per session.
+- `cite` tool now accepts chunk_ids that resolve via the chunks table, not only chunk_ids from a prior `search()` result. Lets the model cite directly from `items.jsonl` / `toc.json` rows. The hallucination guard (`ModelRetry` on chunk_ids that don't exist in the DB) is preserved.
+- `AppConfig.evaluations` (`EvaluationsConfig`) with an optional `judge: ModelConfig`. Lets the eval CLI pin the LLM-as-judge per-yaml — including a custom `base_url` for any OpenAI-compatible endpoint (vLLM, LM Studio) without env-var routing.
+
+### Removed
+
+- **Multi-agent research workflow.** Removes `agents/research/` (graph, state, deps, models, prompts), `client.research`, the CLI `research` command, the MCP `research_question` tool, `ResearchConfig`, `AppConfig.research`, `PromptsConfig.synthesis`, and the corresponding wiring in `chat/__init__.py` and `client/downloads.py`. The pydantic-graph workflow was a three-node loop whose differentiators vs the rag skill (planner step, structured `ResearchReport`, iteration bound) were either redundant with `qa.max_searches` or sat on pre-cite-tool legacy. Multi-step questions go through `client.ask` (rag skill).
+- `llm()` from the analysis sandbox. Sandbox externals are now `search` and `list_documents` only.
+- `list_documents` top-level tool from the analysis skill (still available as `await list_documents()` inside `execute_code`).
+- `documents=` kwarg on `client.analyze` (and the `--document` flag on `haiku-rag analyze` / MCP `analyze` tool). The pre-loaded `documents` Python variable inside the sandbox is no longer populated. Use `filter=` (SQL WHERE clause) to scope analysis to specific documents.
+- `AnalysisResult.program`. The per-execution programs are still tracked on `AnalysisState.executions` (the analysis skill's `execute_code` tool populates it); consumers that need the executed code should pull it from the skill state instead of the function return value.
+- `--cite` flag on `haiku-rag ask`. Citations always render after the answer now.
+- `system_prompt` kwarg on `client.ask`. No production caller used it; `config.prompts.domain_preamble` already covers the preamble use case.
+- Standalone QA agent (`haiku.rag.agents.qa.*`) and analysis agent module (`haiku.rag.agents.analysis.agent`, `haiku.rag.agents.analysis.prompts`). Also drops `RawAnalysisResult`, `CodeExecution`, `AnalysisDeps`, and the dead `documents=` preload path in `Sandbox`.
+- `prompts.qa` config field.
+- `evaluations optimize` subcommand and GEPA prompt-optimization. Drops `gepa` dep.
+- `--target qa` from `evaluations run`. Default is now `rag-skill`.
+- `--judge-model` flag from `evaluations run`. Set the judge in `config.evaluations.judge` instead.
+- `position` field on `toc.json` nodes (redundant with `item_range[0]`).
+- `position` and `tree_depth` from `items.jsonl` row serialization. Both fields are still persisted on `DocumentItem`; they are no longer surfaced to the sandbox.
+
+### Changed
+
+- `haiku.rag.agents.analysis` moved to `haiku.rag.sandbox`. Public surface: `from haiku.rag.sandbox import Sandbox, SandboxResult, AnalysisContext, AnalysisResult`.
+- `Citation` and `resolve_citations` moved to `haiku.rag.store.models.citation` (was `haiku.rag.agents.research.models`), peer to the other output domain models.
+- `search.limit` default lowered from `10` to `5`.
+- Search result formatter surfaces picture captions on a labelled line when a chunk's expanded refs include pictures.
+- Picture bytes attached to `search()` results are bounded to the pre-expansion chunk's `doc_item_refs`. Section expansion that sweeps in adjacent picture-bearing items no longer pulls their bytes into the response. Observed ~16× reduction on tool-response payload sizes; eliminates a class of cross-figure contamination in the agent's view.
+- rag-analysis SKILL.md steers structural lookups ("which section X", "list sections of Y", "summarize section Z") to read `/documents/{id}/toc.json` first and cite the matching node's `chunk_ids` directly, instead of calling `search()`. Empirically validated on the ORB multimodal and Wix corpora: locator and orientation questions now cite the correct document instead of falling back to cross-document search hits.
+- CLI citation panel compacted: 300-char text preview (no full chunk dump), `[N] Title (URI) — pp. — §Section` header, dimmed `doc: <id>  chunk: <id>` footer. Green "Citations" label matches the green "Answer:" label.
+- `AnalysisConfig.model` defaults to `None` (was `ollama:gpt-oss/no-thinking/temp=0`). Resolves via `config.analysis.model or config.qa.model`.
+- `client.ask` and `client.analyze` route through the rag and rag-analysis skills internally.
+- Bump `docling>=2.93.0` and `docling-core>=2.75.0`.
+- Bump `pydantic-ai-slim>=1.96.0`. Migrate off deprecated APIs: AG-UI imports use `pydantic_ai.ui.ag_ui`, docs/CLI examples use the explicit `openai-chat:` model prefix, and `Agent(retries=)` is split into `tool_retries=` + `output_retries=`.
+- Bump `pydantic-monty>=0.0.17`. Migrate off deprecated `pydantic_monty.run_repl_async(repl, ...)` to `repl.feed_run_async(...)`.
+- Cap `transformers<5.0.0` in the `mxbai` extra: `mxbai-rerank>=0.1.6` calls `tokenizer.prepare_for_model` which transformers 5 removed.
+- Refresh the rest of the lockfile to latest within current constraints (pydantic, pydantic-ai, rich, ruff, ty, pytest, torch, textual, textual-image, watchfiles, pre-commit, datasets, and transitives).
+
+### Fixed
+
+- Chat TUI's state-edit screen syntax-highlights JSON instead of falling back to plain text. Adds `tree-sitter` + `tree-sitter-json` to the `[tui]` extra.
+
+### Documentation
+
+- Rework documentation
+
+## [0.47.0] - 2026-05-14
+
+### Added
+
+- **`cross-encoder` reranking provider.** Runs any HuggingFace cross-encoder reranker in-process via `sentence_transformers.CrossEncoder` — no separate server. Useful for BGE (`BAAI/bge-reranker-v2-m3`), Qwen3-Reranker, MS-MARCO MiniLM, and other CrossEncoder-compatible models when vLLM is not an option. New `[cross-encoder]` extra pulls `sentence-transformers`.
+
+### Fixed
+
+- **`rebuild --embed-only` no longer buffers the entire corpus in memory.** The previous implementation accumulated every chunk's id, content, content_fts, metadata, and new embedding vector in a single Python list before flushing. The rebuild now stream-copies non-vector columns into a `chunks_rebuild_staging` table (1000 rows / page), recreates the chunks table fresh to honour vector-dim changes, then streams from staging one document at a time, embedding in batches of `embeddings.batch_size` and flushing to the new chunks table every 50 documents.
+- **`rebuild --embed-only` is now idempotent across crashes.** A second table, `chunks_rebuild_marker`, is written immediately after phase 1 (staging copy) finishes. Its presence flips the next rebuild into resume mode: phase 1 is skipped, the live chunks table is recreated, and phase 2 (re-embed) runs from the existing staging snapshot. Cleanup drops the marker before the staging table, so an interruption between the two drops leaves a markerless staging that the next run discards harmlessly. A staging table without a marker is treated as a partial phase 1 and dropped (the live chunks table is still authoritative). Running a non-embed-only mode (FULL / RECHUNK / DESCRIPTIONS / TITLE_ONLY) after a crashed embed-only correctly discards the staging recovery state. Phase 1's pagination was switched from `offset/limit` to `to_batches`, removing the latent offset-drift risk and the O(N²) cost at high offsets.
+
+## [0.46.0] - 2026-05-13
+
+### Added
+
+- **`processing.conversion_options.fetch_remote_images`** (default `true`). Controls whether docling fetches images referenced by URL in HTML and Markdown inputs. docling-local only — docling-serve cannot fetch external images via its API regardless of this flag.
+- **`s3://` is a first-class document source.** `create_document_from_source`, the CLI `haiku-rag add-src`, and the MCP `add_document_from_url` tool all dispatch on the `s3` URL scheme. Two-stage change detection keeps `metadata["md5"]` semantically uniform across all sources: HEAD ETag matching the stored `metadata["etag"]` short-circuits without GET; if ETag differs but bytes hash to the same MD5 (multipart re-upload, server-side `CopyObject`, SSE mode change), only the etag refreshes — no re-chunk or re-embed. Closes #357.
+- **S3 / object-storage monitoring.** `monitor.s3: list[S3MonitorEntry]` adds a polling watcher per bucket prefix alongside the existing local-directory watcher. Each entry has its own `poll_interval`, `include_patterns`, `ignore_patterns`, `delete_orphans`, and `storage_options`. The same `serve --monitor` flag enables both. Orphan deletion is per-entry (scoped via `uri LIKE 's3://bucket/prefix/%'`); other buckets and prefixes are never touched.
+- **`[s3]` optional extra** (`obstore>=0.9`). Required for `s3://` sources and the S3 watcher. Uses obstore — the Python binding to the same Rust `object_store` crate that LanceDB uses internally — so `monitor.s3[*].storage_options` accepts the same dict shape as `lancedb.storage_options`. Empty/missing options fall back to the AWS default credential chain.
+- **`scripts/run-integration-tests.sh`** — wraps `docker compose up --wait`, `pytest -m integration`, and tear-down so the SeaweedFS-backed integration suite is a one-liner.
+- **`ModelConfig.extra_body`**. Optional dict forwarded verbatim to `ModelSettings.extra_body`, the raw pass-through pydantic-ai exposes for openai/ollama/anthropic/groq. Lets configs reach provider-specific keys without haiku.rag modelling them — e.g. `extra_body: {chat_template_kwargs: {enable_thinking: false}}` to disable Qwen3 thinking on a vLLM endpoint, where the high-level `enable_thinking` flag is a no-op.
+- **`embeddings.batch_size`** (default `512`). Number of text chunks per `/v1/embeddings` call during ingest. Lower it when your provider caps total tokens per request. Closes #365.
+
+### Changed
+
+- **Chat TUI streams markdown incrementally.** Assistant messages now use Textual's `MarkdownStream` (`Markdown.get_stream`) and write per-token deltas instead of re-parsing the entire accumulated message on every token. Removes the O(n²) re-parse that visibly stuttered long responses. Bumps `textual` floor to `>=8.2.4` so `Markdown.get_stream` is reachable via the public API.
+- **Embedding compatibility check only raises on `vector_dim` mismatch.** `provider` and `name` drift (legitimate when the same model is served by a different stack, e.g. Ollama → vLLM-via-openai) now logs a one-time warning and updates the stored settings to match the current config. Subsequent opens are silent. Run `rebuild --embed-only` if you also want to re-embed under the new stack.
+- **`processing.pictures` enum replaces `picture_description.enabled`.** Three modes: `none` (skip picture generation entirely — lower RAM, smaller DBs), `description` (generate images, run VLM, store bytes), `image` (default — generate images, store bytes, no VLM). Closes #366. Breaking change: rename `picture_description.enabled: true` → `pictures: description`, `picture_description.enabled: false` → `pictures: image`. The pre-April-30 `generate_picture_images` flag is also gone; use `pictures: none` for that opt-out.
+
+### Fixed
+
+- **Picture bytes attached to multimodal tool returns are PNG-verified via `PIL.Image.verify()`.** Bytes that fail verification are dropped.
+- **Conversion options now apply to non-PDF formats.** `DoclingLocalConverter` previously wired its `PdfPipelineOptions` only to `InputFormat.PDF`, so user settings (OCR knobs, `picture_description.enabled`, `images_scale`, etc.) silently no-op'd for HTML, Markdown, DOCX, PPTX, and IMAGE inputs. The converter now shares a single `PdfPipelineOptions` instance across PDF, IMAGE, HTML, MD, DOCX, and PPTX `FormatOption`s. SimplePipeline-backed formats ignore the PDF-specific fields; `ConvertPipelineOptions`-level enrichments (picture description / classification / chart extraction) now run uniformly. HTML and Markdown additionally receive `HTMLBackendOptions` / `MarkdownBackendOptions` gated on `fetch_remote_images`.
+- **HTML text ingest path picks up converter options.** `convert_text(format="html"/"md")` previously used a bare `DoclingDocConverter()` with zero format options — the wix corpus ingest path. It now uses the same shared `_build_format_options()` helper as the file path.
+- **Relative `<img>` paths resolve during URL ingest.** `HaikuRAG.convert()` and the converter `convert_file` / `convert_text` methods now thread a `source_uri` through to `HTMLBackendOptions.source_uri` / `MarkdownBackendOptions.source_uri`. URL ingest uses the originating URL; file ingest uses `file://`; raw text accepts an optional override. docling-serve accepts the kwarg as a no-op (its API has no equivalent option).
+- **CLI tracebacks no longer dump per-frame locals.** The Typer app now passes `pretty_exceptions_show_locals=False`, so exceptions involving a `DoclingDocument` (or any large object) print readable rich tracebacks instead of pages of inline base64 image URIs. Set `_TYPER_STANDARD_TRACEBACK=1` for plain Python tracebacks.
+- **Batch ingest no longer hits HF Hub's 429 rate limit.** The chunking tokenizer is now loaded once per process via `@functools.cache` instead of once per chunker instance.
+
+### Documentation
+
+- New "External image fetching" subsection in `docs/configuration/processing.md` documenting `fetch_remote_images`, the SSRF / size / timeout guards inherited from docling, and a per-format table of which conversion options actually apply (PDF, IMAGE, HTML, MD, DOCX/PPTX, others).
+- New "HTML Image Fetching" section in `docs/remote-processing.md` calling out that docling-serve cannot fetch external `<img>` URLs and recommending docling-local for HTML ingest when picture bytes matter.
+- New "S3 / Object Storage Monitoring" section in `docs/server.md` and `docs/configuration/processing.md` covering the `[s3]` extra, polling cadence, ETag semantics, credentials, and CLI usage.
+- New "Deployment Pattern: One Writer, Many Readers" subsection in `docs/configuration/storage.md` documenting the recommended IAM split (one ingestion process + N read-only consumers).
+
+## [0.45.0] - 2026-05-08
+
+### Added
+
+- **Vision capabilities.** Picture-aware ingestion, vision QA, multimodal embeddings, and image-as-query search.
+- **Picture bytes always stored** at ingest in a new `document_items.picture_data` column (`large_binary`), addressable by `(document_id, self_ref)`. Bulk read paths project metadata-only so bytes never leak into context expansion or analysis-sandbox builds. The 0.45.0 migration adds the column on existing DBs and backfills it from each doc's docling blob; URIs are then stripped from the blob so bytes live in one place.
+- **VLM picture descriptions** at ingest via `processing.conversion_options.picture_description.enabled` (default `false`). When enabled, descriptions are woven into chunk text. The earlier `generate_picture_images` flag is dropped with a one-time warning. `haiku-rag rebuild --descriptions` runs the VLM over stored bytes after the fact, idempotently — skipping the docling parse entirely.
+- **Multimodal embedder (`provider="vllm"`)** for cross-modal retrieval. Talks HTTP to a vLLM `/v1/embeddings` endpoint (`input` array for text, `messages` superset with `image_url` for images). Tested with `Qwen/Qwen3-VL-Embedding-8B` and `jinaai/jina-embeddings-v4`. No new Python ML dependencies. Under multimodal embedders, ingest emits one synthetic picture chunk per `PictureItem`, sharing the chunks table with text.
+- **Image-as-query search.** `client.search()` accepts `str | bytes | PIL.Image.Image`. Image queries embed once and run vector-only against the chunks table. New CLI flag `haiku-rag search --image PATH` and new MCP tool `search_documents_by_image(image_base64, ...)` (registered only when the embedder supports images).
+- **Vision QA via `qa.model.vision: bool` flag** on `ModelConfig` (default `false`). When `true`, the agent's `search` tool attaches picture bytes as `BinaryContent` parts on its `ToolReturn`. Default is `false` because providers behave inconsistently when an image is sent to a text-only model (Ollama silently accepts and confabulates; OpenAI returns 400). `SearchResult.image_data: dict[str, str] | None` carries base64 picture bytes keyed by `self_ref`; `client.search()` and MCP `search_documents` gain `include_images: bool = True`.
+- **Silent-failure guard for picture descriptions.** When `picture_description.enabled=true` and a conversion returns at least one picture but zero descriptions, log a warning naming the source, picture count, VLM model, and base URL. Surfaces docling-serve's swallowed VLM errors (unreachable host, missing model) before they pollute a long ingest.
+- **Inspector renders attached pictures** under `qa.model.vision=true` in the context modal (`c` key) so the inspector reflects what the LLM actually receives.
+
+### Fixed
+
+- **`rebuild --descriptions` no longer destroys `docling_pages`.** The previous implementation called `set_docling()` after a structure-only docling load, which writes `docling_pages=None` and clobbered page rasters for every doc with at least one undescribed picture (silently breaking `visualize_chunk` for the affected docs).
+- **docling-serve picture-image extraction.** docling-serve only emits picture bytes under `image_export_mode="referenced"` (upstream [docling-project/docling-serve#576](https://github.com/docling-project/docling-serve/issues/576)). The converter switches to `referenced` + `target_type="zip"` when picture images are requested and rehydrates `artifacts/<filename>` URIs back into `data:` URIs.
+- **`rebuild --rechunk` reuses the stored docling blob** instead of re-converting from the markdown export, which dropped every `PictureItem` on the floor. Documents without a stored docling blob now raise instead of silently falling back.
+
+### Changed
+
+- **Lazy document hydration during rebuild.** Each mode loop now fetches one full record at a time instead of eagerly loading all docs with their multi-MB blobs. Drops startup memory from ~15 GB to ~one document on a 1000-doc database.
+
+## [0.44.0] - 2026-04-29
+
+### Added
+
+- **Skill-based QA evaluation via `evaluations run --target {qa,rag-skill,analysis-skill}`.** Benchmark the RAG and analysis skills end-to-end alongside the existing QA agent path, against the same datasets and judge. `--skill-model "provider:name"` overrides the skill model independently from the judge.
+- **Citation retrieval as a second eval metric.** `CitationMRREvaluator` and `CitationMAPEvaluator` score the URIs the skill registered via the `cite` tool against each dataset's gold `expected_uris`, alongside the existing LLMJudge. Console output gains a "Citation Retrieval" summary (mean score, cite rate, mean citations per case). Zero extra skill runs — cited URIs are surfaced via `pydantic_evals.set_eval_attribute`.
+- Bumps `haiku.skills` to `>=0.16.0` for the public `run_skill` API and `Skill.request_limit`.
+
+### Changed
+
+- **Pinned eval judge defaults to `ollama:qwen3.6`.** Previously `--judge-model` defaulted to `config.qa.model`, so changing the QA or skill model also changed the judge — destabilizing cross-run comparisons and re-introducing self-judging whenever the answerer matched. A 2×2 calibration vs Claude Opus 4.7 (gpt-oss / qwen3.6 as both answerer and judge) showed `qwen3.6` had κ ≥ 0.66 on both same- and cross-family answerers (vs 0.39–0.55 for `gpt-oss`) with no detectable self-preference bias. Pass `--judge-model provider:name` to override.
+- **Tightened `cite` framing in the RAG skill's `SKILL.md`.** `cite` is now a precondition for the final answer: the model identifies supporting chunk IDs and calls `cite` *before* writing the response. The "MUST cite before answering" requirement carries an explicit refusal carve-out so the model does not cite irrelevant chunks when knowledge is missing. On the wix benchmark this lifted cite rate from 32% → 96%, mean `cited_map` from 0.15 → 0.48, and cut the "correct answer with no citation" pattern from 52% of cases to 1%, with QA accuracy holding at ~78%.
+- **Removed dataset-specific eval system prompts.** `WIX_SUPPORT_PROMPT` and `ORB_SYSTEM_PROMPT` duplicated guidance already in the shipped `QA_SYSTEM_PROMPT` and `SKILL.md`, and ORB's referenced the obsolete `search_documents` tool name. The eval-side machinery for injecting them (`DatasetSpec.system_prompt`, `resolve_system_prompt()`) is removed. `config.prompts.qa` remains as the user-facing override knob.
+
+## [0.43.1] - 2026-04-25
+
+### Fixed
+
+- **Relative `db_path` no longer trips the LanceDB cloud-URI sanitizer.** The 0.43 migration to `lancedb.connect_async` started routing the path through an async URI sanitizer that treats anything not clearly an absolute local path as a possible cloud URI, raising `ValueError: An api_key is required when connecting to LanceDb Cloud` on invocations like `haiku-rag info --db db/rag.lancedb`. The path is now made absolute before being handed to LanceDB.
+
+## [0.43.0] - 2026-04-24
+
+### Changed
+
+- **Native async LanceDB**: all table I/O now uses LanceDB's async API (`connect_async`, `AsyncConnection`, `AsyncTable`). Previously, repository methods were declared `async def` but called blocking sync LanceDB under the hood, stalling the event loop on every read/write. No change to the documented `async with HaikuRAG(...) as client:` usage pattern.
+- **BREAKING (internal): `HaikuRAG` must be used via `async with`.** Store initialization now happens in `__aenter__`; constructing `HaikuRAG(...)` and calling methods directly without entering the context manager no longer works.
+- **BREAKING (internal): `download_models` is no longer a method on `HaikuRAG`.** It's now a module-level function: `from haiku.rag.client.downloads import download_models; async for progress in download_models(config): ...`. The CLI and in-repo consumers are updated.
+- **Concurrency: background vacuum tracked as a task** on the client. `__aexit__` and `rebuild_database` now await it explicitly, preventing `CreateIndex transaction was preempted` commit conflicts when destructive operations follow a `create_document` that scheduled a background vacuum.
+
+### Fixed
+
+- **Chat TUI now renders citations again.** After the 0.42.1 flattening of skill state `citations` to `list[str]`, the TUI still indexed `citations[-1]` and iterated the resulting chunk-id string character-by-character, so no citations resolved through `citation_index` and the citation panel stayed empty. Fixed by iterating `state.citations` directly.
+- **`search(..., filter=...)` no longer silently under-returns.** The filter path used to materialize LanceDB's top-N window, filter to matching `document_id`s in pandas, and `head(limit)`. When matching chunks lived outside that top-N window (selective filters, broad queries), the caller got fewer than `limit` results even though plenty of matching chunks existed in the index. The document filter is now pushed down into the chunk query as `document_id IN (...)` so `.limit(limit)` applies to matching chunks directly. Behavior change: searches that previously under-returned will start returning the requested count.
+
+## [0.42.1] - 2026-04-22
+
+### Changed
+
+- **BREAKING: Skill state `citations` is now `list[str]` instead of `list[list[str]]`.** With per-invocation state scoping (0.42), the outer list no longer tracked turn boundaries — it only grouped chunk ids per `cite` call within a single invocation, which has no downstream meaning. The field is now a flat, deduplicated list of chunk ids cited during the current invocation. Clients resolve each id through `citation_index` as before. Applies to both `RAGState` and `AnalysisState`.
+
+## [0.42.0] - 2026-04-22
+
+### Fixed
+
+- **`create_document`, `update_document`, and rebuild (`RECHUNK` / full fallback) no longer misread URL-prefixed text as a URL to fetch.** These paths passed known-text content through `HaikuRAG.convert()`, which dispatches on `urlparse(source).scheme`; text whose first line was `https://...` (common for clipped web pages and notes) got handed to `httpx.get` and crashed with `httpx.InvalidURL` on embedded whitespace. Fixed by calling `converter.convert_text(...)` directly at those sites; `convert()` itself is unchanged for `create_document_from_source`.
+
+### Changed
+
+- **Skills share a single `HaikuRAG` client per invocation** via the new `haiku.skills>=0.15.0` `lifespan` hook. The skill's sub-agent opens one read-only client on entry, all tool calls reuse it, and it closes on exit — replacing the old pattern of open/close around every `search` / `list_documents` / `get_document` call.
+- **`max_searches` tracked on `RAGRunDeps.search_count`** instead of a module-level `ctx.run_id`-keyed dict. Eliminates a memory leak in long-running processes where old run ids were never evicted.
+- **Analysis sandbox persists variables across `execute_code` calls within one invocation.** Re-enables the incremental-exploration workflow (search in one call, process results in the next). Each new skill invocation constructs a fresh `Sandbox` via the analysis lifespan, so there is no cross-invocation leak.
+- **Skill state is scoped to the current invocation.** Lifespans now clear `citations`, `searches`, and (for analysis) `executions` at the start of each invocation, so state deltas sent to the AG-UI client reflect only the in-progress turn. `citation_index` is preserved across invocations so past-turn citation chunk ids remain resolvable, and `document_filter` is preserved as session-level config.
+
+## [0.41.0] - 2026-04-20
+
+### Added
+
+- **Document virtual filesystem in analysis sandbox**: Documents mounted at `/documents/{id}/` with `metadata.json` (eager), `content.txt` (lazy), and `items.jsonl` (lazy). Standard Python `pathlib.Path` for browsing and reading document content and structure.
+- **`execute_code` skill tool**: Direct code execution in the sandbox, surfaced as individual AG-UI events in the chat TUI. Items VFS uses a lazy bulk cache (~1s for 1000 documents vs 60s+ per-document queries).
+- **`cite` skill tool**: Explicit citation registration with per-turn tracking via `citation_index` and `citations` fields in state
+- **`--skill` flag for chat TUI**: `haiku-rag chat -s rag -s analysis` to enable specific skills
+- **`--model` overrides all agents**: Chat, QA, research, and analysis agents all use the specified model
+- **Collapsible program display in chat TUI**: Analysis code execution results shown as expandable code blocks
+
+### Changed
+
+- **BREAKING: Flatten skill architecture**: Skill sub-agents now call `search`, `execute_code`, `cite`, `list_documents`, `get_document` directly — every tool call surfaces as an AG-UI event. Removes the 3rd agent layer where `ask`/`analyze`/`research` spawned inner agents whose tool calls were invisible.
+- **BREAKING: Rename RLM agent to analysis agent** throughout:
+  - `agents/rlm/` → `agents/analysis/`, all classes renamed (`RLMResult` → `AnalysisResult`, etc.)
+  - `client.rlm()` → `client.analyze()`
+  - CLI: `haiku-rag rlm` → `haiku-rag analyze`
+  - MCP: `rlm_question` → `analyze`
+  - Config: `rlm:` → `analysis:` in YAML, `RLMConfig` → `AnalysisConfig`
+  - Skill entrypoint: `rag-rlm` → `rag-analysis`
+- **Analysis sandbox `search()` returns expanded results** with `doc_item_refs` and `labels` for cross-referencing with `items.jsonl`
+- **`list_documents` skill tool** takes no parameters — returns all documents
+- **Per-turn citation tracking**: `citation_index: dict[str, Citation]` (deduplicated) + `citations: list[list[str]]` (per-turn chunk IDs) replaces flat citation list
+- **Search rate limiting**: Skill search tool enforces `config.qa.max_searches`
+- **Context expansion respects section boundaries**: Sections within the char budget are returned whole regardless of item count. Too-large sections expand bounded by section edges. Adjacent sections no longer merge — only overlapping ranges do.
+- **Visualization shows full expanded section**: `visualize_chunk` expands context before resolving bounding boxes, so all pages the section spans get highlighted.
+
+### Removed
+
+- **`ask` skill tool**: Replaced by direct `search` + `cite` — the skill sub-agent searches and answers directly
+- **`analyze` skill tool**: Replaced by direct `execute_code` + `search` + `cite`
+- **`research` skill tool**: Removed from skill layer (still available via CLI `haiku-rag research` and MCP)
+- **`get_document()`, `get_docling_document()`**: Removed from analysis sandbox — replaced by VFS
+- **`get_chunk()`**: Removed from analysis sandbox — search results include expanded context
+- **`create_analysis_toolset()`**: Removed unused `tools/analysis.py` module
+- **`qa_history`, `reports` from skill state**: Conversational context handled by the outer chat agent
+- **`combine_filters`, `build_document_filter`**: Removed from public API
+- **`max_context_items`**: Removed from `SearchConfig` — `max_context_chars` is the sole expansion constraint
+- **`QAHistoryEntry`, `tools/qa.py`**: Removed unused QA history model and relevance threshold
+
+## [0.40.1] - 2026-04-17
+
+### Fixed
+
+- **`haiku-rag info` on pre-migration databases**: `info` no longer fails with a misleading `Cannot create tables in read-only mode` error when a required table added by a later version (e.g. `document_items` in 0.40.0) is absent. It now reports stats for the tables that do exist, marks the missing ones as `absent`, and shows a dedicated section listing any pending migrations with the `haiku-rag migrate` hint ([#346](https://github.com/ggozad/haiku.rag/issues/346))
+
+## [0.39.0] - 2026-04-16
+
+### Added
+
+- **Document items table**: Pre-extracted document items stored as individual rows with scalar indexes, enabling context expansion via indexed range queries (~2.5ms) instead of full DoclingDocument deserialization (~8.7s for large documents)
+- **Section-bounded context expansion**: Expansion is now automatic and structure-aware — stays within section boundaries for structured documents, grows outward for unstructured ones. Noise labels (footnotes, page headers/footers) are filtered. Results without `doc_item_refs` pass through unexpanded.
+
+### Changed
+
+- **Database migration required**: Run `haiku-rag migrate` to populate `document_items` table for existing documents
+- **Pin docling-core**: Upper bound added (`<2.72`) to prevent uncontrolled schema changes
+- **`max_searches` default**: Raised from 3 to 5 — faster expansion makes additional searches inexpensive
+- **Improved QA prompt**: Stronger instruction to refuse answering from tangentially related content
+- **Improved judge prompt**: Asymmetric evaluation — generated answers that are more comprehensive than expected are not penalized
+
+### Removed
+
+- **`context_radius` config**: Replaced by automatic section-bounded expansion. Context expansion no longer requires configuration.
+- **DoclingDocument LRU cache**: No longer needed — the document_items table replaces in-memory caching for context expansion
+- **`cachetools` dependency**: No longer used
+
+## [0.39.0] - 2026-04-09
+
+### Added
+
+- **S3/Object storage support**: Connect to LanceDB on S3, GCS, Azure Blob, or HDFS via `lancedb.uri` and `storage_options` config. Supports S3-compatible stores with custom endpoints.
+- **Remote skill generation**: `create-skill` now supports remote databases — omit `--db` and provide `--config-file` to generate skills that connect to object storage at runtime instead of bundling the database.
+
+### Fixed
+
+- **Skill `list_documents` ignores `document_filter`**: `list_documents` tool now respects `state.document_filter`, consistent with `search`, `ask`, and `research`
+- **Skill `analyze` ignores `document_filter`**: `analyze` tool now uses `state.document_filter` (combined with any explicit `filter` parameter). Added `document_filter` field to `RLMState`
+
+## [0.38.0] - 2026-04-07
+
+### Added
+
+- **Separate page storage**: Page images stored in dedicated `docling_pages` column — search/expand never loads page data
+- **zstd compression**: Switch from gzip to zstd for docling document storage (Python 3.14 stdlib, zstandard package for older versions)
+- **`Document.set_docling()`**: Helper method that handles split compression and version assignment, replacing 11 manual call sites
+- **`Document.get_page_images()`**: Load page images without the document structure, for visualize_chunk
+- **`DocumentRepository.get_pages_data()`**: Load only page data column for a document
+
+### Changed
+
+- **Database migration required**: Run `haiku-rag migrate` to split existing docling blobs into structure + pages and re-compress with zstd
+
+### Fixed
+
+- **Generated skill `domain_preamble`**: Apply `config.prompts.domain_preamble` to instructions in generated skill packages
+
+## [0.37.0] - 2026-04-07
+
+### Changed
+
+- **Dependency updates**: lancedb 0.30.2, pydantic-ai-slim ≥1.77.0, docling ≥2.84.0, docling-core ≥2.71.0, haiku.skills ≥0.13.0, cachetools ≥7.0.5, pydantic-monty ≥0.0.9, cohere ≥5.21.1, textual ≥8.2.1, ty ≥0.0.28, ruff ≥0.15.9
+- **Search result model**: `SearchResult` now includes `order` field propagated from chunk order
+
+### Fixed
+
+- **Type checking**: Fix 37 new ty 0.0.28 diagnostics with proper None guards, assertions, and specific ignore codes
+- **Search performance**: Avoid loading full document blobs (docling_document, content) during search — use column projection to fetch only needed metadata (id, uri, title, metadata)
+- **Context expansion performance**: Load only docling columns during expand_context (skip content blob), and only when doc_item_refs exist
+- **Chunk expansion performance**: Fetch only chunks in the needed order range during context expansion instead of all chunks for a document
+- **Embedding batching**: Batch embedding calls in groups of 512 to avoid request size limits and timeouts with large documents
+- **DoclingDocument validation**: Strip page images before validation on the read path — pages are only needed for visualize_chunk and account for ~99% of the JSON size
+
+## [0.36.3] - 2026-04-01
+
+### Fixed
+
+- **Citation formatting**: Replace raw UUIDs (`[doc_id:chunk_id]`) with human-readable identifiers (`[index] title`) in `format_citations()` output, preventing LLMs from hallucinating opaque ID markers in answers
+- **domain_preamble propagation**: `domain_preamble` now flows to skill subagents and the main agent preamble, not just internal agents (QA, research). Fixes ambiguous queries failing when domain context was needed.
+
+### Changed
+
+- **domain_preamble docs**: Clarified that `domain_preamble` is for domain context (subject matter, terminology), not behavioral instructions (tone, response style).
+
+## [0.36.2] - 2026-03-28
+
+### Fixed
+
+- **Skill extras**: Include `db_path` and `config` in skill extras for both RAG and RLM skills, enabling post-creation reconfiguration
+
+## [0.36.1] - 2026-03-27
+
+## [0.36.0] - 2026-03-26
+
+### Added
+
+- **Chunk visualization for generated skills**: `visualize_chunk(chunk_id)` function exposed in generated skill packages, enabling callers to render visual grounding from chunk IDs in skill state
+- **Configurable generated skills**: Generated skill `create_skill()` now accepts optional `db_path` and `config` parameters, enabling post-discovery reconfiguration via `skill.reconfigure()` (requires haiku.skills >= 0.11.0)
+
+### Fixed
+
+- **Generated skill packages**: Include SKILL.md and assets in wheel distributions. Add README to generated packages.
+- **Docling-serve chunker**: Detect per-document failure status that was silently returning 0 chunks when the task-level status was "success" but individual documents failed
+- **Docling local chunker**: Re-enable `repeat_table_header` for self-contained table chunks, improving retrieval quality and matching docling-serve behavior
+
+## [0.35.1] - 2026-03-24
+
+### Added
+
+- **`create-skill` CLI command**: Generate standalone skill packages with embedded LanceDB databases. Generated packages register as `haiku.skills` entry points.
+
+## [0.35.0] - 2026-03-24
+
+### Added
+
+- **Configurable judge and reflect models**: `evaluations run` and `evaluations optimize` accept `--judge-model provider:name`; `optimize` also accepts `--reflect-model provider:name`. Both fall back to `config.qa.model` when not specified.
+- **`parse_model_option`**: Utility in `haiku.rag.utils` for parsing `provider:name` strings into `ModelConfig`
+- **New format extensions**: `.tex`, `.latex`, `.qmd` (Quarto), `.rmd` (R Markdown) supported in both local and serve converters
+
+### Changed
+
+- **LLMJudge**: Custom evaluator now accepts `ModelConfig` instead of a model name string
+- **Docling upgrade**: docling-core ≥2.70.2 (schema 1.10.0), docling ≥2.81.0. Adds field data model support for structured form/KV content, wide table chunking fixes, and rich table cell hang fix
+- **pydantic-ai ≥1.70.0**: Bumped minimum version. Removed `structured_output_type` helper — all supported providers now handle native structured output, so agents pass result types directly
+
+## [0.34.1] - 2026-03-16
+
+### Added
+
+- **PlantUML support**: `.puml`, `.plantuml`, and `.pu` files are now indexed as `plantuml` code blocks
+
+## [0.34.0] - 2026-03-13
+
+### Added
+
+- **Activity events**: TUI and web frontend now display skill sub-agent tool calls via `ActivitySnapshotEvent`
+
+### Changed
+
+- **RLM sandbox**: Bumped pydantic-monty to 0.0.8. Removed `regex_*` external functions — the sandbox now has native `re` and `math` modules via `import`. Also adds `filter()` and `getattr()` builtins.
+- **Frontend deps**: Upgraded CopilotKit to 1.54.0 and @ag-ui/client to 0.0.47
+
+## [0.33.3] - 2026-03-12
+
+### Added
+
+- **GEPA prompt optimization**: `evaluations optimize` command for automated QA system prompt improvement using evolutionary optimization with LLM-judged scoring. Cases are split 50/50 into train/val sets; GEPA budget is auto-computed from `--num-candidates` and dataset size.
+- **Tuning docs**: Added step 7 (Optimize QA Prompts) to the tuning workflow in `docs/tuning.md`
+- **Evaluations test coverage**: Tests for evaluators (MAP, MRR), config, benchmark helpers, dataset mappers/builders, and optimization
+
+### Fixed
+
+- **Read-only mode table creation**: `--read-only` no longer creates lance tables when pointed at an empty directory. `Store._init_tables()` now raises `ReadOnlyError` when tables are missing in read-only mode.
+
+## [0.33.2] - 2026-03-11
+
+### Changed
+
+- **QA search cap**: Replace dead `max_iterations`/`max_concurrency` config with `max_searches` (default: 3). The QA agent now enforces a per-run search limit, reducing average response time from ~30s to ~15s while maintaining accuracy. The limit resets per agent run so toolsets can be safely reused.
+- **Default search limit**: Increased from 5 to 10 results per search query for better coverage.
+
+### Fixed
+
+- **QA citations**: Strengthened prompt to clarify chunk ID format (complete IDs without brackets). `resolve_citations` now strips `[]` from IDs, handling models that copy brackets from search result formatting.
+
+## [0.33.1] - 2026-03-06
+
+### Changed
+
+- **Default model temperatures**: Set task-appropriate temperature defaults — 0.3 for QA, research, and title generation; 0.0 for RLM and picture description. Previously unset (provider defaults, typically 0.7–1.0).
+- **QA thinking enabled by default**: `enable_thinking` now defaults to `True` for QA agent, improving answer quality with reasoning models.
+- **Default title max_tokens**: Set `max_tokens=100` for title generation model to keep titles concise
+- **Evaluation judge**: Set `temperature=0.0` and `enable_thinking=True` for deterministic, higher-quality judging. Removed unused judge config from retrieval benchmarks.
+- **Test suite cleanup**: Removed stale VCR cassettes, dead fixtures, orphaned directories, and redundant tests. Strengthened weak assertions across search, context enhancement, and converter tests. Relocated misplaced `SearchResult._get_primary_label` test to `test_search.py`
+- **Parallel test execution**: Added `pytest-xdist` and enabled parallel test runs by default (`-n auto`), reducing test suite time from ~3.5 min to ~2 min
+
+## [0.33.0] - 2026-03-04
+
+### Added
+
+- **Module-level skill introspection API**: `STATE_TYPE`, `STATE_NAMESPACE`, `skill_metadata()`, `instructions()`, and `state_metadata()` on `haiku.rag.skills.rag` and `haiku.rag.skills.rlm` — allows introspecting skill configuration without calling `create_skill()`
+- **Automatic structured output detection**: Native JSON schema output is used automatically when the model supports it, with tool-call fallback otherwise. No configuration needed.
+
+### Changed
+
+- **`haiku.skills` dependency**: Bumped to `>=0.7.0` for `StateMetadata` dataclass
+
+## [0.32.3] - 2026-03-03
+
+### Changed
+
+- **AG-UI skill streaming**: Tool calls within skills are now streamed as real-time AG-UI events to the frontend. Requires `haiku.skills>=0.6.0`
+
+### Fixed
+
+- **Search tool regression**: Removed LLM-facing `filter` parameter from search and list_documents tools. The SQL WHERE clause description confused LLMs, degrading QA accuracy. Document filtering is now handled programmatically via `base_filter` and `state.document_filter`
+
+## [0.32.2] - 2026-02-28
+
+### Fixed
+
+- **Compatibility with haiku.skills 0.5.1**: Replaced removed `SkillToolset.system_prompt` with `build_system_prompt(toolset.skill_catalog)` across chat TUI, backend app, and examples
+- **Minimum dependency**: Bumped `haiku.skills` requirement to `>=0.5.1`
+- **Chat model default**: Chat TUI and backend app now use the configured QA model instead of hardcoded `openai:gpt-4o`
+
+## [0.32.1] - 2026-02-26
+
+### Added
+
+- **Automatic title generation**: Documents can now have titles auto-generated during ingestion via `processing.auto_title: true`. Uses two-tier extraction: structural metadata from DoclingDocument (HTML `<title>`, h1, section headers) first, with LLM fallback via configurable `processing.title_model`
+- **`generate_title()`**: Public method on `HaikuRAG` to generate a title for an existing document on demand
+- **`rebuild --title-only`**: New rebuild mode that generates titles only for untitled documents without re-chunking or re-embedding
+- **`add --title`**: CLI option to set a title when adding text documents
+
+## [0.32.0] - 2026-02-24
+
+### Changed
+
+- **RLM sandbox**: Replaced Docker-based code execution with [pydantic-monty](https://github.com/pydantic/monty), a minimal secure Python interpreter written in Rust. Eliminates Docker as a runtime dependency for RLM with sub-millisecond sandbox startup
+- **RLM sandbox functions**: Added `get_chunk(chunk_id)` for retrieving chunk content and metadata from search results. `get_docling_document(document_id)` now returns the full document structure as a JSON dict. All sandbox functions now require `await`
+- **`RLMConfig`**: Removed `docker_image` and `docker_memory_limit` fields
+
+### Added
+
+- **RLM sandbox regex functions**: `regex_findall`, `regex_sub`, `regex_search`, `regex_split` for pattern matching without LLM calls
+- **`HaikuRAG.get_chunk_by_id()`**: Public method for chunk lookup by ID
+
+### Removed
+
+- **`docker_sandbox.py`**, **`runner.py`**: Docker container plumbing replaced by `sandbox.py`
+
+## [0.31.1] - 2026-02-20
+
+### Fixed
+
+- **`info` and `history` commands**: Open database in read-only mode to prevent write failures on read-only filesystems
+
+## [0.31.0] - 2026-02-20
+
+### Added
+
+- **RAG skill** (`haiku.rag.skills.rag`): haiku.skills integration with search, list_documents, get_document, ask, and research tools plus managed `RAGState`
+- **RLM skill** (`haiku.rag.skills.rlm`): haiku.skills integration with analyze tool for computational analysis via code execution
+- **`HaikuRAG.research()`**: Client method for multi-agent research
+- **haiku.skills entry points**: `rag = "haiku.rag.skills.rag:create_skill"`, `rag-rlm = "haiku.rag.skills.rlm:create_skill"`
+
+### Changed
+
+- **Chat TUI**: Rebuilt on RAG skill + haiku.skills `SkillToolset`
+- **Web app backend**: Rebuilt on RAG skill + `AGUIAdapter`
+- **Toolsets simplified**: Removed `ToolContext`, `SessionState`, `AgentDeps`, `Toolkit`; kept core `FunctionToolset` factories
+- **Research graph**: Removed `session_context` and conversational output mode
+
+### Removed
+
+- **`agents/chat/`**: Entire chat agent module (replaced by RAG skill)
+- **`--deep` flag**: Removed from `ask` CLI (use `research` command instead)
+- **`--context`/`--context-file`**: Removed from `ask` CLI
+- **`tools/` state machinery**: `ToolContext`, `ToolContextCache`, `SessionState`, `AgentDeps`, `Toolkit`, etc.
+
+## [0.30.2] - 2026-02-19
+
+### Fixed
+
+- Added `cachetools` as an explicit dependency (was only available transitively, causing `ModuleNotFoundError` for some installations)
+- **download-models**: Show actionable error message when Ollama is not running instead of cryptic "All connection attempts failed" (#277)
+
+## [0.30.1] - 2026-02-17
+
+### Changed
+
+- **AG-UI state sync**: `ask` tool now emits `StateDeltaEvent` (JSON Patch) instead of `StateSnapshotEvent`, consistent with the `search` tool
+
+## [0.30.0] - 2026-02-16
+
+### Added
+
+- **Composable toolsets**: New `haiku.rag.tools` module with reusable `FunctionToolset` factories that can be mixed into any pydantic-ai agent
+  - `create_search_toolset()` — hybrid search with context expansion and citation tracking
+  - `create_document_toolset()` — document listing, retrieval, and summarization
+  - `create_qa_toolset()` — question answering via research graph with prior answer recall
+  - `create_analysis_toolset()` — computational analysis via RLM agent (Docker sandbox)
+- **`Toolkit` and `build_toolkit()`**: High-level factory that bundles toolsets, prompt, and context creation for a given feature set. Reduces agent composition from ~15 lines to ~5. `build_chat_toolkit()` adds chat-specific defaults (background summarization callback)
+- **`ToolContext`**: Namespace-based state container shared across toolsets. Toolsets register Pydantic models under string namespaces, enabling state accumulation (search results, citations, QA history) across invocations
+- **`ToolContextCache`**: In-memory TTL-based cache for `ToolContext` instances, keyed by external session/thread ID. Replaces module-level caches for embeddings and summaries
+- **`run_qa_core()`**: Extracted core QA function for direct programmatic use without an agent
+- **Feature-based chat agent**: `create_chat_agent()` accepts a `features` list to select which toolsets are enabled (`search`, `documents`, `qa`, `analysis`). System prompt is composed to match
+- **New documentation**: `docs/tools.md` covers all toolsets, `ToolContext`, state management, filter helpers, and composing custom agents
+
+### Changed
+
+- **Toolset factories decoupled from runtime dependencies**: `create_search_toolset()`, `create_qa_toolset()`, `create_document_toolset()`, `create_analysis_toolset()`, and `create_chat_agent()` no longer take `client` or `context` parameters. Instead, tool functions receive these via pydantic-ai's `RunContext.deps`. This enables toolset and agent creation at configuration time (cacheable, created once), with only lightweight deps created per-request. Deps must satisfy the `RAGDeps` protocol (`client: HaikuRAG`, `tool_context: ToolContext | None`)
+- **Toolset factory return types narrowed to `FunctionToolset[RAGDeps]`**: All four toolset factories now declare their return type as `FunctionToolset[RAGDeps]` instead of bare `FunctionToolset`
+- **`create_chat_agent()` accepts optional `toolkit` parameter**: Pass a pre-built `Toolkit` to share toolsets between agent and context creation, avoiding duplicate construction
+- **`ChatDeps` now includes `client`**: `ChatDeps(config=..., client=..., tool_context=...)` — the `client` field was added since it's no longer captured by the agent factory
+- **`prepare_chat_context()` helper**: Extracted from `create_chat_agent()` for idempotent namespace registration, since the agent factory no longer has access to the context
+- **Chat agent architecture**: Rebuilt on composable toolsets instead of monolithic tool definitions. Chat agent is now a thin wrapper around `create_search_toolset`, `create_document_toolset`, `create_qa_toolset`, and `create_analysis_toolset`
+- **State management simplified**: Removed `session_id`, `incoming_session_id`, and `incoming_session_context` from the state layer. `ToolContextCache` preserves all state (embeddings, summaries, QA history) on cached `ToolContext` instances, eliminating the need for module-level caches
+- **AG-UI state sync**: `ask` tool now emits `StateSnapshotEvent` instead of `StateDeltaEvent`, ensuring background summarization results are reliably delivered to clients
+- **TUI simplified**: Chat TUI reads directly from `ToolContext` namespace states instead of maintaining a separate `ChatSessionState` and manually syncing via AG-UI state events
+- **AG-UI web app**: Uses `ToolContextCache` to maintain per-thread state across requests
+- **Frontend session management**: Persistent chat sessions with localStorage, wired to backend `ToolContextCache` via CopilotKit `threadId`
+  - Session manager dropdown: create, switch, delete, and export sessions to markdown
+  - Messages, chat state, and citations restored on session switch
+  - Session title derived from first user message
+  - Inline citation blocks injected after assistant responses via `qa_history` correlation
+
+### Removed
+
+- **`SearchAgent`**: Replaced by `create_search_toolset()`
+- **Module-level session caches**: `_session_cache`, `cache_session_context`, `get_cached_session_context`, `cache_question_embedding`, `get_cached_embedding` — all replaced by cached `ToolContext`
+- **`ChatSessionState` from TUI**: TUI no longer maintains its own copy of session state
+
+## [0.29.1] - 2026-02-10
+
+### Fixed
+
+- **Document listing memory usage**: `list_documents` no longer loads full document content and docling blobs by default, preventing out-of-memory errors on large databases. Use `include_content=True` when content is needed.
+- **Chat session_id not persisting across AG-UI requests**: `ChatSessionState.session_id` now defaults to `""` instead of auto-generating a UUID. This ensures the session_id assignment is detected as a state change and included in the `StateDeltaEvent` delta, allowing clients to persist it across requests.
+
+## [0.29.0] - 2026-02-06
+
+### Added
+
+- **docling-serve Chunker OCR Options**: The docling-serve chunker now respects OCR settings from `conversion_options`
+  - Passes `do_ocr`, `force_ocr`, `ocr_engine`, and `ocr_lang` to the chunking API
+  - Allows disabling OCR via config when running docling-serve in read-only containers
+- **RLM Agent (Recursive Language Model)**: New agent for complex analytical tasks via sandboxed Python code execution
+  - Solves problems traditional RAG can't handle: aggregation, computation, multi-document analysis
+  - Docker-based sandbox with full Python environment (no import restrictions)
+  - Container reuse within a single `rlm()` call for reduced latency
+  - Available functions: `search()`, `list_documents()`, `get_document()`, `get_docling_document()`, `llm()`
+  - Pre-loaded documents support via `documents` variable
+  - Context filter for scoping searches without LLM control
+  - New `client.rlm(question)` method on HaikuRAG client
+  - New `haiku-rag rlm` CLI command
+  - New `rlm_question` MCP tool
+  - New config options: `docker_image`, `docker_memory_limit`
+- **CI**: Docker sandbox integration tests run in GitHub Actions
+
+### Fixed
+
+- **CI**: Cache HuggingFace tokenizer to prevent flaky test failures when HuggingFace has transient outages
+
+## [0.28.0] - 2026-01-31
+
+### Changed
+
+- **Iterative Research Planning**: Research graph now uses an iterative feedback loop instead of batch question processing
+  - Planner proposes ONE question at a time, sees the answer, then decides whether to continue
+  - Removes `gather_context` tool — planner proposes questions directly
+  - Simpler flow: `plan_next` → `search_one` → loop back until complete → `synthesize`
+  - Consolidated `build_conversational_graph()` into `build_research_graph(output_mode="conversational")`
+
+### Removed
+
+- **Dead config options**: Removed vestigial fields from iterative planning refactor
+  - `confidence_threshold` from `ResearchConfig` and `ResearchState` (LLM decides completion via `is_complete`)
+  - `max_sub_questions` from `QAConfig` (iterative flow uses one question at a time)
+  - `sub_questions` field from `ResearchContext` (no longer populated)
+
+## [0.27.2] - 2026-01-29
+
+### Added
+
+- **Deep Ask Evaluations**: QA benchmarks can now use the research graph for multi-step reasoning
+  - New `--deep` flag on `evaluations run` enables deep ask mode
+  - Uses research graph with `max_iterations=2` and `confidence_threshold=0.0`
+  - Evaluation name automatically suffixed with `_deep` when enabled
+  - Experiment metadata includes `deep_ask` field for tracking
+- **Chat Agent Document Awareness Tools**: Two new tools for browsing and understanding the knowledge base
+  - `list_documents` — Returns `DocumentListResponse` with paginated documents (50 per page), page number, total pages, and total count; respects session document filter
+  - `summarize_document` — Generate LLM-powered summaries of specific documents
+- **Document Count API**: New `count_documents(filter)` method on `HaikuRAG` client for efficient document counting
+- **Read-Only Initial Context**: Initial context is now locked after the first message, providing consistent session context
+  - Chat TUI: `--initial-context` CLI option sets background context for the session
+  - Context can be edited via command palette before the first message is sent
+  - After first message, context becomes read-only (view only)
+  - Clearing chat resets context to CLI value and unlocks editing
+  - Web app: Memory panel now serves dual purpose - edit initial context before first message, view session context after
+  - Agent uses `initial_context` as fallback when `session_context` is empty
+
+### Changed
+
+- **AG-UI State Delta Updates**: Web application now sends `StateDeltaEvent` (JSON Patch RFC 6902) instead of full `StateSnapshotEvent` for state updates
+  - Reduces bandwidth when state grows large (e.g., 50 Q&As with citations)
+  - First request still sends full snapshot; subsequent requests send only changes
+  - Backend logging shows incoming/outgoing state events for debugging
+
+### Fixed
+
+- **Chat TUI Session State Sync**: TUI now syncs full session state from AG-UI events
+
+## [0.27.1] - 2026-01-27
+
+### Added
+
+- **Initial Context for Chat Sessions**: New `initial_context` field on `ChatSessionState` allows external clients to seed sessions with background context
+  - Static context set once at session creation, used as fallback when no cached session context exists
+  - Incorporated into first summarization, after which evolved `session_context` takes precedence
+  - Eliminates need for clients to import and call internal cache functions (`cache_session_context`, `get_cached_session_context`)
+  - `session_id` now auto-generates a UUID if not provided (previously defaulted to empty string)
+
+### Fixed
+
+- **AG-UI StateSnapshotEvent JSON Serialization**: Chat agent tools now use `model_dump(mode="json")` when creating `StateSnapshotEvent`
+  - Fixes `TypeError: Object of type datetime is not JSON serializable` when external clients persist AG-UI state to database JSON columns
+
+## [0.27.0] - 2026-01-26
+
+### Added
+
+- **Evaluation Database Hosting**: Pre-built evaluation databases available on HuggingFace
+  - `evaluations download <dataset>` downloads pre-built databases from `ggozad/haiku-rag-eval-dbs`
+  - `evaluations upload <dataset>` uploads databases to HuggingFace (maintainer only)
+  - Supports `all` argument to download/upload all datasets at once
+  - Use `--force` flag to overwrite existing databases
+  - Avoids lengthy database rebuild times for users running benchmarks
+- **Stable Citation Registry**: Citation indices now persist across tool calls within a session
+  - Same `chunk_id` always returns the same citation index (first-occurrence-wins)
+  - New `citation_registry: dict[str, int]` field on `ChatSessionState`
+  - New `get_or_assign_index(chunk_id)` method for stable index assignment
+  - Registry serialized/restored via AG-UI state protocol
+- **Prior Answer Recall**: The `ask` tool automatically checks conversation history before research
+  - Finds semantically similar prior answers using embedding similarity (0.7 cosine threshold)
+  - Relevant prior answers are passed to the research planner as context
+  - Planner can return empty sub_questions when context is sufficient, avoiding redundant searches
+- **Dynamic Session Context**: Compressed conversation history for multi-turn chat
+  - New `SessionContext` model stores summarized conversation state instead of raw Q&A history
+  - Background LLM-based summarization runs after each `ask` tool call (non-blocking)
+  - Previous summarization tasks are cancelled when new ones start
+  - Research graph receives compact context (~1,000-2,000 tokens) instead of raw qa_history (potentially thousands of tokens)
+  - New `session_context` field on `ChatSessionState` synced via AG-UI state protocol
+  - Chat TUI: New context modal (`Ctrl+O`) to view current session context
+- **Session Document Filter**: Restrict all search/ask operations to selected documents
+  - New `document_filter` field on `ChatSessionState` stores list of document titles/URIs
+  - Session filter combines with per-tool `document_name` filter using AND logic
+  - Multi-document selection uses OR logic within the session filter
+  - Filter persists across tool calls and chat clears via AG-UI state protocol
+  - Chat TUI: Access via command palette ("Filter documents" command)
+  - Web Application: Filter button in header shows count of selected documents
+
+### Changed
+
+- **Dependencies**: Updated core dependencies
+  - `pydantic-ai-slim`: 1.44.0 → 1.46.0
+  - `lancedb`: 0.26.1 → 0.27.0
+  - `docling`: 2.68.0 → 2.69.1
+  - `docling-core`: 2.59.0 → 2.60.1
+- **VoyageAI Embeddings**: Now uses pydantic-ai-slim's native VoyageAI support instead of custom implementation
+  - Removed `haiku.rag.embeddings.voyageai` module
+  - The `voyageai` extra now delegates to `pydantic-ai-slim[voyageai]`
+
+### Removed
+
+- **Q&A History Functions**: Removed standalone conversation history utilities
+  - `rank_qa_history_by_similarity()` - similarity matching now integrated into `ask` tool
+  - `format_conversation_context()` - replaced by `SessionContext` summarization
+  - Associated embedding cache and helper functions also removed
+
+## [0.26.9] - 2026-01-22
+
+### Fixed
+
+- **v0.25.0 Migration Failure**: Fixed "Table 'documents' already exists" error during migration caused by held table references preventing `drop_table()` from succeeding. Added recovery logic to restore documents from staging table if a previous migration attempt failed mid-way.
+
+## [0.26.8] - 2026-01-22
+
+### Added
+
+- **Jina Reranker v3**: Added support for Jina reranking with API mode (`provider: jina`) and local inference (`provider: jina-local`, requires `[jina]` extra)
+- **Model Downloads**: `download-models` now pre-downloads HuggingFace models for `sentence-transformers`, `mxbai`, and `jina-local`
+- **Reranker Factory**: Removed unreliable `id(config)`-based caching from `get_reranker()`; factory now always instantiates fresh
+
+### Changed
+
+- **Agent Search Result Display**: Search results now show rank position instead of raw scores
+  - `SearchResult.format_for_agent()` accepts optional `rank` and `total` parameters
+  - Output changes from `(score: 0.02)` to `[rank 1 of 5]` when rank is provided
+  - Prevents LLMs from misinterpreting low RRF hybrid search scores as "2% relevant"
+  - QA and Research agents updated to pass rank/total to formatted results
+  - Agent prompts updated to reference rank-based ordering instead of scores
+
+### Fixed
+
+- **Test Cassette Organization**: Consolidated all VCR cassettes to `tests/cassettes/`
+- **Environment Loading**: Fixed `.env` file loading to search from current working directory instead of source file directory ([#250](https://github.com/ggozad/haiku.rag/pull/250)) - thanks @tianyicui
+
+## [0.26.7] - 2026-01-20
+
+### Added
+
+- **OCR Engine Selection**: New `ocr_engine` option in `conversion_options` to explicitly select OCR backend ([#246](https://github.com/ggozad/haiku.rag/issues/246))
+  - Supported engines: `auto` (default), `easyocr`, `rapidocr`, `tesseract`, `tesserocr`, `ocrmac`
+  - Works with both `docling-local` and `docling-serve` converters
+  - Fixes inconsistent OCR engine selection between docling-serve startup and conversion requests
+
+### Removed
+
+- **A2A Example**: Removed `examples/a2a-server/` A2A protocol server example
+- **Stale Example References**: Cleaned up references to removed `ag-ui-research` example from documentation
+
+### Changed
+
+- **MCP Error Handling**: MCP tools now let exceptions propagate naturally; FastMCP converts them to proper MCP error responses
+- **Chunk Contextualization**: Consolidated duplicate `contextualize` logic into `Chunk.contextualize_content()` method
+- **Type Checker**: Replaced pyright with [ty](https://github.com/astral-sh/ty), Astral's extremely fast Python type checker
+  - Added explicit `Agent[Deps, Output]` type annotations to all pydantic-ai agents for better type inference
+  - Removed ~24 unnecessary `# type: ignore` comments that ty correctly infers
+- **Dependencies**: Updated to latest versions
+  - `pydantic-ai-slim`: 1.39.0 → 1.44.0
+  - `docling`: 2.67.0 → 2.68.0
+  - `pathspec`: 0.12.1 → 1.0.3
+  - `textual`: 7.0.0 → 7.3.0
+  - `datasets`: 4.4.2 → 4.5.0
+  - `ruff`: 0.14.11 → 0.14.13
+  - `opencv-python-headless`: 4.12.0.88 → 4.13.0.90
+
+### Fixed
+
+- **Chat TUI**: Fixed crash when logfire is installed but user is not authenticated ([#247](https://github.com/ggozad/haiku.rag/issues/247))
+
+## [0.26.6] - 2026-01-19
+
+### Changed
+
+- **Explicit Database Migrations**: Database migrations are no longer applied automatically on open
+  - Opening a database with pending migrations now raises `MigrationRequiredError` with a clear message
+  - New `haiku-rag migrate` command to explicitly apply pending migrations
+  - Version-only updates (no schema changes) are applied silently in writable mode
+  - New `skip_migration_check` parameter on `Store` for tools that need to bypass the check
+  - `Store.migrate()` method returns list of applied migration descriptions
+
+## [0.26.5] - 2026-01-16
+
+### Added
+
+- **Background Context Support**: Pass background context to agents via CLI or Python API
+  - `haiku-rag ask --context "..." --context-file path` for Q&A with background context
+  - `haiku-rag research --context "..." --context-file path` for research with background context
+  - `haiku-rag chat --context "..." --context-file path` for chat sessions with persistent context
+  - `ResearchContext(background_context="...")` for Python API usage
+  - `ChatSessionState(background_context="...")` for chat agent sessions
+  - Context is included in agent system prompts and research graph planning
+- **Frontend Background Context**: Settings panel in the chat app to configure persistent background context
+  - Context is stored in localStorage and sent with each conversation
+- **Frontend Linting**: Added Biome for linting and formatting the frontend codebase
+
+## [0.26.4] - 2026-01-15
+
+### Added
+
+- **AGUI_STATE_KEY Constant**: Exported `AGUI_STATE_KEY` (`"haiku.rag.chat"`) from `haiku.rag.agents.chat` for namespaced AG-UI state emission
+  - Enables integrators to use a consistent key when combining haiku.rag with other agents
+  - Backend, TUI, and frontend now use this key for state emission and extraction
+
+## [0.26.3] - 2026-01-15
+
+### Added
+
+- **Enhanced Database Info**: `haiku-rag info` now displays `pydantic-ai` version and `docling-document schema` version
+- **Keyed State Emission for Chat Agent**: New `state_key` parameter in `ChatDeps` for namespaced AG-UI state snapshots
+  - When set, tools emit `{state_key: snapshot}` instead of bare state, enabling state merging when multiple agents share state
+  - Default `None` preserves backwards compatibility (bare state emission)
+- **Page Image Generation Control**: New `generate_page_images` option in `ConversionOptions` to control PDF page image extraction
+
+### Changed
+
+- **CLI Error Handling**: Commands (`rebuild`, `vacuum`, `create-index`, `ask`, `research`) now propagate errors with proper exit codes instead of swallowing exceptions
+
+### Fixed
+
+- **Embed-only rebuild with changed vector dimensions**: Fixed `haiku-rag rebuild --embed-only` failing when the configured embedding model has different dimensions than the database
+  - Store now reads stored vector dimension when opening existing databases, allowing chunks to be read regardless of current config
+  - `_rebuild_embed_only` recreates the chunks table to handle dimension changes
+  - `generate_page_images: bool = True` - Enable/disable rendered page images (used by `visualize_chunk()`)
+  - Works with both `docling-local` and `docling-serve` converters
+  - For `docling-serve`, maps to `image_export_mode` API parameter (`embedded`/`placeholder`)
+  - Note: `generate_picture_images` (embedded figures/diagrams) works with local converter but has limited support in docling-serve
+
+## [0.26.2] - 2026-01-13
+
+### Changed
+
+- **Dependencies**: Updated docling dependencies for latest docling-serve compatibility ([#229](https://github.com/ggozad/haiku.rag/issues/229))
+  - `docling-core`: 2.57.0 → 2.59.0 (supports schema 1.9.0)
+  - `docling`: 2.65.0 → 2.67.0
+
+## [0.26.1] - 2026-01-13
+
+### Fixed
+
+- **Docling Schema Version Mismatch**: Fixed incompatibility between `docling` and `docling-core` causing `ValidationError: Doc version 1.9.0 incompatible with SDK schema version 1.8.0` when adding documents ([#229](https://github.com/ggozad/haiku.rag/issues/229))
+  - Root cause: `docling-core` was reverted to 2.57.0 (schema 1.8.0) for docling-serve compatibility, but `docling` remained at 2.67.0 (schema 1.9.0)
+  - Fix: Reverted `docling` from 2.67.0 to 2.65.0 to match `docling-core` schema version
+
+## [0.26.0] - 2026-01-13
+
+### Added
+
+- **Conversational RAG Application**: Full-stack application (`app/`) with CopilotKit frontend and pydantic-ai AG-UI backend
+  - Next.js frontend with chat interface, citation display, and visual grounding
+  - Starlette backend using pydantic-ai's native `AGUIAdapter` for streaming
+  - Docker Compose setup for development (`docker-compose.dev.yml`) and production
+  - Logfire integration for debugging LLM calls
+  - SSE heartbeat to prevent connection timeouts
+- **Chat Agent** (`haiku.rag.agents.chat`): New conversational RAG agent optimized for multi-turn chat
+  - `create_chat_agent()` factory function for creating chat agents with AG-UI support
+  - `SearchAgent` for internal query expansion with deduplication
+  - `ChatDeps` and `ChatSessionState` for session management
+  - `CitationInfo` and `QAResponse` models for structured responses
+  - Natural language document filtering via `build_document_filter()`
+  - Configurable search limit per agent
+- **Chat TUI** (`haiku-rag chat`): Terminal-based chat interface using Textual
+  - Single chat window with inline tool calls and expandable citations
+  - Visual grounding (`v` key) reuses inspector's `VisualGroundingModal`
+  - Database info (`i` key) shows document/chunk counts and storage info
+  - Keybindings: `q` quit, `Ctrl+L` clear chat, `Escape` focus input
+- **Q/A History Management**: Intelligent conversation history with semantic ranking
+  - FIFO queue with 50 max entries
+  - Embedding cache to avoid re-embedding Q/A pairs
+  - `rank_qa_history_by_similarity()` returns top-K most relevant history entries
+  - Confidence filtering to exclude low-confidence answers from context
+- **Conversational Research Graph**: Simplified single-iteration research graph for chat
+  - `build_conversational_graph()` optimized for conversational Q&A
+  - Context-aware planning (generates fewer sub-questions when history exists)
+  - `ConversationalAnswer` output type with direct answer and citations
+
+### Changed
+
+- **BREAKING: Module Reorganization**: Consolidated all agent code under `haiku.rag.agents`
+  - Moved `haiku.rag.qa` → `haiku.rag.agents.qa`
+  - Moved `haiku.rag.graph.research` → `haiku.rag.agents.research`
+  - Added `haiku.rag.agents.chat` module with conversational RAG agent
+  - Deleted `haiku.rag.graph` module (research graph now at `haiku.rag.agents.research.graph`)
+
+### Removed
+
+- **BREAKING: Custom AG-UI Infrastructure**: Removed custom AG-UI event handling in favor of pydantic-ai's native AG-UI support
+  - Deleted `haiku.rag.graph.agui` module (`AGUIEmitter`, `AGUIConsoleRenderer`, `stream_graph()`, `create_agui_server()`)
+  - Removed `--agui` flag from `serve` command
+  - Removed `--verbose` flags from `ask` and `research` commands
+  - Removed `--interactive` flag from `research` command
+  - Removed `AGUIConfig` from configuration
+  - Deleted `cli_chat.py` interactive chat module
+  - Research graph now uses `graph.run()` directly instead of `stream_graph()`
+  - For AG-UI streaming, use pydantic-ai's native `AGUIAdapter` with `ToolReturn` and `StateSnapshotEvent` (see `app/backend/` for example)
+- **AG-UI Research Example**: Removed `examples/ag-ui-research/` (replaced by `app/`)
+
+## [0.25.0] - 2026-01-12
+
+### Fixed
+
+- **Large Document Storage Overflow**: Fixed "byte array offset overflow" panic when vacuuming/rebuilding databases with many large PDF documents ([#225](https://github.com/ggozad/haiku.rag/issues/225))
+  - Root cause: Arrow's 32-bit string column offsets limited to ~2GB per fragment
+  - Changed `docling_document_json` (string) to `docling_document` (bytes) with `large_binary` Arrow type (64-bit offsets)
+  - Added gzip compression for DoclingDocument JSON (~1.4x compression ratio)
+  - Migration automatically compresses existing documents in batches to avoid memory issues
+  - **Breaking**: Migration is destructive - all table version history is lost after upgrade
+
+### Changed
+
+- **Dependencies**: Updated lancedb 0.26.0 → 0.26.1, docling 2.65.0 → 2.67.0
+
+### Removed
+
+- **Legacy Migrations**: Removed obsolete database migration files (`v0_9_3.py`, `v0_10_1.py`, `v0_19_6.py`). These migrations were for versions prior to 0.20.0 and are no longer needed since the current release requires a database rebuild anyway.
+
+## [0.24.2] - 2026-01-08
+
+### Fixed
+
+- **Base64 Images in Expanded Context**: Fixed base64 image data leaking into expanded search results when `expand_context()` processed `PictureItem` objects. The issue was `PictureItem.export_to_markdown()` defaulting to `EMBEDDED` mode. Now explicitly uses `PLACEHOLDER` mode to prevent base64 data while still including VLM descriptions and captions.
+
+## [0.24.1] - 2026-01-08
+
+### Fixed
+
+- **OpenAI Non-Reasoning Models**: Fixed `reasoning_effort` parameter being sent to non-reasoning OpenAI models (gpt-4o, gpt-4o-mini), causing 400 errors. Now correctly detects reasoning models (o1, o3 series) using pydantic-ai's model profile.
+- **Bedrock Non-Reasoning Models**: Fixed same issue for OpenAI models on Bedrock.
+
+## [0.24.0] - 2026-01-07
+
+### Added
+
+- **VLM Picture Description**: Describe embedded images using Vision Language Models during document conversion
+  - Images are sent to a VLM for automatic description via OpenAI-compatible API
+  - Descriptions become searchable text, improving RAG retrieval for visual content
+  - Configure via `processing.conversion_options.picture_description` with `enabled`, `model`, `timeout`, `max_tokens`
+  - Default prompt customizable via `prompts.picture_description`
+  - Requires OpenAI-compatible `/v1/chat/completions` endpoint (Ollama, OpenAI, vLLM, LM Studio)
+
+## [0.23.2] - 2026-01-05
+
+### Fixed
+
+- **AG-UI Concurrent Step Tracking**: Emitter now correctly tracks multiple concurrent steps ([#216](https://github.com/ggozad/haiku.rag/issues/216))
+
+### Changed
+
+- **Dependencies**: Updated core and development dependencies
+
+## [0.23.1] - 2025-12-29
+
+### Added
+
+- **Contextualized FTS Search**: Full-text search now includes section headings
+  - New `content_fts` column stores contextualized content (headings + body text)
+  - FTS index now searches `content_fts` for better keyword matching on section context
+  - Original `content` column preserved for display and context expansion
+  - Migration automatically populates `content_fts` for existing databases
+- **GitHub Actions CI**: Test workflow runs pytest, pyright, and ruff on push/PR to main
+- **VCR Cassette Recording**: Integration tests use recorded HTTP responses for deterministic CI runs
+  - LLM tests (QA, embeddings, research graph) replay from cassettes without real API calls
+  - docling-serve tests run without Docker container in CI
+  - Uses pytest-recording with custom JSON body serializer
+
+## [0.23.0] - 2025-12-26
+
+### Added
+
+- **Prompt Customization**: Configure agent prompts via `prompts` config section
+  - `domain_preamble`: Prepended to all agent prompts for domain context
+  - `qa`: Full replacement for QA agent prompt
+  - `synthesis`: Full replacement for research synthesis prompt
+
+### Changed
+
+- **Embeddings**: Migrated to pydantic-ai's embeddings module
+  - Uses pydantic-ai v1.39.0+ embeddings with instrumentation and token counting support
+  - Explicit `embed_query()` and `embed_documents()` API for query/document distinction
+  - New providers available: Cohere (`cohere:`), SentenceTransformers (`sentence-transformers:`)
+  - VoyageAI refactored to extend pydantic-ai's `EmbeddingModel` base class
+- **Configuration**: Added `base_url` to `ModelConfig` and `EmbeddingModelConfig`
+  - Enables custom endpoints for OpenAI-compatible providers (vLLM, LM Studio, etc.)
+  - Model-level `base_url` takes precedence over provider config
+
+### Deprecated
+
+- **vLLM and LM Studio providers**: Use `openai` provider with `base_url` instead
+  - `provider: vllm` → `provider: openai` with `base_url: http://localhost:8000/v1`
+  - `provider: lm_studio` → `provider: openai` with `base_url: http://localhost:1234/v1`
+
+### Removed
+
+- Deleted obsolete embedder implementations: `ollama.py`, `openai.py`, `vllm.py`, `lm_studio.py`, `base.py`
+- Removed `VLLMConfig` and `LMStudioConfig` from configuration (use `base_url` in model config instead)
+
+## [0.22.0] - 2025-12-19
+
+### Added
+
+- **Read-Only Mode**: Global `--read-only` CLI flag for safe database access without modifications
+  - Blocks all write operations at the Store layer
+  - Skips database upgrades and settings saves on open
+  - Excludes write tools (`add_document_*`, `delete_document`) from MCP server
+  - Disables file monitor with warning when `--read-only` is used with `serve --monitor`
+- **Time Travel**: Query the database as it existed at a previous point in time
+  - Global `--before` CLI flag accepts datetime strings (ISO 8601 or date-only)
+  - Automatically enables read-only mode when time-traveling
+  - New `history` command shows version history for database tables
+  - Useful for debugging and auditing
+  - Supported throughout: CLI, Client, App, Inspector
+
+### Fixed
+
+- **File Monitor Path Validation**: Monitor now validates directories exist before watching ([#204](https://github.com/ggozad/haiku.rag/issues/204))
+  - Provides clear error message pointing to `haiku.rag.yaml` configuration
+  - Prevents cryptic `FileNotFoundError: No path was found` from watchfiles
+- **Docker Documentation**: Improved Docker setup instructions
+  - Added volume mount examples for config file and documents directory
+  - Clarified that `monitor.directories` must use container paths, not host paths
+
+### Changed
+
+- **Dependencies**: Updated core dependencies
+  - `pydantic-ai-slim`: 1.27.0 → 1.36.0 (FileSearchTool, web chat UI, GPT-5.2 support, prompt caching)
+  - `lancedb`: 0.25.3 → 0.26.0
+  - `docling`: 2.64.0 → 2.65.0
+  - `docling-core`: 2.54.0 → 2.57.0
+
+## [0.21.0] - 2025-12-18
+
+### Added
+
+- **Interactive Research Mode**: Human-in-the-loop research using graph-based decision nodes
+  - `haiku-rag research --interactive` starts conversational CLI chat
+  - Natural language interpretation for user commands (search, modify questions, synthesize)
+  - Chat with assistant before starting research, and during decision points
+  - Review collected answers and pending questions at each decision point
+  - Add, remove, or modify sub-questions through natural conversation
+  - New `human_decide` graph node emits AG-UI tool calls (`TOOL_CALL_START/ARGS/END`) for frontend integration
+  - New `emit_tool_call_start()`, `emit_tool_call_args()`, `emit_tool_call_end()` AG-UI event helpers
+  - New `AGUIEmitter.emit()` method for direct event emission
+- **AG-UI Research Example**: Human-in-the-loop research with client-side tool calling
+  - Frontend handles `human_decision` tool calls via AG-UI `TOOL_CALL_*` events
+  - Tool results sent directly to backend `/v1/research/stream` endpoint
+  - Backend queues decisions and continues the research graph
+- **HotpotQA Evaluation**: Added HotpotQA dataset adapter for multi-hop QA benchmarks
+  - Extracts unique documents from validation set context paragraphs
+  - Uses MAP for retrieval evaluation (multiple supporting documents per question)
+  - Run with `evaluations hotpotqa`
+- **Plain Text Format**: Added `format="plain"` for text conversion
+  - Use when content is plain text without markdown/HTML structure
+  - Falls back gracefully when docling cannot detect markdown format in content
+  - Supported in `create_document()`, `convert()`, and all converter classes
+
+### Changed
+
+- **AG-UI Events**: Replaced custom event classes with `ag_ui.core` types
+  - Removed `haiku.rag.graph.agui.events` module
+  - Event factory functions (`emit_*`) now wrap official `ag_ui.core` event classes
+- **Chunker Sets Order**: Chunkers now set `chunk.order` directly
+- **Unified Research Graph**: Simplified and unified research and deep QA into a single configurable graph
+  - Removed `analyze_insights` node - graph now flows directly from `collect_answers` to `decide`
+  - Simplified `EvaluationResult` to: `is_sufficient`, `confidence_score`, `reasoning`, `new_questions`
+  - Simplified `ResearchContext` - removed insight/gap tracking methods
+  - `ask --deep` now uses research graph with `max_iterations=2`, `confidence_threshold=0.0`
+  - `ask --deep` output now shows executive summary, key findings, and sources
+  - Added `include_plan` parameter to `build_research_graph()` for plan-less execution
+  - Added `max_iterations` and `confidence_threshold` overrides to `ResearchState.from_config()`
+- **Improved Synthesis Prompt**: Updated synthesis agent prompt to produce direct answers
+  - Executive summary now directly answers the question instead of describing the report
+  - Added explicit examples of good vs bad output style
+- **Evaluations Vacuum Strategy**: `populate_db` now uses periodic vacuum to prevent disk exhaustion with large datasets
+  - Disables auto_vacuum during population, vacuums every N documents with retention=0
+  - New `--vacuum-interval` CLI option (default: 100) to control vacuum frequency
+  - Prevents disk space issues when building databases with thousands of documents (e.g., HotpotQA)
+- **Benchmarks Documentation**: Restructured benchmarks.md for clarity
+  - Added dedicated Methodology section explaining MRR, MAP, and QA Accuracy metrics
+  - Organized results by dataset with retrieval and QA subsections
+
+### Removed
+
+- **Deep QA Graph**: Removed `haiku.rag.graph.deep_qa` module entirely
+  - Use `build_research_graph()` with appropriate parameters instead
+  - `ask --deep` CLI command now uses research graph internally
+- **Insight/Gap Tracking**: Removed over-engineered insight and gap tracking from research graph
+  - Removed `InsightRecord`, `GapRecord`, `InsightAnalysis`, `InsightStatus`, `GapSeverity` models
+  - Removed `format_analysis_for_prompt()` helper
+  - Removed `INSIGHT_AGENT_PROMPT` from prompts
+
+## [0.20.2] - 2025-12-12
+
+### Fixed
+
+- **LLM Schema Compliance**: Improved prompts to prevent LLMs from returning objects instead of plain strings for `list[str]` fields
+  - All graph prompts now explicitly state that list fields must contain plain strings only
+  - Added missing `query` and `confidence` fields to search agent output format documentation
+  - Fixes validation errors with less capable models that ignore JSON schema constraints
+- **AG-UI Frontend Types**: Fixed TypeScript interfaces in ag-ui-research example to match backend Python models
+  - `EvaluationResult`: `confidence` → `confidence_score`, `should_continue` → `is_sufficient`, `gaps_identified` → `gaps`, `follow_up_questions` → `new_questions`, added `key_insights`
+  - `ResearchReport`: `question` → `title`, `summary` → `executive_summary`, `findings` → `main_findings`, removed `insights_used`/`methodology`, added `limitations`/`recommendations`/`sources_summary`
+  - Updated Final Report UI to display new fields (Recommendations, Limitations, Sources)
+- **Citation Formatting**: Citations in CLI now render properly with Rich panels
+  - Content is rendered as markdown with proper code block formatting
+  - No longer truncates or flattens newlines in citation content
+
+## [0.20.1] - 2025-12-11
+
+### Added
+
+- **Search Filter for Graphs**: Research and Deep QA graphs now support `search_filter` parameter to restrict searches to specific documents
+  - Set `state.search_filter` to a SQL WHERE clause (e.g., `"id IN ('doc1', 'doc2')"`) before running the graph
+  - Enables document-scoped research workflows
+  - CLI: `haiku-rag research "question" --filter "uri LIKE '%paper%'"`
+  - CLI: `haiku-rag ask "question" --filter "title = 'My Doc'"`
+  - Python: `client.ask(question, filter="...")` and `agent.answer(question, filter="...")`
+- **AG-UI Research Example**: Added bidirectional state demonstration with document filter
+  - New `/api/documents` endpoint to list available documents
+  - Frontend document selector component with search and multi-select
+  - Demonstrates client-to-server state flow via AG-UI protocol
+- **Inspector Info Modal**: New `i` keyboard shortcut opens a modal displaying database information
+
+### Changed
+
+- **Inspector Lazy Loading**: Chunks panel now loads chunks in batches of 50 with infinite scroll
+  - Fixes unresponsive UI when viewing documents with large numbers of chunks
+  - New `ChunkRepository.get_by_document_id()` pagination with `limit` and `offset` parameters
+  - New `ChunkRepository.count_by_document_id()` method
+
+## [0.20.0] - 2025-12-10
+
+### Added
+
+- **DoclingDocument Storage**: Full DoclingDocument JSON is now stored with each document, enabling rich context and visual grounding
+  - Documents store the complete DoclingDocument structure (JSON) and schema version
+  - Chunks store metadata with JSON pointer references (`doc_item_refs`), semantic labels, section headings, and page numbers
+  - New `ChunkMetadata` model for structured chunk provenance: `doc_item_refs`, `headings`, `labels`, `page_numbers`
+  - `Document.get_docling_document()` method to parse stored DoclingDocument
+  - `ChunkMetadata.resolve_doc_items()` to resolve JSON pointer refs to actual DocItem objects
+  - `ChunkMetadata.resolve_bounding_boxes()` for visual grounding with page coordinates
+  - LRU cache (100 documents) for parsed DoclingDocument objects to avoid repeated JSON parsing
+- **Enhanced Search Results**: `search()` and `expand_context()` now return full provenance information
+  - `SearchResult` includes `page_numbers`, `headings`, `labels`, and `doc_item_refs`
+  - QA and research agents use provenance for better citations (page numbers, section headings)
+- **Type-Aware Context Expansion**: `expand_context()` now uses document structure for intelligent expansion
+  - Structural content (tables, code blocks, lists) expands to complete structures regardless of chunking
+  - Text content uses radius-based expansion via `text_context_radius` setting
+  - `max_context_items` and `max_context_chars` settings control expansion limits
+  - `SearchResult.format_for_agent()` method formats expanded results with metadata for LLM consumption
+- **Visual Grounding**: View page images with highlighted bounding boxes for chunks
+  - Inspector modal with keyboard navigation between pages
+  - CLI command: `haiku-rag visualize <chunk_id>`
+  - Requires `textual-image` dependency and terminal with image support
+- **Processing Primitives**: New methods for custom document processing pipelines
+  - `convert()` - Convert files, URLs, or text to DoclingDocument
+  - `chunk()` - Chunk a DoclingDocument into Chunk objects
+  - `contextualize()` - Prepend section headings to chunk content for embedding
+  - `embed_chunks()` - Generate embeddings for chunks
+- **New `import_document()` Method**: Import pre-processed documents with custom chunks
+  - Accepts `DoclingDocument` directly for rich metadata (visual grounding, page numbers)
+  - Use when document conversion, chunking, or embedding were done externally
+  - Chunks without embeddings are automatically embedded
+- **Automatic Chunk Embedding**: `import_document()` and `update_document()` automatically embed chunks that don't have embeddings
+  - Pass chunks with or without embeddings - missing embeddings are generated
+  - Chunks with pre-computed embeddings are stored as-is
+- **Format Parameter for Text Conversion**: New `format` parameter for `convert()` and `create_document()` to specify content type
+  - Supports `"md"` (default) for markdown and `"html"` for HTML content
+  - HTML format preserves document structure (headings, lists, sections) in DoclingDocument
+  - Enables proper parsing of HTML content that was previously treated as plain text
+- **Inspector Context Modal**: Press `c` in the inspector to view expanded context for the selected chunk
+- **Auto-Vacuum Configuration**: New `storage.auto_vacuum` setting to control automatic vacuuming behavior
+  - When `true` (default), vacuum runs automatically after document create/update operations and rebuilds
+  - When `false`, vacuum only runs via explicit `haiku-rag vacuum` command
+  - Disabling can help avoid potential crashes in high-concurrency scenarios due to LanceDB race conditions
+
+### Changed
+
+- **BREAKING: `create_document()` API**: Removed `chunks` parameter
+  - `create_document()` now always processes content (converts, chunks, embeds)
+  - Use `import_document()` for pre-processed documents with custom chunks
+- **BREAKING: `update_document()` API**: Unified with `update_document_fields()`
+  - Old: `update_document(document)` - pass modified Document object
+  - New: `update_document(document_id, content=, metadata=, chunks=, title=, docling_document=)`
+  - `content` and `docling_document` are mutually exclusive
+- **BREAKING: Chunker Interface**: `DocumentChunker.chunk()` now returns `list[Chunk]` instead of `list[str]`
+  - Chunks include structured metadata (doc_item_refs, labels, headings, page_numbers)
+- **Search Config**: New settings in `search` section for search behavior and context expansion
+  - `search.limit` - Default number of search results (default: 5). Used by CLI, MCP server, and API when no limit specified
+  - `search.context_radius` - DocItems before/after to include for text content expansion (default: 0)
+  - `search.max_context_items` - Maximum items in expanded context (default: 10)
+  - `search.max_context_chars` - Maximum characters in expanded context (default: 10000)
+- **Rebuild Performance**: Batched database writes during `rebuild` command reduce LanceDB versions by ~98%
+  - All rebuild modes (FULL, RECHUNK, EMBED_ONLY) now batch writes across documents
+  - Eliminates redundant per-document chunk deletions and vacuum calls
+  - Significantly reduces storage overhead and improves rebuild speed for large databases
+- **Embedding Architecture**: Moved embedding generation from `ChunkRepository` to client layer
+  - Repository is now a pure persistence layer
+  - Client handles embedding via `_ensure_chunks_embedded()`
+- **Chunk Text Storage**: Chunks store raw text; headings prepended only at embedding time
+  - Stored chunk content stays clean without duplicate heading prefixes
+  - Local and serve chunkers now produce identical output
+- **Citation Models**: Introduced `RawSearchAnswer` for LLM output, `SearchAnswer` with resolved citations
+- **Page Image Generation**: Always enabled for local docling converter (required for visual grounding)
+- **Download Models Progress**: `haiku-rag download-models` now shows real-time progress with Rich progress bars for Ollama model downloads
+
+### Removed
+
+- **BREAKING: `markdown_preprocessor` Config Option**: Use processing primitives (`convert()`, `chunk()`, `embed_chunks()`) for custom pipelines
+- **`update_document_fields()`**: Merged into `update_document()`
+
+### Migration
+
+This release requires a database rebuild to populate the new DoclingDocument fields:
+
+```bash
+haiku-rag rebuild
+```
+
+Existing documents without DoclingDocument data will work but won't have provenance information.
+
+## [0.19.6] - 2025-12-03
+
+### Changed
+
+- **BREAKING: Explicit Database Creation**: Databases must now be explicitly created before use
+  - New `haiku-rag init` command creates a new empty database
+  - Python API: `HaikuRAG(path, create=True)` to create database programmatically
+  - Operations on non-existent databases raise `FileNotFoundError`
+- **BREAKING: Embeddings Configuration**: Restructured to nested `EmbeddingModelConfig`
+  - Config path changed from `embeddings.{provider, model, vector_dim}` to `embeddings.model.{provider, name, vector_dim}`
+  - Automatic migration upgrades existing databases to new format
+- **Database Migrations**: Always run when opening an existing database
+
+## [0.19.5] - 2025-12-01
+
+### Changed
+
+- **Rebuild Performance**: Optimized `rebuild --embed-only` to use batch updates via LanceDB's `merge_insert` instead of individual chunk updates, and skip chunks with unchanged embeddings
+
+## [0.19.4] - 2025-11-28
+
+### Added
+
+- **Rebuild Modes**: New options for `rebuild` command to control what gets rebuilt
+  - `--embed-only`: Only regenerate embeddings, keeping existing chunks (fastest option when changing embedding model)
+  - `--rechunk`: Re-chunk from existing document content without accessing source files
+  - Default (no flag): Full rebuild with source file re-conversion
+  - Python API: `rebuild_database(mode=RebuildMode.EMBED_ONLY | RECHUNK | FULL)`
+
+## [0.19.3] - 2025-11-27
+
+### Changed
+
+- **Async Chunker**: `DoclingServeChunker` now uses `httpx.AsyncClient` instead of sync `requests`
+
+### Fixed
+
+- **OCR Options**: Fixed `DoclingLocalConverter` using base `OcrOptions` class which docling's OCR factory doesn't recognize. Now uses `OcrAutoOptions` for automatic OCR engine selection.
+- **Dependencies**: Added `opencv-python-headless` to the `docling` optional dependency for table structure detection.
+
+## [0.19.2] - 2025-11-27
+
+### Changed
+
+- **Async Converters**: Made document converters fully async
+  - `BaseConverter.convert_file()` and `convert_text()` are now async methods
+  - `DoclingLocalConverter` wraps blocking Docling operations with `asyncio.to_thread()`
+  - `DoclingServeConverter` now uses `httpx.AsyncClient` instead of sync `requests`
+- **Async Model Prefetch**: `prefetch_models()` is now async
+  - Uses `httpx.AsyncClient` for Ollama model pulls
+  - Wraps blocking Docling and HuggingFace downloads with `asyncio.to_thread()`
+
+## [0.19.1] - 2025-11-26
+
+### Added
+
+- **LM Studio Provider**: Added support for LM Studio as a provider for embeddings and QA/research models
+  - Configure with `provider: lm_studio` in embeddings, QA, or research model settings
+  - Supports thinking control for reasoning models (gpt-oss, etc.)
+  - Default base URL: `http://localhost:1234`
+
+### Fixed
+
+- **Configuration**: Fixed `init-config` command generating invalid configuration files (#165)
+  - Refactored `generate_default_config()` to use Pydantic model serialization instead of manual dict construction
+  - Updated `qa`, `research`, and `reranking` sections to use new `ModelConfig` structure
+
+## [0.19.0] - 2025-11-25
+
+### Added
+
+- **Model Customization**: Added support for per-model configuration settings
+  - New `enable_thinking` parameter to control reasoning behavior (true/false/None)
+  - Support for `temperature` and `max_tokens` settings on QA and research models
+  - All settings apply to any provider that supports them
+- **Database Inspector**: New `inspect` CLI command launches interactive TUI for browsing documents and chunks & searching
+- **Evaluations**: Added `evaluations` CLI script for running benchmarks (replaces `python -m evaluations.benchmark`)
+- **Evaluations**: Added `--db` option to override evaluation database path
+  - Default database location moved to haiku.rag data directory:
+    - macOS: `~/Library/Application Support/haiku.rag/evaluations/dbs/`
+    - Linux: `~/.local/share/haiku.rag/evaluations/dbs/`
+    - Windows: `C:/Users/<USER>/AppData/Roaming/haiku.rag/evaluations/dbs/`
+  - Previously stored in `evaluations/data/` within the repository
+- **Evaluations**: Added comprehensive experiment metadata tracking for better reproducibility
+  - Records dataset name, test case count, and all model configurations
+  - Tracks embedder settings: provider, model, and vector dimensions
+  - Tracks QA model: provider and model name
+  - Tracks judge model: provider and model name for LLM evaluation
+  - Tracks processing parameters: `chunk_size` and `context_chunk_radius`
+  - Tracks retrieval configuration: `retrieval_limit` for number of chunks retrieved
+  - Tracks reranking configuration: `rerank_provider` and `rerank_model`
+  - Enables comparison of evaluation runs with different configurations in Logfire
+- **Evaluations**: Refactored retrieval evaluation to use pydantic-ai experiment framework
+  - New `evaluators` module with `MRREvaluator` (Mean Reciprocal Rank) and `MAPEvaluator` (Mean Average Precision)
+  - Retrieval benchmarks now use `Dataset.evaluate()` with full Logfire experiment tracking
+  - Dataset specifications now declare their retrieval evaluator (MRR for RepliQA, MAP for Wix)
+  - Replaced Recall@K and Success@K with industry-standard MRR and MAP metrics
+  - Unified evaluation framework for both retrieval and QA benchmarks
+- **AG-UI Events**: Enhanced ActivitySnapshot events with richer structured data
+  - Added `stepName` field to identify which graph node emitted each activity
+  - Added structured fields to activity content while preserving backward-compatible `message` field:
+    - **Planning**: `sub_questions` - list of sub-question strings
+    - **Searching**: `query` - the search query, `confidence` - answer confidence (on success), `error` - error message (on failure)
+    - **Analyzing** (research): `insights` - list of insight objects, `gaps` - list of gap objects, `resolved_gaps` - list of resolved gap strings
+    - **Evaluating** (research): `confidence` - confidence score, `is_sufficient` - sufficiency flag
+    - **Evaluating** (deep QA): `is_sufficient` - sufficiency flag, `iterations` - iteration count
+
+### Changed
+
+- **Evaluations**: Renamed `--qa-limit` CLI parameter to `--limit`, now applies to both retrieval and QA benchmarks
+- **Evaluations**: Retrieval evaluator selection moved from runtime logic to dataset configuration
+
+## [0.18.0] - 2025-11-21
+
+### Added
+
+- **Manual Vector Indexing**: New `create-index` CLI command for explicit vector index creation
+  - Creates IVF_PQ indexes
+  - Requires minimum 256 chunks (LanceDB training data requirement)
+  - New `search.vector_index_metric` config option: `cosine` (default), `l2`, or `dot`
+  - New `search.vector_refine_factor` config option (default: 30) for accuracy/speed tradeoff
+  - Indexes not created automatically during ingestion to avoid performance degradation
+  - Manual rebuilding required after adding significant new data
+- **Enhanced Info Command**: `haiku-rag info` now shows storage sizes and vector index statistics
+  - Displays storage size for documents and chunks tables in human-readable format
+  - Shows vector index status (exists/not created)
+  - Shows indexed and unindexed chunk counts for monitoring index staleness
+
+### Changed
+
+- **BREAKING: Default Embedding Model**: Changed default embedding model from `qwen3-embedding` to `qwen3-embedding:4b` with vector dimension 2560 (previously 4096)
+  - New installations will use the smaller, more efficient 4B parameter model by default
+  - **Action required**: Existing databases created with the old default will be incompatible. Users must either:
+    - Explicitly set `embeddings.model: "qwen3-embedding"` and `embeddings.vector_dim: 4096` in their config to maintain compatibility with existing databases
+    - Or run `haiku-rag rebuild` to re-embed all documents with the new default
+  - This change provides better performance for most use cases while reducing resource requirements
+- **Evaluations**: Improved evaluation dataset naming and simplified evaluator configuration
+  - `EvalDataset` now accepts dataset name for better organization in Logfire
+  - Added `--name` CLI parameter to override evaluation run names
+  - Removed `IsInstance` evaluator, using only `LLMJudge` for QA evaluation
+- **Search Accuracy**: Applied `refine_factor` to vector and hybrid searches for improved accuracy
+  - Retrieves `refine_factor * limit` candidates and re-ranks in memory
+  - Higher values increase accuracy but slow down queries
+
+### Fixed
+
+- **AG-UI Activity Events**: Activity events now correctly use structured dict content instead of strings
+- **Graph Configuration**: Graph builder functions now properly accept and use non-global config (#149)
+  - `build_research_graph()` and `build_deep_qa_graph()` now pass config to all agents and model creation
+  - `get_model()` utility function accepts `config` parameter (defaults to global Config)
+  - Allows creating multiple graphs with different configurations in the same application
+
+
+## [0.17.2] - 2025-11-19
+
+### Added
+
+- **Document Update API**: New `update_document_fields()` method for partial document updates
+  - Update individual fields (content, metadata, title, chunks) without fetching full document
+  - Support for custom chunks or auto-generation from content
+
+### Changed
+
+- **Chunk Creation**: `ChunkRepository.create()` now accepts both single chunks and lists for batch insertion
+  - Batch insertion reduces LanceDB version creation when adding multiple chunks with custom chunks
+  - Batch embedding generation for improved performance with multiple chunks
+- Updated core dependencies
+
+## [0.17.1] - 2025-11-18
+
+### Added
+
+- **Conversion Options**: Fine-grained control over document conversion for both local and remote converters
+  - New `conversion_options` config section in `ProcessingConfig`
+  - OCR settings: `do_ocr`, `force_ocr`, `ocr_lang` for controlling OCR behavior
+  - Table extraction: `do_table_structure`, `table_mode` (fast/accurate), `table_cell_matching`
+  - Image settings: `images_scale` to control image resolution
+  - Options work identically with both `docling-local` and `docling-serve` converters
+
+### Changed
+
+- Increase reranking candidate retrieval multiplier from 3x to 10x for improved result quality
+- **Docker Images**: Main `haiku.rag` image no longer automatically built and published
+- **Conversion Options**: Removed the legacy `pdf_backend` setting; docling now chooses the optimal backend automatically
+
+## [0.17.0] - 2025-11-17
+
+### Added
+
+- **Remote Processing**: Support for docling-serve as remote document processing and chunking service
+  - New `converter` config option: `docling-local` (default) or `docling-serve`
+  - New `chunker` config option: `docling-local` (default) or `docling-serve`
+  - New `providers.docling_serve` config section with `base_url`, `api_key`, and `timeout`
+  - Comprehensive error handling for connection, timeout, and authentication issues
+- **Chunking Strategies**: Support for both hybrid and hierarchical chunking
+  - New `chunker_type` config option: `hybrid` (default) or `hierarchical`
+  - Hybrid chunking: Structure-aware splitting that respects document boundaries
+  - Hierarchical chunking: Preserves document hierarchy for nested documents
+- **Table Serialization Control**: Configurable table representation in chunks
+  - New `chunking_use_markdown_tables` config option (default: `false`)
+  - `false`: Tables serialized as narrative text ("Value A, Column 2 = Value B")
+  - `true`: Tables preserved as markdown format with structure
+- **Chunking Configuration**: Additional chunking control options
+  - New `chunking_merge_peers` config option (default: `true`) to merge undersized successive chunks
+- **Docker Images**: Two Docker images for different deployment scenarios
+  - `haiku.rag`: Full image with all dependencies for self-contained deployments
+  - `haiku.rag-slim`: Minimal image designed for use with external docling-serve
+  - Multi-platform support (linux/amd64, linux/arm64)
+  - Docker Compose examples with docling-serve integration
+  - Automated CI/CD workflows for both images
+  - Build script (`scripts/build-docker-images.sh`) for local multi-platform builds
+
+### Changed
+
+- **BREAKING: Chunking Tokenizer**: Switched from tiktoken to HuggingFace tokenizers for consistency with docling-serve
+  - Default tokenizer changed from tiktoken "gpt-4o" to "Qwen/Qwen3-Embedding-0.6B"
+  - New `chunking_tokenizer` config option in `ProcessingConfig` for customization
+  - `download-models` CLI command now also downloads the configured HuggingFace tokenizer
+- **Docker Examples**: Updated examples to demonstrate remote processing
+  - `examples/docker` now uses slim image with docling-serve
+  - `examples/ag-ui-research` backend uses slim image with docling-serve
+  - Configuration examples include remote processing setup
+
+## [0.16.1] - 2025-11-14
+
+### Changed
+
+- **Evaluations**: Refactored QA benchmark to run entire dataset as single evaluation for better Logfire experiment tracking
+- **Evaluations**: Added `.env` file loading support via `python-dotenv` dependency
+
+## [0.16.0] - 2025-11-13
+
+### Added
+
+- **AG-UI Protocol Support**: Full AG-UI (Agent-UI) protocol implementation for graph execution with event streaming
+  - New `AGUIEmitter` class for emitting AG-UI events from graphs
+  - Support for all AG-UI event types: lifecycle events (`RUN_STARTED`, `RUN_FINISHED`, `RUN_ERROR`), step events (`STEP_STARTED`, `STEP_FINISHED`), state updates (`STATE_SNAPSHOT`, `STATE_DELTA`), activity narration (`ACTIVITY_SNAPSHOT`), and text messages (`TEXT_MESSAGE_CHUNK`)
+  - `AGUIConsoleRenderer` for rendering AG-UI event streams to terminal with Rich formatting
+  - `stream_graph()` utility function for executing graphs with AG-UI event emission
+  - State diff computation for efficient state synchronization
+  - **Delta State Updates**: AG-UI emitter now supports incremental state updates via JSON Patch operations (`STATE_DELTA` events) to reduce bandwidth, configurable via `use_deltas` parameter (enabled by default)
+- **AG-UI Server**: Starlette-based HTTP server for serving graphs via AG-UI protocol
+  - Server-Sent Events (SSE) streaming endpoint at `/v1/agent/stream`
+  - Health check endpoint at `/health`
+  - Full CORS support configurable via `agui` config section
+  - `create_agui_server()` function for programmatic server creation
+- **Deep QA AG-UI Support**: Deep QA graph now fully supports AG-UI event streaming
+  - Integration with `AGUIEmitter` for progress tracking
+  - Step-by-step execution visibility via AG-UI events
+- **CLI AG-UI Flag**: New `--agui` flag for `serve` command to start AG-UI server
+- **Graph Module**: New unified `haiku.rag.graph` module containing all graph-related functionality
+- **Common Graph Nodes**: New factory functions (`create_plan_node`, `create_search_node`) in `haiku.rag.graph.common.nodes` for reusable graph components
+- **AG-UI Research Example**: New full-stack example (`examples/ag-ui-research`) demonstrating agent+graph architecture with CopilotKit frontend
+  - Pydantic AI agent with research tool that invokes the research graph
+  - Custom AG-UI streaming endpoint with anyio memory streams
+  - React/Next.js frontend with split-pane UI showing live research state
+  - Real-time progress tracking of questions, answers, insights, and gaps
+  - Docker Compose setup for easy local development
+
+### Changed
+
+- **Vacuum Retention**: Default `vacuum_retention_seconds` increased from 60 seconds to 86400 seconds (1 day) for better version retention in typical workflows
+- **BREAKING**: Major refactoring of graph-related code into unified `haiku.rag.graph` module structure:
+  - `haiku.rag.research` → `haiku.rag.graph.research`
+  - `haiku.rag.qa.deep` → `haiku.rag.graph.deep_qa`
+  - `haiku.rag.agui` → `haiku.rag.graph.agui`
+  - `haiku.rag.graph_common` → `haiku.rag.graph.common`
+- **BREAKING**: Research and Deep QA graphs now use AG-UI event protocol instead of direct console logging
+  - Removed `console` and `stream` parameters from graph dependencies
+  - All progress updates now emit through `AGUIEmitter`
+- **BREAKING**: `ResearchState` converted from dataclass to Pydantic `BaseModel` for JSON serialization and AG-UI compatibility
+- Research and Deep QA graphs now emit detailed execution events for better observability
+- CLI research command now uses AG-UI event rendering for `--verbose` output
+- Improved graph execution visibility with step-by-step progress tracking
+- Updated all documentation to reflect new import paths and AG-UI usage
+- Updated examples (ag-ui-research, a2a-server) to use new import paths
+
+### Fixed
+
+- **Document Creation**: Optimized `create_document` to skip unnecessary DoclingDocument conversion when chunks are pre-provided
+- **FileReader**: Error messages now include both original exception details and file path for easier debugging
+- **Database Auto-creation**: Read operations (search, list, get, ask, research) no longer auto-create empty databases. Write operations (add, add-src, delete, rebuild) still create the database as needed. This prevents the confusing scenario where a search query creates an empty database. Fixes issue #137.
+
+### Removed
+
+- **BREAKING**: Removed `disable_autocreate` config option - the behavior is now automatic based on operation type
+- **BREAKING**: Removed legacy `ResearchStream` and `ResearchStreamEvent` classes (replaced by AG-UI event protocol)
+
+## [0.15.0] - 2025-11-07
+
+### Added
+
+- **File Monitor**: Orphan deletion feature - automatically removes documents from database when source files are deleted (enabled via `monitor.delete_orphans` config option, default: false)
+
+### Changed
+
+- **Configuration**: All CLI commands now properly support `--config` parameter for specifying custom configuration files
+- Configuration loading consolidated across CLI, app, and client with consistent resolution order
+- `HaikuRAGApp` and MCP server now accept `config` parameter for programmatic configuration
+- Updated CLI documentation to clarify global vs per-command options
+- **BREAKING**: Standardized configuration filename to `haiku.rag.yaml` in user directories (was incorrectly using `config.yaml`). Users with existing `config.yaml` in their user directory will need to rename it to `haiku.rag.yaml`
+
+### Fixed
+
+- **File Monitor**: Fixed incorrect "Updated document" logging for unchanged files - monitor now properly skips files when MD5 hash hasn't changed
+
+### Removed
+
+- **BREAKING**: A2A (Agent-to-Agent) protocol support has been moved to a separate self-contained package in `examples/a2a-server/`. The A2A server is no longer part of the main haiku.rag package. Users who need A2A functionality can install and run it from the examples directory with `cd examples/a2a-server && uv sync`.
+- **BREAKING**: Removed deprecated `.env`-based configuration system. The `haiku-rag init-config --from-env` command and `load_config_from_env()` function have been removed. All configuration must now be done via YAML files. Environment variables for API keys (e.g., `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`) and service URLs (e.g., `OLLAMA_BASE_URL`) are still supported and can be set via `.env` files.
+
+## [0.14.1] - 2025-11-06
+
+### Added
+
+- Migrated research and deep QA agents to use Pydantic Graph beta API for better graph execution
+- Automatic semaphore-based concurrency control for parallel sub-question processing
+- `max_concurrency` parameter for controlling parallel execution in research and deep QA (default: 1)
+
+### Changed
+
+- **BREAKING**: Research and Deep QA graphs now use `pydantic_graph.beta` instead of the class-based graph implementation
+- Refactored graph common patterns into `graph_common` module
+- Sub-questions now process using `.map()` for true parallel execution
+- Improved graph structure with cleaner node definitions and flow control
+- Pinned critical dependencies: `docling-core`, `lancedb`, `docling`
+
+## [0.14.0] - 2024-11-05
+
+### Added
+
+- New `haiku.rag-slim` package with minimal dependencies for users who want to install only what they need
+- Evaluations package (`haiku.rag-evals`) for internal benchmarking and testing
+- Improved search filtering performance by using pandas DataFrames for joins instead of SQL WHERE IN clauses
+
+### Changed
+
+- **BREAKING**: Restructured project into UV workspace with three packages:
+  - `haiku.rag-slim` - Core package with minimal dependencies
+  - `haiku.rag` - Full package with all extras (recommended for most users)
+  - `haiku.rag-evals` - Internal benchmarking and evaluation tools
+- Migrated from `pydantic-ai` to `pydantic-ai-slim` with extras system
+- Docling is now an optional dependency (install with `haiku.rag-slim[docling]`)
+- Package metadata checks now use `haiku.rag-slim` (always present) instead of `haiku.rag`
+- Docker image optimized: removed evaluations package, reducing installed packages from 307 to 259
+- Improved vector search performance through optimized score normalization
+
+### Fixed
+
+- ImportError now properly raised when optional docling dependency is missing
+
+## [0.13.3] - 2024-11-04
+
+### Added
+
+- Support for Zero Entropy reranker
+- Filter parameter to `search()` for filtering documents before search
+- Filter parameter to CLI `search` command
+- Filter parameter to CLI `list` command for filtering document listings
+- Config option to pass custom configuration files to evaluation commands
+- Document filtering now respects configured include/exclude patterns when using `add-src` with directories
+- Max retries to insight_agent when producing structured output
+
+### Fixed
+
+- CLI now loads `.env` files at startup
+- Info command no longer attempts to use deprecated `.env` settings
+- Documentation typos
+
+## [0.13.2] - 2024-11-04
+
+### Added
+
+- Gitignore-style pattern filtering for file monitoring using pathspec
+- Include/exclude pattern documentation for FileMonitor
+
+### Changed
+
+- Moved monitor configuration to its own section in config
+- Improved configuration documentation
+- Updated dependencies
+
+## [0.13.1] - 2024-11-03
+
+### Added
+
+- Initial version tracking
+
+[Unreleased]: https://github.com/ggozad/haiku.rag/compare/0.109.0...HEAD
+[0.109.0]: https://github.com/ggozad/haiku.rag/compare/0.108.0...0.109.0
+[0.108.0]: https://github.com/ggozad/haiku.rag/compare/0.107.0...0.108.0
+[0.107.0]: https://github.com/ggozad/haiku.rag/compare/0.106.0...0.107.0
+[0.106.0]: https://github.com/ggozad/haiku.rag/compare/0.105.0...0.106.0
+[0.105.0]: https://github.com/ggozad/haiku.rag/compare/0.104.0...0.105.0
+[0.104.0]: https://github.com/ggozad/haiku.rag/compare/0.103.0...0.104.0
+[0.103.0]: https://github.com/ggozad/haiku.rag/compare/0.102.0...0.103.0
+[0.102.0]: https://github.com/ggozad/haiku.rag/compare/0.101.2...0.102.0
+[0.101.2]: https://github.com/ggozad/haiku.rag/compare/0.101.1...0.101.2
+[0.101.1]: https://github.com/ggozad/haiku.rag/compare/0.101.0...0.101.1
+[0.101.0]: https://github.com/ggozad/haiku.rag/compare/0.100.0...0.101.0
+[0.100.0]: https://github.com/ggozad/haiku.rag/compare/0.99.0...0.100.0
+[0.99.0]: https://github.com/ggozad/haiku.rag/compare/0.98.0...0.99.0
+[0.98.0]: https://github.com/ggozad/haiku.rag/compare/0.97.0...0.98.0
+[0.97.0]: https://github.com/ggozad/haiku.rag/compare/0.96.1...0.97.0
+[0.96.1]: https://github.com/ggozad/haiku.rag/compare/0.96.0...0.96.1
+[0.96.0]: https://github.com/ggozad/haiku.rag/compare/0.95.0...0.96.0
+[0.95.0]: https://github.com/ggozad/haiku.rag/compare/0.94.0...0.95.0
+[0.94.0]: https://github.com/ggozad/haiku.rag/compare/0.93.0...0.94.0
+[0.93.0]: https://github.com/ggozad/haiku.rag/compare/0.92.0...0.93.0
+[0.92.0]: https://github.com/ggozad/haiku.rag/compare/0.91.0...0.92.0
+[0.91.0]: https://github.com/ggozad/haiku.rag/compare/0.90.0...0.91.0
+[0.90.0]: https://github.com/ggozad/haiku.rag/compare/0.89.0...0.90.0
+[0.89.0]: https://github.com/ggozad/haiku.rag/compare/0.88.2...0.89.0
+[0.88.2]: https://github.com/ggozad/haiku.rag/compare/0.88.1...0.88.2
+[0.88.1]: https://github.com/ggozad/haiku.rag/compare/0.88.0...0.88.1
+[0.88.0]: https://github.com/ggozad/haiku.rag/compare/0.87.0...0.88.0
+[0.87.0]: https://github.com/ggozad/haiku.rag/compare/0.86.0...0.87.0
+[0.86.0]: https://github.com/ggozad/haiku.rag/compare/0.85.0...0.86.0
+[0.85.0]: https://github.com/ggozad/haiku.rag/compare/0.84.0...0.85.0
+[0.84.0]: https://github.com/ggozad/haiku.rag/compare/0.83.0...0.84.0
+[0.83.0]: https://github.com/ggozad/haiku.rag/compare/0.82.1...0.83.0
+[0.82.1]: https://github.com/ggozad/haiku.rag/compare/0.82.0...0.82.1
+[0.82.0]: https://github.com/ggozad/haiku.rag/compare/0.81.0...0.82.0
+[0.81.0]: https://github.com/ggozad/haiku.rag/compare/0.80.0...0.81.0
+[0.80.0]: https://github.com/ggozad/haiku.rag/compare/0.79.0...0.80.0
+[0.79.0]: https://github.com/ggozad/haiku.rag/compare/0.78.0...0.79.0
+[0.78.0]: https://github.com/ggozad/haiku.rag/compare/0.77.0...0.78.0
+[0.77.0]: https://github.com/ggozad/haiku.rag/compare/0.77.0...0.77.0
+[0.77.0]: https://github.com/ggozad/haiku.rag/compare/0.76.0...0.77.0
+[0.76.0]: https://github.com/ggozad/haiku.rag/compare/0.75.0...0.76.0
+[0.75.0]: https://github.com/ggozad/haiku.rag/compare/0.74.0...0.75.0
+[0.74.0]: https://github.com/ggozad/haiku.rag/compare/0.73.0...0.74.0
+[0.73.0]: https://github.com/ggozad/haiku.rag/compare/0.72.1...0.73.0
+[0.72.1]: https://github.com/ggozad/haiku.rag/compare/0.72.0...0.72.1
+[0.72.0]: https://github.com/ggozad/haiku.rag/compare/0.71.0...0.72.0
+[0.71.0]: https://github.com/ggozad/haiku.rag/compare/0.70.0...0.71.0
+[0.70.0]: https://github.com/ggozad/haiku.rag/compare/0.69.0...0.70.0
+[0.69.0]: https://github.com/ggozad/haiku.rag/compare/0.68.0...0.69.0
+[0.68.0]: https://github.com/ggozad/haiku.rag/compare/0.67.3...0.68.0
+[0.67.3]: https://github.com/ggozad/haiku.rag/compare/0.67.2...0.67.3
+[0.67.2]: https://github.com/ggozad/haiku.rag/compare/0.67.1...0.67.2
+[0.67.1]: https://github.com/ggozad/haiku.rag/compare/0.67.0...0.67.1
+[0.67.0]: https://github.com/ggozad/haiku.rag/compare/0.67.0...0.67.0
+[0.67.0]: https://github.com/ggozad/haiku.rag/compare/0.67.0...0.67.0
+[0.67.0]: https://github.com/ggozad/haiku.rag/compare/0.66.0...0.67.0
+[0.66.0]: https://github.com/ggozad/haiku.rag/compare/0.65.1...0.66.0
+[0.65.1]: https://github.com/ggozad/haiku.rag/compare/0.65.0...0.65.1
+[0.65.0]: https://github.com/ggozad/haiku.rag/compare/0.64.0...0.65.0
+[0.64.0]: https://github.com/ggozad/haiku.rag/compare/0.63.2...0.64.0
+[0.63.2]: https://github.com/ggozad/haiku.rag/compare/0.63.1...0.63.2
+[0.63.1]: https://github.com/ggozad/haiku.rag/compare/0.63.0...0.63.1
+[0.63.0]: https://github.com/ggozad/haiku.rag/compare/0.62.1...0.63.0
+[0.62.1]: https://github.com/ggozad/haiku.rag/compare/0.62.0...0.62.1
+[0.62.0]: https://github.com/ggozad/haiku.rag/compare/0.61.2...0.62.0
+[0.61.2]: https://github.com/ggozad/haiku.rag/compare/0.61.1...0.61.2
+[0.61.1]: https://github.com/ggozad/haiku.rag/compare/0.61.0...0.61.1
+[0.61.0]: https://github.com/ggozad/haiku.rag/compare/0.60.0...0.61.0
+[0.60.0]: https://github.com/ggozad/haiku.rag/compare/0.59.1...0.60.0
+[0.59.1]: https://github.com/ggozad/haiku.rag/compare/0.59.0...0.59.1
+[0.59.0]: https://github.com/ggozad/haiku.rag/compare/0.58.0...0.59.0
+[0.58.0]: https://github.com/ggozad/haiku.rag/compare/0.57.0...0.58.0
+[0.57.0]: https://github.com/ggozad/haiku.rag/compare/0.56.0...0.57.0
+[0.56.0]: https://github.com/ggozad/haiku.rag/compare/0.55.1...0.56.0
+[0.55.1]: https://github.com/ggozad/haiku.rag/compare/0.55.0...0.55.1
+[0.55.0]: https://github.com/ggozad/haiku.rag/compare/0.54.0...0.55.0
+[0.54.0]: https://github.com/ggozad/haiku.rag/compare/0.53.0...0.54.0
+[0.53.0]: https://github.com/ggozad/haiku.rag/compare/0.52.0...0.53.0
+[0.52.0]: https://github.com/ggozad/haiku.rag/compare/0.51.0...0.52.0
+[0.51.0]: https://github.com/ggozad/haiku.rag/compare/0.50.0...0.51.0
+[0.50.0]: https://github.com/ggozad/haiku.rag/compare/0.48.1...0.50.0
+[0.48.1]: https://github.com/ggozad/haiku.rag/compare/0.48.0...0.48.1
+[0.48.0]: https://github.com/ggozad/haiku.rag/compare/0.47.0...0.48.0
+[0.47.0]: https://github.com/ggozad/haiku.rag/compare/0.46.0...0.47.0
+[0.46.0]: https://github.com/ggozad/haiku.rag/compare/0.45.0...0.46.0
+[0.45.0]: https://github.com/ggozad/haiku.rag/compare/0.44.0...0.45.0
+[0.44.0]: https://github.com/ggozad/haiku.rag/compare/0.43.1...0.44.0
+[0.43.1]: https://github.com/ggozad/haiku.rag/compare/0.43.0...0.43.1
+[0.43.0]: https://github.com/ggozad/haiku.rag/compare/0.42.1...0.43.0
+[0.42.1]: https://github.com/ggozad/haiku.rag/compare/0.42.0...0.42.1
+[0.42.0]: https://github.com/ggozad/haiku.rag/compare/0.41.0...0.42.0
+[0.41.0]: https://github.com/ggozad/haiku.rag/compare/0.40.1...0.41.0
+[0.40.1]: https://github.com/ggozad/haiku.rag/compare/0.39.0...0.40.1
+[0.39.0]: https://github.com/ggozad/haiku.rag/compare/0.38.0...0.39.0
+[0.38.0]: https://github.com/ggozad/haiku.rag/compare/0.37.0...0.38.0
+[0.37.0]: https://github.com/ggozad/haiku.rag/compare/0.36.3...0.37.0
+[0.36.3]: https://github.com/ggozad/haiku.rag/compare/0.36.2...0.36.3
+[0.36.2]: https://github.com/ggozad/haiku.rag/compare/0.36.1...0.36.2
+[0.36.1]: https://github.com/ggozad/haiku.rag/compare/0.36.0...0.36.1
+[0.36.0]: https://github.com/ggozad/haiku.rag/compare/0.35.1...0.36.0
+[0.35.1]: https://github.com/ggozad/haiku.rag/compare/0.35.0...0.35.1
+[0.35.0]: https://github.com/ggozad/haiku.rag/compare/0.34.1...0.35.0
+[0.34.1]: https://github.com/ggozad/haiku.rag/compare/0.34.0...0.34.1
+[0.34.0]: https://github.com/ggozad/haiku.rag/compare/0.33.3...0.34.0
+[0.33.3]: https://github.com/ggozad/haiku.rag/compare/0.33.2...0.33.3
+[0.33.2]: https://github.com/ggozad/haiku.rag/compare/0.33.1...0.33.2
+[0.33.1]: https://github.com/ggozad/haiku.rag/compare/0.33.0...0.33.1
+[0.33.0]: https://github.com/ggozad/haiku.rag/compare/0.32.3...0.33.0
+[0.32.3]: https://github.com/ggozad/haiku.rag/compare/0.32.2...0.32.3
+[0.32.2]: https://github.com/ggozad/haiku.rag/compare/0.32.1...0.32.2
+[0.32.1]: https://github.com/ggozad/haiku.rag/compare/0.32.0...0.32.1
+[0.32.0]: https://github.com/ggozad/haiku.rag/compare/0.31.1...0.32.0
+[0.31.1]: https://github.com/ggozad/haiku.rag/compare/0.31.0...0.31.1
+[0.31.0]: https://github.com/ggozad/haiku.rag/compare/0.30.2...0.31.0
+[0.30.2]: https://github.com/ggozad/haiku.rag/compare/0.30.1...0.30.2
+[0.30.1]: https://github.com/ggozad/haiku.rag/compare/0.30.0...0.30.1
+[0.30.0]: https://github.com/ggozad/haiku.rag/compare/0.29.1...0.30.0
+[0.29.1]: https://github.com/ggozad/haiku.rag/compare/0.29.0...0.29.1
+[0.29.0]: https://github.com/ggozad/haiku.rag/compare/0.28.0...0.29.0
+[0.28.0]: https://github.com/ggozad/haiku.rag/compare/0.27.2...0.28.0
+[0.27.2]: https://github.com/ggozad/haiku.rag/compare/0.27.1...0.27.2
+[0.27.1]: https://github.com/ggozad/haiku.rag/compare/0.27.0...0.27.1
+[0.27.0]: https://github.com/ggozad/haiku.rag/compare/0.26.9...0.27.0
+[0.26.9]: https://github.com/ggozad/haiku.rag/compare/0.26.8...0.26.9
+[0.26.8]: https://github.com/ggozad/haiku.rag/compare/0.26.7...0.26.8
+[0.26.7]: https://github.com/ggozad/haiku.rag/compare/0.26.6...0.26.7
+[0.26.6]: https://github.com/ggozad/haiku.rag/compare/0.26.5...0.26.6
+[0.26.5]: https://github.com/ggozad/haiku.rag/compare/0.26.4...0.26.5
+[0.26.4]: https://github.com/ggozad/haiku.rag/compare/0.26.3...0.26.4
+[0.26.3]: https://github.com/ggozad/haiku.rag/compare/0.26.2...0.26.3
+[0.26.2]: https://github.com/ggozad/haiku.rag/compare/0.26.1...0.26.2
+[0.26.1]: https://github.com/ggozad/haiku.rag/compare/0.26.0...0.26.1
+[0.26.0]: https://github.com/ggozad/haiku.rag/compare/0.25.0...0.26.0
+[0.25.0]: https://github.com/ggozad/haiku.rag/compare/0.24.2...0.25.0
+[0.24.2]: https://github.com/ggozad/haiku.rag/compare/0.24.1...0.24.2
+[0.24.1]: https://github.com/ggozad/haiku.rag/compare/0.24.0...0.24.1
+[0.24.0]: https://github.com/ggozad/haiku.rag/compare/0.23.2...0.24.0
+[0.23.2]: https://github.com/ggozad/haiku.rag/compare/0.23.1...0.23.2
+[0.23.1]: https://github.com/ggozad/haiku.rag/compare/0.23.0...0.23.1
+[0.23.0]: https://github.com/ggozad/haiku.rag/compare/0.22.0...0.23.0
+[0.22.0]: https://github.com/ggozad/haiku.rag/compare/0.21.0...0.22.0
+[0.21.0]: https://github.com/ggozad/haiku.rag/compare/0.20.2...0.21.0
+[0.20.2]: https://github.com/ggozad/haiku.rag/compare/0.20.1...0.20.2
+[0.20.1]: https://github.com/ggozad/haiku.rag/compare/0.20.0...0.20.1
+[0.20.0]: https://github.com/ggozad/haiku.rag/compare/0.19.6...0.20.0
+[0.19.6]: https://github.com/ggozad/haiku.rag/compare/0.19.5...0.19.6
+[0.19.5]: https://github.com/ggozad/haiku.rag/compare/0.19.4...0.19.5
+[0.19.4]: https://github.com/ggozad/haiku.rag/compare/0.19.3...0.19.4
+[0.19.3]: https://github.com/ggozad/haiku.rag/compare/0.19.2...0.19.3
+[0.19.2]: https://github.com/ggozad/haiku.rag/compare/0.19.1...0.19.2
+[0.19.1]: https://github.com/ggozad/haiku.rag/compare/0.19.0...0.19.1
+[0.19.0]: https://github.com/ggozad/haiku.rag/compare/0.18.0...0.19.0
+[0.18.0]: https://github.com/ggozad/haiku.rag/compare/0.17.2...0.18.0
+[0.17.2]: https://github.com/ggozad/haiku.rag/compare/0.17.1...0.17.2
+[0.17.1]: https://github.com/ggozad/haiku.rag/compare/0.17.0...0.17.1
+[0.17.0]: https://github.com/ggozad/haiku.rag/compare/0.16.1...0.17.0
+[0.16.1]: https://github.com/ggozad/haiku.rag/compare/0.16.0...0.16.1
+[0.16.0]: https://github.com/ggozad/haiku.rag/compare/0.15.0...0.16.0
+[0.15.0]: https://github.com/ggozad/haiku.rag/compare/0.14.1...0.15.0
+[0.14.1]: https://github.com/ggozad/haiku.rag/compare/0.14.0...0.14.1
+[0.14.0]: https://github.com/ggozad/haiku.rag/compare/0.13.3...0.14.0
+[0.13.3]: https://github.com/ggozad/haiku.rag/compare/0.13.2...0.13.3
+[0.13.2]: https://github.com/ggozad/haiku.rag/compare/0.13.1...0.13.2
+[0.13.1]: https://github.com/ggozad/haiku.rag/releases/tag/0.13.1

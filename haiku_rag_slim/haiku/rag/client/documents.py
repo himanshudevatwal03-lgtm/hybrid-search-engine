@@ -1,0 +1,1474 @@
+import asyncio
+import hashlib
+import json
+import logging
+import mimetypes
+from collections.abc import Awaitable, Callable, Collection
+from dataclasses import dataclass, field
+from functools import partial
+from pathlib import Path
+from typing import TYPE_CHECKING
+from urllib.parse import quote, urlparse
+
+from haiku.rag.client.exceptions import UnsupportedSourceError
+from haiku.rag.client.processing import (
+    _write_fetch_body,
+    chunk,
+    convert,
+    ensure_chunks_embedded,
+    get_extension_from_content_type_or_url,
+)
+from haiku.rag.client.session import SingleDatabaseSession
+from haiku.rag.client.titles import resolve_title
+from haiku.rag.converters import get_converter
+from haiku.rag.converters.exceptions import (
+    ConversionFailedError,
+    ConversionTimeoutError,
+    ConverterWedgedError,
+)
+from haiku.rag.hooks import (
+    ConvertedDocument,
+    DeleteEvent,
+    DocumentRejected,
+    HookError,
+    IngestEvent,
+    IngestRequest,
+    hook_name,
+    hook_span,
+    notify,
+    overrides,
+)
+from haiku.rag.store.models.chunk import Chunk
+from haiku.rag.store.models.document import Document
+from haiku.rag.store.models.document_item import DocumentItem, extract_items
+from haiku.rag.telemetry import logfire
+from haiku.rag.uri import is_local_uri, uri_to_path
+from haiku.rag.utils.sql import escape_like_pattern, escape_sql_string
+
+if TYPE_CHECKING:
+    from docling_core.types.doc.document import DoclingDocument
+
+    from haiku.rag.client import HaikuRAG
+    from haiku.rag.ingester.metadata import BoundMetadataProvider, MetadataProvider
+    from haiku.rag.sources.base import FetchResult, Source
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class DocumentImport:
+    """A prepared document for batch import via ``import_documents``.
+
+    Carries the same inputs as ``import_document``: a converted
+    ``DoclingDocument``, its chunks (embeddings filled in if missing), and
+    optional uri/title/metadata.
+    """
+
+    docling_document: "DoclingDocument"
+    chunks: list[Chunk]
+    uri: str | None = None
+    title: str | None = None
+    metadata: dict | None = field(default=None)
+
+
+# Maximum length of an attachment chain rooted at a top-level ingest. With
+# value 3, a PDF whose attachments contain PDFs which themselves contain
+# PDFs is fully ingested (3 levels); a fourth nested level logs a warning
+# and is skipped.
+MAX_ATTACHMENT_DEPTH = 3
+
+# Documents resolved per id-filter query, bounding the filter expression a
+# corpus-wide migration builds.
+ID_LOOKUP_BATCH = 500
+
+# Keys the source pipeline owns: content_type/md5/source_revision drive
+# sync_state, source_id records which configured source ingested the document
+# and drives orphan reconciliation, parent_uri links an attachment to the
+# document it was extracted from and drives cascade deletes. Stripped from
+# caller, provider and hook metadata, so only the pipeline sets them.
+_INGESTION_OWNED_KEYS = frozenset(
+    {"content_type", "md5", "source_revision", "source_id", "parent_uri"}
+)
+
+# Ingestion-owned keys that no write path drops once stored.
+_LINEAGE_KEYS = ("source_id", "parent_uri")
+
+# Keys the revision and MD5 short-circuits trust. Written to a document that
+# can have attachments only once its attachments have reconciled.
+_FRESHNESS_KEYS = ("md5", "source_revision")
+
+
+def _prepare_document_from_docling_sync(
+    document: Document, docling_document: "DoclingDocument"
+) -> str:
+    """Populate content/docling blobs from a DoclingDocument.
+
+    This performs size-proportional serialization, JSON splitting, and
+    compression via ``Document.set_docling``. Async ingestion paths should call
+    it through ``_prepare_document_from_docling`` so large image-bearing
+    documents do not block the event loop.
+    """
+    content = docling_document.export_to_markdown()
+    document.content = content
+    document.set_docling(docling_document)
+    return content
+
+
+async def _prepare_document_from_docling(
+    document: Document, docling_document: "DoclingDocument"
+) -> str:
+    return await asyncio.to_thread(
+        _prepare_document_from_docling_sync, document, docling_document
+    )
+
+
+async def _prepare_and_title(
+    session: SingleDatabaseSession,
+    document: Document,
+    docling_document: "DoclingDocument",
+) -> None:
+    """Fill the document from its converted form and title it if it has none.
+
+    A caller-supplied title always wins: set it on the document before calling.
+    Update paths that must keep an existing empty title call
+    ``_prepare_document_from_docling`` directly instead.
+    """
+    stored_content = await _prepare_document_from_docling(document, docling_document)
+    if document.title is None:
+        document.title = await resolve_title(
+            session.config, docling_document, stored_content
+        )
+
+
+async def chunk_document(
+    session: SingleDatabaseSession,
+    docling_document: "DoclingDocument",
+    *,
+    existing_picture_data: dict[str, bytes] | None = None,
+    document_id: str | None = None,
+) -> list[Chunk]:
+    """Chunk and embed through the database this write belongs to."""
+    return await chunk(
+        session.config,
+        docling_document,
+        embedder=session.store.embedder,
+        existing_picture_data=existing_picture_data,
+        document_id=document_id,
+    )
+
+
+def parent_uri_filter(parent_uri: str) -> str:
+    """SQL `WHERE` clause matching documents whose ``metadata.parent_uri``
+    equals ``parent_uri``. ``metadata`` is stored as a JSON string produced by
+    the standard library's ``json.dumps`` (which inserts ``": "`` between key
+    and value), so the match is a substring search over that serialized form —
+    escape JSON-meaningful chars in the URI, then `LIKE` wildcards, then single
+    quotes."""
+    json_fragment = escape_sql_string(escape_like_pattern(json.dumps(parent_uri)[1:-1]))
+    return f"metadata LIKE '%\"parent_uri\": \"{json_fragment}\"%' ESCAPE '\\'"
+
+
+async def _extract_items_observed(
+    uri: str | None,
+    document_id: str,
+    docling_document: "DoclingDocument",
+    existing_picture_data: dict[str, bytes] | None = None,
+) -> list[DocumentItem]:
+    """`extract_items` on a worker thread, under a `document.items` span."""
+    with logfire.span(
+        "document.items", uri=uri, pictures=len(docling_document.pictures)
+    ) as span:
+        items = await asyncio.to_thread(
+            extract_items, document_id, docling_document, existing_picture_data
+        )
+        span.set_attribute("items", len(items))
+        return items
+
+
+async def _store_document_with_chunks(
+    session: SingleDatabaseSession,
+    client: "HaikuRAG | None",
+    document: Document,
+    chunks: list[Chunk],
+    docling_document: "DoclingDocument",
+    observed_uri: str | None = None,
+    notify_hooks: bool = True,
+    events: list[IngestEvent] | None = None,
+) -> Document:
+    """Store a document with chunks, embedding any that lack embeddings.
+
+    Handles versioning/rollback on failure. ``observed_uri`` is the URI the
+    other phase spans report, which can differ from ``document.uri``, the URI
+    the document is stored under. ``events``, when given, receives the
+    ``after_ingest`` event instead of the hooks.
+    """
+    span_uri = observed_uri if observed_uri is not None else document.uri
+    chunks = await ensure_chunks_embedded(
+        session.config, chunks, session.store.embedder
+    )
+    items = await _extract_items_observed(span_uri, "", docling_document)
+    # A racing writer's document is only visible under the lock, so a transfer
+    # to this one is resolved here and reported once the write commits.
+    replaced_owner: str | None = None
+
+    with logfire.span(
+        "document.store", uri=span_uri, chunks=len(chunks), items=len(items)
+    ) as store_span:
+        async with session.store.write_transaction():
+            # A concurrent ingestion of the same URI may have created the
+            # document while this one was converting/embedding outside the
+            # lock. LanceDB has no unique constraint on `uri`, so re-check
+            # under the lock and update in place rather than inserting a
+            # duplicate.
+            existing = (
+                await session.get_document_by_uri(document.uri)
+                if document.uri is not None
+                else None
+            )
+
+            if existing is not None:
+                document.id = existing.id
+                document.created_at = existing.created_at
+                replaced_owner = (existing.metadata or {}).get("source_id")
+                document.metadata = _keep_ingestion_keys(
+                    document.metadata, existing.metadata
+                )
+                stored_doc = await session.document_repository.update(document)
+            else:
+                stored_doc = await session.document_repository.create(document)
+
+            assert stored_doc.id is not None, (
+                "Document ID should not be None after storing"
+            )
+            for order, chunk in enumerate(chunks):
+                chunk.document_id = stored_doc.id
+                chunk.order = order
+            for item in items:
+                item.document_id = stored_doc.id
+
+            if existing is not None:
+                await session.chunk_repository.replace_for_document(
+                    stored_doc.id, chunks
+                )
+                await session.document_item_repository.replace_for_document(
+                    stored_doc.id, items
+                )
+            else:
+                await session.chunk_repository.create(chunks)
+                await session.document_item_repository.create_items(
+                    stored_doc.id, items
+                )
+
+        # The under-lock re-check decides create vs update.
+        store_span.set_attribute("op", "update" if existing is not None else "create")
+        store_span.set_attribute("document_id", stored_doc.id)
+
+    _note_source_change(stored_doc, replaced_owner)
+
+    session.record_write()
+
+    session.name(stored_doc)
+    if client is not None and notify_hooks:
+        event = IngestEvent(
+            documents=[stored_doc],
+            operation="create" if existing is None else "update",
+        )
+        if events is not None:
+            events.append(event)
+        else:
+            await notify(client._hooks, "after_ingest", client, event)
+    return stored_doc
+
+
+async def _update_document_with_chunks(
+    session: SingleDatabaseSession,
+    client: "HaikuRAG | None",
+    document: Document,
+    chunks: list[Chunk],
+    docling_document: "DoclingDocument | None" = None,
+    observed_uri: str | None = None,
+    notify_hooks: bool = True,
+    stored_meta: Callable[[], Awaitable[Document]] | None = None,
+    events: list[IngestEvent] | None = None,
+) -> Document:
+    """Update a document and replace its chunks, embedding any that lack embeddings.
+
+    Handles versioning/rollback on failure. When `docling_document` is None,
+    existing items are preserved. ``observed_uri`` is the URI the other phase
+    spans report, which can differ from ``document.uri``, the URI the
+    document is stored under. ``stored_meta``, when given, supplies the
+    ``uri``, ``title`` and ``metadata`` to write, read under the write lock.
+    ``events``, when given, receives the ``after_ingest`` event instead of the
+    hooks.
+    """
+    span_uri = observed_uri if observed_uri is not None else document.uri
+    assert document.id is not None, "Document ID is required for update"
+
+    # Snapshot existing picture bytes before deleting items so the post-delete
+    # extract_items can merge them back when the live docling has had its
+    # picture URIs stripped (rebuild / re-extract via the stored blob).
+    existing_picture_data: dict[str, bytes] | None = None
+    if docling_document is not None:
+        existing_picture_data = (
+            await session.document_item_repository.get_all_picture_data(document.id)
+        )
+
+    chunks = await ensure_chunks_embedded(
+        session.config, chunks, session.store.embedder
+    )
+
+    items: list[DocumentItem] | None = None
+    if docling_document is not None:
+        items = await _extract_items_observed(
+            span_uri, document.id, docling_document, existing_picture_data
+        )
+
+    with logfire.span(
+        "document.store",
+        uri=span_uri,
+        op="update",
+        document_id=document.id,
+        chunks=len(chunks),
+    ) as store_span:
+        if items is not None:
+            store_span.set_attribute("items", len(items))
+        async with session.store.write_transaction():
+            if stored_meta is not None:
+                current = await stored_meta()
+                document.uri, document.title = current.uri, current.title
+                document.metadata = current.metadata
+            updated_doc = await session.document_repository.update(document)
+
+            assert updated_doc.id is not None
+            for order, chunk in enumerate(chunks):
+                chunk.document_id = updated_doc.id
+                chunk.order = order
+
+            await session.chunk_repository.replace_for_document(updated_doc.id, chunks)
+
+            if items is not None:
+                await session.document_item_repository.replace_for_document(
+                    updated_doc.id, items
+                )
+
+    session.record_write()
+
+    session.name(updated_doc)
+    if client is not None and notify_hooks:
+        event = IngestEvent(documents=[updated_doc], operation="update")
+        if events is not None:
+            events.append(event)
+        else:
+            await notify(client._hooks, "after_ingest", client, event)
+    return updated_doc
+
+
+async def create_document(
+    session: SingleDatabaseSession,
+    client: "HaikuRAG | None",
+    content: str,
+    uri: str | None = None,
+    title: str | None = None,
+    metadata: dict | None = None,
+    format: str = "md",
+) -> Document:
+    """Create a new document from text content.
+
+    Converts the content, chunks it, and generates embeddings.
+    """
+    converter = get_converter(session.config)
+    docling_document = await _after_convert(
+        client,
+        ConvertedDocument(
+            uri=uri,
+            source_id=None,
+            content_type=None,
+            docling_document=await converter.convert_text(content, format=format),
+        ),
+    )
+    chunks = await chunk_document(session, docling_document)
+
+    document = Document(
+        content="",
+        uri=uri,
+        title=title,
+        metadata=_caller_metadata(metadata),
+    )
+    await _prepare_and_title(session, document, docling_document)
+
+    return await _store_document_with_chunks(
+        session, client, document, chunks, docling_document
+    )
+
+
+async def import_document(
+    session: SingleDatabaseSession,
+    client: "HaikuRAG | None",
+    docling_document: "DoclingDocument",
+    chunks: list[Chunk],
+    uri: str | None = None,
+    title: str | None = None,
+    metadata: dict | None = None,
+) -> Document:
+    """Import a pre-processed document with chunks.
+
+    Use this when conversion, chunking, and embedding were done externally.
+    Chunks without embeddings will be automatically embedded.
+
+    The document is stored as given, since the chunks' ``doc_item_refs``
+    index into it. Convert through :meth:`HaikuRAG.convert` to get one whose
+    inline groups are flattened.
+    """
+    document = Document(
+        content="",
+        uri=uri,
+        title=title,
+        metadata=_caller_metadata(metadata),
+    )
+    await _prepare_and_title(session, document, docling_document)
+
+    return await _store_document_with_chunks(
+        session, client, document, chunks, docling_document
+    )
+
+
+async def _store_documents_with_chunks(
+    session: SingleDatabaseSession,
+    client: "HaikuRAG",
+    prepared: list[tuple[Document, list[Chunk], "DoclingDocument"]],
+) -> list[Document]:
+    """Store many documents with their chunks in a single table version each.
+
+    Embeds any chunks that lack embeddings, then writes the documents, chunks,
+    and document_items tables once apiece. Restores all tables on any failure.
+    """
+    flat = await ensure_chunks_embedded(
+        session.config,
+        [chunk for _, chunks, _ in prepared for chunk in chunks],
+        session.store.embedder,
+    )
+    embedded: list[list[Chunk]] = []
+    position = 0
+    for _, chunks, _ in prepared:
+        embedded.append(flat[position : position + len(chunks)])
+        position += len(chunks)
+
+    def _extract_all_items():
+        return [extract_items("", d) for _, _, d in prepared]
+
+    with logfire.span(
+        "document.items",
+        documents=len(prepared),
+        pictures=sum(len(d.pictures) for _, _, d in prepared),
+    ) as items_span:
+        all_item_lists = await asyncio.to_thread(_extract_all_items)
+        items_span.set_attribute("items", sum(len(i) for i in all_item_lists))
+
+    with logfire.span(
+        "document.store",
+        op="create_batch",
+        documents=len(prepared),
+        chunks=len(flat),
+    ):
+        async with session.store.write_transaction():
+            created = await session.document_repository.create(
+                [doc for doc, _, _ in prepared]
+            )
+
+            all_chunks: list[Chunk] = []
+            all_items = []
+            for doc, doc_chunks, item_list in zip(created, embedded, all_item_lists):
+                assert doc.id is not None
+                for order, chunk in enumerate(doc_chunks):
+                    chunk.document_id = doc.id
+                    chunk.order = order
+                all_chunks.extend(doc_chunks)
+                for item in item_list:
+                    item.document_id = doc.id
+                all_items.extend(item_list)
+
+            await session.chunk_repository.create(all_chunks)
+            await session.document_item_repository.create_all(all_items)
+
+    session.record_write()
+
+    session.name_all(created)
+    event = IngestEvent(documents=created, operation="create")
+    await notify(client._hooks, "after_ingest", client, event)
+    return created
+
+
+async def import_documents(
+    session: SingleDatabaseSession,
+    client: "HaikuRAG",
+    imports: list[DocumentImport],
+) -> list[Document]:
+    """Batch-import pre-processed documents with their chunks.
+
+    The batch analog of ``import_document``: writes the documents, chunks, and
+    document_items tables once each regardless of how many documents are
+    imported. Chunks without embeddings are embedded automatically. Looks
+    up no URI: every import creates a new document, even for a stored or
+    repeated URI.
+    """
+    if not imports:
+        return []
+
+    prepared: list[tuple[Document, list[Chunk], DoclingDocument]] = []
+    for item in imports:
+        document = Document(
+            content="",
+            uri=item.uri,
+            title=item.title,
+            metadata=_caller_metadata(item.metadata),
+        )
+        await _prepare_and_title(session, document, item.docling_document)
+        prepared.append((document, item.chunks, item.docling_document))
+
+    return await _store_documents_with_chunks(session, client, prepared)
+
+
+async def _refresh_doc_metadata(
+    session: SingleDatabaseSession,
+    doc: Document,
+    *,
+    title: str | None,
+    user_metadata: dict,
+    source_metadata: dict | None,
+) -> Document:
+    """Update a document's title + metadata without re-chunking. Merges onto
+    the stored record, which may have changed since ``doc`` was read."""
+    assert doc.id is not None
+    async with session.store._write_lock:
+        stored = await session.document_repository.get_by_id(doc.id)
+        if stored is None:
+            raise ValueError(f"Document with ID {doc.id} not found")
+        doc.uri, doc.title = stored.uri, stored.title
+        doc.metadata, doc.updated_at = stored.metadata, stored.updated_at
+        before = (doc.title, doc.metadata)
+        if title is not None:
+            doc.title = title
+        doc.metadata = {
+            **(doc.metadata or {}),
+            **user_metadata,
+            **(source_metadata or {}),
+        }
+        updated = (doc.title, doc.metadata) != before
+        if updated:
+            await session.document_repository.update_meta(doc)
+    if updated:
+        # Reclaim the document_meta churn from rolling source_revision sweeps.
+        # The vacuum is debounced, and document_meta is tiny, so this is cheap.
+        session.record_write()
+    session.name(doc)
+    return doc
+
+
+def _caller_metadata(metadata: dict | None) -> dict:
+    """Caller-supplied metadata without the keys only ingestion sets."""
+    return _storable(metadata or {})
+
+
+def _keep_ingestion_keys(
+    metadata: dict,
+    previous_metadata: dict | None,
+    keys: Collection[str] = _LINEAGE_KEYS,
+) -> dict:
+    """``metadata`` with each stored key of ``keys`` it lacks restored."""
+    previous = previous_metadata or {}
+    kept = {
+        key: previous[key]
+        for key in keys
+        if previous.get(key) is not None and metadata.get(key) is None
+    }
+    return {**metadata, **kept}
+
+
+def _note_source_change(doc: Document, previous: str | None) -> Document:
+    """Log an ownership transfer, at the write boundary that made it."""
+    current = (doc.metadata or {}).get("source_id")
+    if previous is not None and current is not None and current != previous:
+        logger.warning(
+            "Source of %s changed from %s to %s; both sources cover this URI",
+            doc.uri,
+            previous,
+            current,
+        )
+    return doc
+
+
+async def _provider_metadata(
+    provider: "BoundMetadataProvider | None",
+    uri: str,
+    result: "FetchResult",
+) -> dict:
+    if provider is None:
+        return {}
+    # Hand the provider an isolated copy: mutating the live FetchResult
+    # (e.g. result.content_hash or result.extra_metadata) would feed the
+    # MD5 short-circuit and source_meta, bypassing the reserved-key filter
+    # that only guards the returned dict.
+    provider_result = result.model_copy(deep=True)
+    return _storable(await provider(uri, provider_result))
+
+
+def _storable(metadata: dict) -> dict:
+    return {k: v for k, v in metadata.items() if k not in _INGESTION_OWNED_KEYS}
+
+
+async def _before_ingest(
+    client: "HaikuRAG | None",
+    result: "FetchResult",
+    source_id: str | None,
+    uri: str,
+) -> "tuple[FetchResult, dict]":
+    """Run the ``before_ingest`` hooks over a fetched document, stored under
+    ``uri``. Returns the result to convert, its ``content_hash`` following a
+    replaced body and its ``extra_metadata`` without the keys the hooks set,
+    and the metadata the hooks added."""
+    if client is None or not client._hooks:
+        return result, {}
+    request = IngestRequest(
+        uri=uri,
+        source_id=source_id,
+        body=result.body,
+        content_type=result.content_type,
+    )
+    for hook in client._hooks:
+        if not overrides(hook, "before_ingest"):
+            continue
+        rejected: DocumentRejected | None = None
+        with hook_span(
+            "before_ingest", hook, uri=uri, content_type=result.content_type
+        ) as span:
+            try:
+                request = await hook.before_ingest(client, request)
+                if not isinstance(request, IngestRequest):
+                    raise TypeError(f"returned {type(request).__name__}")
+                if not isinstance(request.body, bytes):
+                    raise TypeError(f"body is {type(request.body).__name__}")
+                # The store serialises metadata after conversion and embedding.
+                json.dumps(_storable(request.metadata))
+            except DocumentRejected as e:
+                span.set_attributes({"rejected": True, "reason": e.reason})
+                rejected = e
+            except Exception as e:
+                raise HookError(
+                    f"{hook_name(hook)}.before_ingest failed for "
+                    f"{uri}: {type(e).__name__}: {e}"
+                ) from e
+        # Raised outside the span, so a rejection is not recorded as an error.
+        if rejected is not None:
+            rejected.uri = uri
+            raise rejected
+    if request.body != result.body:
+        result = result.model_copy(
+            update={
+                "body": request.body,
+                "content_hash": hashlib.md5(
+                    request.body, usedforsecurity=False
+                ).hexdigest(),
+                "disk_path": None,
+            }
+        )
+    added = _storable(request.metadata)
+    if added.keys() & result.extra_metadata.keys():
+        result = result.model_copy(
+            update={
+                "extra_metadata": {
+                    k: v for k, v in result.extra_metadata.items() if k not in added
+                }
+            }
+        )
+    return result, added
+
+
+async def _after_convert(
+    client: "HaikuRAG | None",
+    document: ConvertedDocument,
+) -> "DoclingDocument":
+    """Run the ``after_convert`` hooks and return the document to chunk."""
+    from docling_core.types.doc.document import DoclingDocument
+
+    if client is None:
+        return document.docling_document
+    uri = document.uri
+    for hook in client._hooks:
+        if not overrides(hook, "after_convert"):
+            continue
+        with hook_span(
+            "after_convert",
+            hook,
+            uri=uri,
+            content_type=document.content_type,
+        ):
+            try:
+                document = await hook.after_convert(client, document)
+                if not isinstance(document, ConvertedDocument):
+                    raise TypeError(f"returned {type(document).__name__}")
+                if not isinstance(document.docling_document, DoclingDocument):
+                    raise TypeError(
+                        "docling_document is "
+                        f"{type(document.docling_document).__name__}"
+                    )
+            except Exception as e:
+                raise HookError(
+                    f"{hook_name(hook)}.after_convert failed for "
+                    f"{uri}: {type(e).__name__}: {e}"
+                ) from e
+    return document.docling_document
+
+
+async def _ingest_fetch_result(
+    session: SingleDatabaseSession,
+    client: "HaikuRAG | None",
+    result: "FetchResult",
+    *,
+    title: str | None,
+    user_metadata: dict,
+    stored_uri: str,
+    existing_doc: Document | None,
+    source_id: str | None = None,
+    depth: int = 0,
+    filename: str | None = None,
+    metadata_provider: "BoundMetadataProvider | None" = None,
+    force: bool = False,
+    written_ids: set[str] | None = None,
+    notify_hooks: bool = True,
+) -> Document:
+    """Convert / chunk / embed / store a fetched document. Replaces an
+    existing document if one is supplied. ``depth`` tracks position in an
+    attachment chain so the reconciliation step can bound recursion.
+
+    ``filename``, when given, makes its suffix authoritative for the file
+    extension (and thus the docling format), overriding the URI/content-type
+    fallback. Callers pass it when ``result.uri`` cannot yield the right
+    extension, e.g. embedded attachments whose name lives in a URI fragment.
+
+    ``metadata_provider`` runs for every attachment beneath this document.
+    ``source_id`` is the ingesting source, stored only on a top-level document
+    (``depth == 0``).
+
+    ``force`` re-ingests unchanged attachments too. ``written_ids`` collects the
+    id of every document this call writes, attachments included.
+    ``notify_hooks=False`` fires no post-commit hooks for any of them."""
+
+    converter = get_converter(session.config)
+    if filename is not None:
+        file_extension = Path(filename).suffix.lower()
+    else:
+        file_extension = get_extension_from_content_type_or_url(
+            result.uri, result.content_type
+        )
+    if file_extension not in converter.supported_extensions:
+        raise UnsupportedSourceError(
+            f"Unsupported content type/extension: {result.content_type}/{file_extension}"
+        )
+
+    source_metadata: dict = {
+        "content_type": result.content_type,
+        "md5": result.content_hash,
+        **result.extra_metadata,
+    }
+    if result.revision is not None:
+        source_metadata["source_revision"] = result.revision
+    if source_id is not None and depth == 0:
+        source_metadata["source_id"] = source_id
+
+    if result.disk_path is not None:
+        target_path = result.disk_path
+        cleanup_path: Path | None = None
+    else:
+        target_path = await _write_fetch_body(result.body, file_extension)
+        cleanup_path = target_path
+
+    try:
+        with logfire.span("document.convert", uri=result.uri):
+            docling_document = await convert(
+                session.config, target_path, source_uri=result.uri
+            )
+        docling_document = await _after_convert(
+            client,
+            ConvertedDocument(
+                uri=stored_uri,
+                source_id=source_id,
+                content_type=result.content_type,
+                docling_document=docling_document,
+            ),
+        )
+        with logfire.span("document.chunk", uri=result.uri) as chunk_span:
+            chunks = await chunk_document(session, docling_document)
+            chunk_span.set_attribute("chunks_created", len(chunks))
+    finally:
+        if cleanup_path is not None:
+            cleanup_path.unlink(missing_ok=True)
+
+    final_metadata = {**user_metadata, **source_metadata}
+    may_have_attachments = _may_have_attachments(session, result.content_type)
+    freshness = (
+        {k: final_metadata.pop(k) for k in _FRESHNESS_KEYS if k in final_metadata}
+        if may_have_attachments
+        else {}
+    )
+    # A PDF's event waits for its attachments and its freshness keys.
+    held: list[IngestEvent] | None = (
+        [] if may_have_attachments and client is not None and notify_hooks else None
+    )
+
+    if existing_doc:
+        existing_doc.metadata = _keep_ingestion_keys(
+            final_metadata, existing_doc.metadata
+        )
+        if title is not None:
+            existing_doc.title = title
+        await _prepare_and_title(session, existing_doc, docling_document)
+        stored = await _update_document_with_chunks(
+            session,
+            client,
+            existing_doc,
+            chunks,
+            docling_document,
+            observed_uri=result.uri,
+            notify_hooks=notify_hooks,
+            events=held,
+        )
+    else:
+        document = Document(
+            content="",
+            uri=stored_uri,
+            title=title,
+            metadata=final_metadata,
+        )
+        await _prepare_and_title(session, document, docling_document)
+        stored = await _store_document_with_chunks(
+            session,
+            client,
+            document,
+            chunks,
+            docling_document,
+            observed_uri=result.uri,
+            notify_hooks=notify_hooks,
+            events=held,
+        )
+
+    if written_ids is not None:
+        assert stored.id is not None
+        written_ids.add(stored.id)
+
+    await _reconcile_pdf_attachments(
+        session,
+        client,
+        stored,
+        result.body,
+        depth=depth,
+        source_id=source_id,
+        metadata_provider=metadata_provider,
+        force=force,
+        written_ids=written_ids,
+        notify_hooks=notify_hooks,
+    )
+    refreshed = await _refresh_doc_metadata(
+        session, stored, title=None, user_metadata={}, source_metadata=freshness
+    )
+    if held is not None:
+        assert client is not None
+        [event] = held
+        event.documents = [refreshed]
+        await notify(client._hooks, "after_ingest", client, event)
+    return refreshed
+
+
+def _may_have_attachments(
+    session: SingleDatabaseSession, content_type: str | None
+) -> bool:
+    """Whether a document of ``content_type`` gets its attachments reconciled."""
+    return (
+        session.config.processing.extract_pdf_attachments
+        and content_type == "application/pdf"
+    )
+
+
+def _extract_pdf_attachments(
+    parent_body: bytes, parent_uri: str, *, depth: int
+) -> dict[str, tuple[str, bytes, str, str]] | None:
+    """Open the parent PDF and return its embedded attachments keyed by child
+    URI. Returns ``None`` when the PDF can't be opened or the recursion depth
+    cap is reached — in both cases the caller skips reconciliation entirely.
+
+    Every pdfium call is held under ``PDFIUM_LOCK`` (shared with page slicing)
+    because libpdfium's global C state is not thread-safe; concurrent access
+    from another worker corrupts it and then fails valid PDFs with "Data format
+    error" until the process restarts.
+    """
+    import pypdfium2 as pdfium
+
+    from haiku.rag.converters.pdf_split import PDFIUM_LOCK
+
+    with PDFIUM_LOCK:
+        try:
+            pdf = pdfium.PdfDocument(parent_body)
+        except pdfium.PdfiumError as exc:
+            logger.warning(
+                "Cannot scan %s for embedded attachments: %s", parent_uri, exc
+            )
+            return None
+        try:
+            attachment_count = pdf.count_attachments()
+
+            if depth + 1 >= MAX_ATTACHMENT_DEPTH:
+                if attachment_count > 0:
+                    logger.warning(
+                        "Attachment depth cap (%d) reached at %s; skipping %d nested "
+                        "attachment(s).",
+                        MAX_ATTACHMENT_DEPTH,
+                        parent_uri,
+                        attachment_count,
+                    )
+                return None
+
+            new_attachments: dict[str, tuple[str, bytes, str, str]] = {}
+            for i in range(attachment_count):
+                att = pdf.get_attachment(i)
+                name = att.get_name()
+                # A malformed PDF can carry an attachment with an empty /F, so
+                # this is real validation on untrusted input — it just needs a
+                # hand-crafted file to reach, which no fixture here produces.
+                if not name:  # pragma: no cover - needs a malformed PDF
+                    continue
+                data = bytes(att.get_data())
+                child_uri = f"{parent_uri}#attachment={quote(name, safe='')}"
+                content_type = (
+                    mimetypes.guess_type(name)[0] or "application/octet-stream"
+                )
+                content_hash = hashlib.md5(data, usedforsecurity=False).hexdigest()
+                new_attachments[child_uri] = (name, data, content_type, content_hash)
+            return new_attachments
+        finally:
+            pdf.close()
+
+
+async def _reconcile_pdf_attachments(
+    session: SingleDatabaseSession,
+    client: "HaikuRAG | None",
+    parent_doc: Document,
+    parent_body: bytes,
+    *,
+    depth: int,
+    source_id: str | None = None,
+    metadata_provider: "BoundMetadataProvider | None" = None,
+    force: bool = False,
+    written_ids: set[str] | None = None,
+    notify_hooks: bool = True,
+) -> None:
+    """Diff the parent PDF's ``/EmbeddedFiles`` table against any children
+    already linked via ``metadata.parent_uri`` and bring the child set in line:
+    ingest additions, update changed bytes, cascade-delete removed names.
+
+    Re-uses ``_ingest_fetch_result`` for each child so the standard conversion
+    path runs uniformly — child PDFs recurse into this helper one level deeper,
+    bounded by ``MAX_ATTACHMENT_DEPTH``.
+    """
+    if not _may_have_attachments(
+        session, (parent_doc.metadata or {}).get("content_type")
+    ):
+        return
+    if not parent_doc.uri:
+        return
+
+    new_attachments = await asyncio.to_thread(
+        _extract_pdf_attachments, parent_body, parent_doc.uri, depth=depth
+    )
+    if new_attachments is None:
+        return
+
+    existing = await session.list_documents(filter=parent_uri_filter(parent_doc.uri))
+    existing_by_uri: dict[str, Document] = {d.uri: d for d in existing if d.uri}
+
+    from haiku.rag.sources.base import FetchResult
+
+    supported_extensions = get_converter(session.config).supported_extensions
+    for child_uri, (name, data, content_type, content_hash) in new_attachments.items():
+        if Path(name).suffix.lower() not in supported_extensions:
+            logger.warning(
+                "Skipping attachment %r in %s: unsupported extension %r "
+                "(content type %r)",
+                name,
+                parent_doc.uri,
+                Path(name).suffix.lower(),
+                content_type,
+            )
+            continue
+        existing_child = existing_by_uri.get(child_uri)
+        fetched = FetchResult(
+            uri=child_uri,
+            body=data,
+            content_type=content_type,
+            content_hash=content_hash,
+            extra_metadata={"parent_uri": parent_doc.uri},
+        )
+        try:
+            child_fr, hook_metadata = await _before_ingest(
+                client, fetched, source_id, child_uri
+            )
+        except DocumentRejected as e:
+            logger.warning("%s", e)
+            continue
+        if (
+            existing_child
+            and not force
+            and (existing_child.metadata or {}).get("md5") == child_fr.content_hash
+        ):
+            continue
+
+        caller_metadata = (
+            _caller_metadata(existing_child.metadata)
+            if force and existing_child
+            else {}
+        )
+        try:
+            await _ingest_fetch_result(
+                session,
+                client,
+                child_fr,
+                title=None,
+                user_metadata={
+                    **caller_metadata,
+                    **await _provider_metadata(metadata_provider, child_uri, fetched),
+                    **hook_metadata,
+                },
+                stored_uri=child_uri,
+                existing_doc=existing_child,
+                source_id=source_id,
+                depth=depth + 1,
+                filename=name,
+                metadata_provider=metadata_provider,
+                force=force,
+                written_ids=written_ids,
+                notify_hooks=notify_hooks,
+            )
+        except ConversionFailedError as e:
+            logger.warning("Skipping attachment %r in %s: %s", name, parent_doc.uri, e)
+
+    deleted: list[Document] = []
+    try:
+        for child_uri, child in existing_by_uri.items():
+            if child_uri not in new_attachments and child.id:
+                deleted += await session.delete_document(
+                    child.id, allow_attachment=True
+                )
+    finally:
+        # Each delete commits on its own, so a later failure leaves earlier ones done.
+        if deleted and client is not None and notify_hooks:
+            await notify(client._hooks, "after_delete", client, DeleteEvent(deleted))
+
+
+async def create_document_from_source(
+    session: SingleDatabaseSession,
+    client: "HaikuRAG | None",
+    source: str | Path,
+    title: str | None = None,
+    metadata: dict | None = None,
+    uri: str | None = None,
+    storage_options: dict[str, str] | None = None,
+    sources: "list[Source] | None" = None,
+    source_id: str | None = None,
+    metadata_provider: "MetadataProvider | None" = None,
+    observed_revision: str | None = None,
+    force: bool = False,
+    written_ids: set[str] | None = None,
+    notify_hooks: bool = True,
+    failed: list[str] | None = None,
+) -> Document | list[Document]:
+    """Create or update document(s) from a file path, directory, or URL.
+
+    Checks if a document with the same URI already exists:
+    - If MD5 is unchanged, returns existing document
+    - If MD5 changed, updates the document
+    - If no document exists, creates a new one
+
+    ``force`` skips both freshness checks, for the document and its PDF
+    attachments, so an unchanged source is re-converted, re-chunked and
+    re-embedded into the existing document. Internal: rebuild uses it to refresh
+    a document in place instead of deleting and recreating it, passes
+    ``written_ids`` to collect the id of every document written, and
+    ``notify_hooks=False`` to fire no post-commit hooks.
+
+    If ``uri`` is provided, it overrides the URI auto-derived from the source
+    (which is normally ``file://`` for local files or the URL for remote
+    sources). Not supported for directory sources, which produce one document
+    per file.
+
+    A directory call logs and skips a file that fails, appending its URI to
+    ``failed`` when given. A wedged docling converter stops it.
+
+    Returns a single Document for files/URLs, a list for directories.
+    """
+    metadata = _caller_metadata(metadata)
+
+    source_str = str(source)
+    parsed_url = urlparse(source_str)
+
+    # Directory case: recurse with the existing FS filter and produce one
+    # document per file. Remote schemes (http/s3) never hit this branch.
+    if is_local_uri(source_str):
+        local_path = uri_to_path(source_str) if isinstance(source, str) else source
+        if local_path.is_dir():
+            if uri is not None:
+                raise UnsupportedSourceError(
+                    "uri override is not supported for directory sources; each file "
+                    "produces its own document with its own auto-derived URI."
+                )
+            from haiku.rag.sources.filter import FileFilter
+            from haiku.rag.sources.fs import walk_files
+
+            # One-shot CLI directory ingest filters by the docling-local and text
+            # extensions, with no include/ignore patterns. For pattern-based
+            # filtering use `haiku-ingester serve` with an FS source.
+            documents: list[Document] = []
+            filter = FileFilter()
+            for child in walk_files(local_path):
+                if child.is_file() and filter.include_file(str(child)):
+                    try:
+                        doc = await create_document_from_source(
+                            session,
+                            client,
+                            child,
+                            title=None,
+                            metadata=metadata,
+                            sources=sources,
+                            source_id=source_id,
+                            metadata_provider=metadata_provider,
+                            force=force,
+                            written_ids=written_ids,
+                            notify_hooks=notify_hooks,
+                        )
+                    except DocumentRejected as e:
+                        logger.warning("%s", e)
+                        continue
+                    except ConverterWedgedError:
+                        raise
+                    except Exception as e:
+                        if isinstance(e, ConversionTimeoutError) and e.converter_wedged:
+                            raise
+                        child_uri = child.absolute().as_uri()
+                        logger.error("%s failed: %s", child_uri, e)
+                        if failed is not None:
+                            failed.append(child_uri)
+                        continue
+                    assert isinstance(doc, Document)
+                    documents.append(doc)
+            return documents
+
+        if not local_path.exists():
+            raise UnsupportedSourceError(f"File does not exist: {local_path}")
+
+        # Match the old _create_document_from_file behaviour: fail fast on
+        # unsupported extension before reading any bytes.
+        converter = get_converter(session.config)
+        if local_path.suffix.lower() not in converter.supported_extensions:
+            raise UnsupportedSourceError(
+                f"Unsupported file extension: {local_path.suffix}"
+            )
+
+    # Worker jobs carry source_id from the poller; strict lookup so a
+    # renamed/removed source surfaces as a DLQ instead of silently dropping
+    # credentials. Ad-hoc CLI calls (no source_id) fall back to scheme-based
+    # adapters when no configured source matches.
+    from haiku.rag.sources import (
+        resolve_adhoc_fetcher,
+        resolve_configured_source,
+    )
+
+    if source_id is not None:
+        fetcher = resolve_configured_source(source_str, source_id, sources)
+    else:
+        fetcher = resolve_adhoc_fetcher(
+            source_str, sources=sources, storage_options=storage_options
+        )
+
+    # A fetcher built for this call holds its own httpx pool (HTTP, WebDAV) and
+    # has to be closed here. One handed in through `sources` belongs to the
+    # caller: the ingester keeps its sources open across jobs.
+    owns_fetcher = all(fetcher is not configured for configured in sources or ())
+
+    try:
+        # The stored URI is what we look up + persist by. For an explicit uri
+        # override, use it as-is. For a file:// input the source string is
+        # already canonical (URL-encoded); round-tripping via Path.as_uri()
+        # would double-encode any escapes like %5B. For bare paths, canonicalize.
+        if uri is not None:
+            stored_uri = uri
+        elif parsed_url.scheme == "file":
+            stored_uri = source_str
+        elif is_local_uri(source_str):
+            stored_uri = Path(source_str).absolute().as_uri()
+        else:
+            stored_uri = source_str
+
+        existing_doc = await session.get_document_by_uri(stored_uri)
+        previous_owner = (
+            (existing_doc.metadata or {}).get("source_id") if existing_doc else None
+        )
+        owner = source_id if source_id is not None else previous_owner
+        owner_metadata = {"source_id": owner} if owner is not None else {}
+
+        # Cheap revision-based short-circuit: only worth a HEAD when we have a
+        # stored revision to compare against. All sources persist their native
+        # revision (mtime_ns for FS, ETag for S3, ETag/Last-Modified for HTTP)
+        # under the canonical "source_revision" metadata key.
+        stored_revision = (
+            (existing_doc.metadata or {}).get("source_revision")
+            if existing_doc
+            else None
+        )
+        if existing_doc and stored_revision and not force:
+            current_revision = (
+                observed_revision
+                if observed_revision is not None
+                else await fetcher.head(source_str)
+            )
+            if current_revision == stored_revision:
+                return _note_source_change(
+                    await _refresh_doc_metadata(
+                        session,
+                        existing_doc,
+                        title=title,
+                        user_metadata=metadata,
+                        source_metadata=owner_metadata,
+                    ),
+                    previous_owner,
+                )
+
+        with logfire.span("document.fetch", uri=source_str) as fetch_span:
+            result = await fetcher.fetch(source_str)
+            fetch_span.set_attribute("bytes", len(result.body))
+            fetch_span.set_attribute("content_hash", result.content_hash)
+
+        bound_provider = (
+            partial(metadata_provider, source_id or fetcher.source_id)
+            if metadata_provider is not None
+            else None
+        )
+        provider_metadata = await _provider_metadata(bound_provider, source_str, result)
+        result, hook_metadata = await _before_ingest(client, result, owner, stored_uri)
+        user_metadata = {**metadata, **provider_metadata, **hook_metadata}
+
+        # MD5 short-circuit: the bytes are unchanged even if the revision wasn't.
+        # Refresh the source-derived metadata (revision may have rolled) but skip
+        # convert/embed/store entirely.
+        if (
+            existing_doc
+            and not force
+            and existing_doc.metadata.get("md5") == result.content_hash
+        ):
+            source_meta: dict = {
+                "content_type": result.content_type,
+                "md5": result.content_hash,
+                **result.extra_metadata,
+                **owner_metadata,
+            }
+            if result.revision is not None:
+                source_meta["source_revision"] = result.revision
+            return _note_source_change(
+                await _refresh_doc_metadata(
+                    session,
+                    existing_doc,
+                    title=title,
+                    user_metadata=user_metadata,
+                    source_metadata=source_meta,
+                ),
+                previous_owner,
+            )
+
+        return _note_source_change(
+            await _ingest_fetch_result(
+                session,
+                client,
+                result,
+                title=title,
+                user_metadata=user_metadata,
+                stored_uri=stored_uri,
+                existing_doc=existing_doc,
+                source_id=owner,
+                metadata_provider=bound_provider,
+                force=force,
+                written_ids=written_ids,
+                notify_hooks=notify_hooks,
+            ),
+            previous_owner,
+        )
+    finally:
+        if owns_fetcher:
+            await fetcher.aclose()
+
+
+async def set_document_source(
+    session: SingleDatabaseSession, document_ids: list[str], source_id: str
+) -> list[Document]:
+    """Attribute documents to a source, in one table version.
+
+    The one door for `source_id` outside ingestion: every other write path
+    strips it, so reconciliation uses this to carry attribution the queue
+    already records onto the documents themselves.
+    """
+    from haiku.rag.utils.sql import build_document_id_filter
+
+    docs = []
+    previous_owners = []
+    for start in range(0, len(document_ids), ID_LOOKUP_BATCH):
+        batch = document_ids[start : start + ID_LOOKUP_BATCH]
+        found = {
+            doc.id: doc
+            for doc in await session.document_repository.list_all(
+                filter=build_document_id_filter(batch)
+            )
+        }
+        for document_id in batch:
+            doc = found.get(document_id)
+            if doc is None:
+                raise ValueError(f"Document with ID {document_id} not found")
+            previous_owners.append((doc.metadata or {}).get("source_id"))
+            doc.metadata = {**(doc.metadata or {}), "source_id": source_id}
+            docs.append(doc)
+
+    async with session.store._write_lock:
+        updated = await session.document_repository.update_meta_all(docs)
+    for doc, previous in zip(updated, previous_owners, strict=True):
+        _note_source_change(doc, previous)
+        session.name(doc)
+    session.record_write()
+    return updated
+
+
+async def update_document(
+    session: SingleDatabaseSession,
+    client: "HaikuRAG | None",
+    document_id: str,
+    content: str | None = None,
+    metadata: dict | None = None,
+    chunks: list[Chunk] | None = None,
+    title: str | None = None,
+    docling_document: "DoclingDocument | None" = None,
+    uri: str | None = None,
+) -> Document:
+    """Update a document by ID.
+
+    Updates specified fields. When content or docling_document is provided, the
+    document is rechunked and re-embedded. Updates to only metadata or title
+    skip rechunking for efficiency.
+
+    Raises:
+        ValueError: If document not found, or if both content and
+            docling_document are provided.
+    """
+
+    if content is not None and docling_document is not None:
+        raise ValueError(
+            "content and docling_document are mutually exclusive. "
+            "Provide one or the other, not both."
+        )
+
+    async def read_and_apply(include_blobs: bool = False) -> Document:
+        doc = await session.document_repository.get_by_id(
+            document_id, include_blobs=include_blobs
+        )
+        if doc is None:
+            raise ValueError(f"Document with ID {document_id} not found")
+        if title is not None:
+            doc.title = title
+        if metadata is not None:
+            doc.metadata = _keep_ingestion_keys(
+                _caller_metadata(metadata), doc.metadata, _INGESTION_OWNED_KEYS
+            )
+        if uri is not None:
+            doc.uri = uri
+        return doc
+
+    if content is None and chunks is None and docling_document is None:
+        # Read under the lock, so the write keeps every key stored before it.
+        async with session.store._write_lock:
+            updated = await session.document_repository.update_meta(
+                await read_and_apply()
+            )
+        session.record_write()
+        session.name(updated)
+        return updated
+
+    # Caller-supplied chunks without a docling document replace neither blob,
+    # and the row is written back whole, so they have to make the round trip.
+    existing_doc = await read_and_apply(
+        include_blobs=chunks is not None and docling_document is None
+    )
+
+    if chunks is not None:
+        if docling_document is not None:
+            await _prepare_document_from_docling(existing_doc, docling_document)
+        elif content is not None:
+            existing_doc.content = content
+
+        return await _update_document_with_chunks(
+            session,
+            client,
+            existing_doc,
+            chunks,
+            docling_document,
+            stored_meta=read_and_apply,
+        )
+
+    if docling_document is not None:
+        await _prepare_document_from_docling(existing_doc, docling_document)
+
+        new_chunks = await chunk_document(session, docling_document)
+        return await _update_document_with_chunks(
+            session,
+            client,
+            existing_doc,
+            new_chunks,
+            docling_document,
+            stored_meta=read_and_apply,
+        )
+
+    assert content is not None
+    existing_doc.content = content
+    converter = get_converter(session.config)
+    converted_docling = await _after_convert(
+        client,
+        ConvertedDocument(
+            uri=existing_doc.uri,
+            source_id=existing_doc.metadata.get("source_id"),
+            content_type=None,
+            docling_document=await converter.convert_text(
+                existing_doc.content, format="md"
+            ),
+        ),
+    )
+    await _prepare_document_from_docling(existing_doc, converted_docling)
+
+    new_chunks = await chunk_document(session, converted_docling)
+    return await _update_document_with_chunks(
+        session,
+        client,
+        existing_doc,
+        new_chunks,
+        converted_docling,
+        stored_meta=read_and_apply,
+    )
+
+
+def check_source_accessible(uri: str) -> bool:
+    """Check if a document's source URI is accessible.
+
+    Anything the URI itself makes unanswerable counts as inaccessible rather
+    than aborting the caller's sweep: ``urlparse`` rejects malformed IPv6
+    hosts, and ``Path.exists`` re-raises errno values outside its ignored set
+    (an unreadable parent directory, an over-long name).
+    """
+    try:
+        parsed_url = urlparse(uri)
+        if parsed_url.scheme == "file":
+            return uri_to_path(uri).exists()
+        elif parsed_url.scheme in ("http", "https", "s3"):
+            return True
+        return False
+    except (ValueError, OSError):
+        return False

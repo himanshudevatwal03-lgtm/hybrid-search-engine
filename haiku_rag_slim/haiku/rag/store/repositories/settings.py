@@ -1,0 +1,121 @@
+import json
+import logging
+
+from haiku.rag.store.engine import Store, embedder_drift, recorded_settings
+from haiku.rag.store.exceptions import ConfigMismatchError
+from haiku.rag.store.schema import SettingsRecord, query_to_pydantic
+
+logger = logging.getLogger(__name__)
+
+# What to do about provider, name or prefix drift at an unchanged vector_dim, which is
+# either a config naming another model or an interrupted rebuild whose table
+# holds vectors of both embedders.
+EMBEDDER_DRIFT_ADVICE = (
+    "Run 'haiku-rag rebuild --embed-only' to re-embed with the configured "
+    "embedder, or run an interrupted rebuild again to finish it. Run "
+    "'haiku-rag rebuild --set-embedder' only for an embedder that produces the "
+    "same vectors as the recorded one."
+)
+
+
+class SettingsRepository:
+    """Repository for Settings operations."""
+
+    def __init__(self, store: Store) -> None:
+        self.store = store
+
+    async def get_current_settings(self) -> dict:
+        """Get the current settings."""
+        results = await query_to_pydantic(
+            self.store.settings_table.query().where("id = 'settings'").limit(1),
+            SettingsRecord,
+        )
+
+        if not results:
+            return {}
+
+        return json.loads(results[0].settings) if results[0].settings else {}
+
+    async def save_current_settings(self) -> None:
+        """Record the current embedder in the database."""
+        self.store._assert_writable()
+        recorded = recorded_settings(self.store._config.model_dump(mode="json"))
+
+        existing = await query_to_pydantic(
+            self.store.settings_table.query().where("id = 'settings'").limit(1),
+            SettingsRecord,
+        )
+
+        if existing:
+            # Preserve the existing versions to avoid interfering with upgrade flow
+            existing_settings = json.loads(existing[0].settings)
+            for key in ("version", "schema_version"):
+                if key in existing_settings:
+                    recorded[key] = existing_settings[key]
+
+            if existing_settings != recorded:
+                await self.store.settings_table.update(
+                    {"settings": json.dumps(recorded)},
+                    where="id = 'settings'",
+                )
+        else:
+            settings_record = SettingsRecord(
+                id="settings", settings=json.dumps(recorded)
+            )
+            await self.store.settings_table.add([settings_record])
+
+    async def validate_config_compatibility(
+        self, stored_settings: dict | None = None
+    ) -> None:
+        """Validate the current configuration against stored settings without writing.
+
+        Opening a database never modifies it. ``vector_dim`` mismatches raise —
+        corpus and query vectors must live in the same dimensional space.
+        ``provider``, ``name`` and prefix drift (with matching ``vector_dim``) is
+        soft: a read-only open still searches, and provider drift is legitimate
+        when the same model is served by a different stack (Ollama vs
+        vLLM-via-openai, etc.). Drift is surfaced via a warning; a writable open
+        then raises so a write cannot mix embedding identities in the corpus,
+        while a read-only open continues.
+        """
+        if stored_settings is None:
+            stored_settings = await self.get_current_settings()
+
+        # Nothing stored to validate against — never write on open.
+        if not stored_settings:
+            return
+
+        current_config = self.store._config.model_dump(mode="json")
+
+        # Both stored and current use nested structure: embeddings.model.{provider,name,vector_dim}
+        stored_model_obj = stored_settings.get("embeddings", {}).get("model", {})
+        current_model_obj = current_config.get("embeddings", {}).get("model", {})
+
+        stored_vector_dim = stored_model_obj.get("vector_dim")
+        current_vector_dim = current_model_obj.get("vector_dim")
+
+        if (
+            stored_vector_dim
+            and current_vector_dim
+            and stored_vector_dim != current_vector_dim
+        ):
+            raise ConfigMismatchError(
+                "Database configuration is incompatible with current settings:\n"
+                f"  - Stored (db) embedding vector dimension {stored_vector_dim} -> "
+                f"Environment (current) embedding vector dimension {current_vector_dim}\n"
+                "\nPlease rebuild the database using: haiku-rag rebuild"
+            )
+
+        soft_changes = embedder_drift(stored_settings, current_config)
+        if soft_changes:
+            logger.warning(
+                "Embedding identity changed (vector_dim matches): %s. %s",
+                "; ".join(soft_changes),
+                EMBEDDER_DRIFT_ADVICE,
+            )
+            if not self.store.is_read_only:
+                raise ConfigMismatchError(
+                    "Database embedding identity differs from current config "
+                    f"(vector_dim matches): {'; '.join(soft_changes)}. "
+                    f"{EMBEDDER_DRIFT_ADVICE}"
+                )

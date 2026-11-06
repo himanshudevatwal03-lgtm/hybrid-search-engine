@@ -1,0 +1,430 @@
+/** @vitest-environment jsdom */
+import {
+	act,
+	cleanup,
+	render,
+	screen,
+	waitFor,
+	within,
+} from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import IngestionPage from "./IngestionPage";
+
+const job = (id: string, status: string, extra = {}) => ({
+	id,
+	source_id: "docs",
+	uri: `file:///docs/${id}.md`,
+	op: "upsert",
+	content_hash: null,
+	revision: null,
+	status,
+	attempts: 1,
+	max_attempts: 3,
+	last_error: status === "dead" ? "conversion failed" : null,
+	conversion_stalled: false,
+	extra: null,
+	enqueued_at: "2026-10-20T10:00:00Z",
+	scheduled_at: "2026-10-20T10:00:00Z",
+	claimed_at: "2026-10-20T10:00:01Z",
+	claimed_by: "w-1",
+	last_heartbeat_at: null,
+	completed_at: status === "succeeded" ? "2026-10-20T10:00:05Z" : null,
+	...extra,
+});
+
+const answers: Record<string, unknown> = {
+	health: {
+		status: "ok",
+		queue_counts: { queued: 4, claimed: 1, succeeded: 12, dead: 1 },
+		worker_count: 2,
+		poller_count: 1,
+		workers_alive: 2,
+		pollers_alive: 1,
+		worker_breaker_open: false,
+		worker_breaker_consecutive_failures: 0,
+		failed_databases: [],
+	},
+	sources: [
+		{
+			source_id: "docs",
+			database: "docs",
+			type: "filesystem",
+			last_polled_at: null,
+			circuit_breaker_open: false,
+			last_skip_reason: null,
+			last_error: null,
+			last_error_at: null,
+			unsupported_files: {},
+		},
+	],
+	providers: { docling_serve: [] },
+	stats: {
+		throughput: { succeeded_5m: 2, succeeded_30m: 5, succeeded_1h: 9 },
+		workers: { busy: 1, total: 2 },
+		oldest_queued_age_s: 90,
+		dlq_by_source: { docs: 1 },
+		rejected_by_source: { docs: 3 },
+		queue_depth_by_source: { docs: 4 },
+	},
+	"jobs?status=claimed&limit=20": [job("running", "claimed")],
+	"jobs?status=dead&limit=10": [job("broken", "dead")],
+	"jobs?status=succeeded&limit=10": [job("done", "succeeded")],
+	"databases/docs": { path: "/data/docs.lancedb" },
+	"databases/papers": { path: "/data/papers.lancedb" },
+};
+
+// What the ingester answers a write, by path.
+let actions: Record<string, () => Promise<unknown>>;
+let calls: { path: string; method: string }[];
+let page: EventTarget & { hidden: boolean };
+
+beforeEach(() => {
+	calls = [];
+	actions = {
+		"sources/docs/refresh": async () => ({ refreshed: true }),
+		"sources/docs/retry?status=dead": async () => ({
+			source_id: "docs",
+			retried: 2,
+			worker_breaker_open: false,
+		}),
+	};
+	page = document as unknown as EventTarget & { hidden: boolean };
+	Object.defineProperty(document, "hidden", {
+		configurable: true,
+		writable: true,
+		value: false,
+	});
+	vi.stubGlobal(
+		"fetch",
+		vi.fn(async (url: string, init?: RequestInit) => {
+			const path = String(url).replace("/api/ingester/", "");
+			const method = init?.method ?? "GET";
+			calls.push({ path, method });
+			if (method !== "GET") {
+				const aborted = new Promise<never>((_, reject) =>
+					init?.signal?.addEventListener("abort", () =>
+						reject(new DOMException("aborted", "AbortError")),
+					),
+				);
+				const answer = actions[path]?.() ?? Promise.resolve({});
+				return Response.json(await Promise.race([answer, aborted]));
+			}
+			if (path.startsWith("jobs?limit=")) return Response.json([]);
+			const answer = answers[path];
+			return answer instanceof Response
+				? answer.clone()
+				: Response.json(answer ?? null);
+		}),
+	);
+});
+
+afterEach(() => {
+	cleanup();
+	vi.unstubAllGlobals();
+	vi.useRealTimers();
+});
+
+const writes = () => calls.filter((call) => call.method !== "GET");
+const browserReads = () =>
+	calls.filter((call) => call.path.startsWith("jobs?limit=")).length;
+
+describe("IngestionPage", () => {
+	it("shows the queue, sources and jobs from one poll", async () => {
+		render(<IngestionPage />);
+		await screen.findByText("Writes docs");
+		expect(screen.getByText("2/2 workers · 1/1 pollers")).toBeTruthy();
+		expect(screen.getByText("2 / 9")).toBeTruthy();
+		expect(screen.getByText("1/2")).toBeTruthy();
+		expect(screen.getByText("filesystem")).toBeTruthy();
+		expect(screen.getByText("file:///docs/running.md")).toBeTruthy();
+		expect(screen.getByText("conversion failed")).toBeTruthy();
+		expect(screen.getByText("file:///docs/done.md")).toBeTruthy();
+		expect(screen.getByText("4s")).toBeTruthy();
+	});
+
+	it("shows each source's queued, dead and rejected counts", async () => {
+		render(<IngestionPage />);
+		await screen.findByText("filesystem");
+		const headers = screen
+			.getAllByRole("columnheader")
+			.map((header) => header.textContent);
+		const row = screen.getByRole("row", { name: /^docs/ });
+		const cells = within(row)
+			.getAllByRole("cell")
+			.map((cell) => cell.textContent);
+		expect(cells[headers.indexOf("Queued")]).toBe("4");
+		expect(cells[headers.indexOf("Dead")]).toBe("1");
+		expect(cells[headers.indexOf("Rejected")]).toBe("3");
+	});
+
+	it("names each source's database and its failed discovery", async () => {
+		const [docs] = answers.sources as Record<string, unknown>[];
+		answers.sources = [
+			docs,
+			{
+				...docs,
+				source_id: "papers-s3",
+				database: "papers",
+				type: "s3",
+				last_error: "bucket unreadable",
+				last_error_at: "2026-10-20T10:00:00Z",
+			},
+		];
+		try {
+			render(<IngestionPage />);
+			await screen.findByText("Writes docs, papers");
+			expect(
+				screen.getByRole("columnheader", { name: "Database" }),
+			).toBeTruthy();
+			const row = screen.getByRole("row", { name: /papers-s3/ });
+			expect(within(row).getByText("papers")).toBeTruthy();
+			expect(within(row).getByText("discovery failed")).toBeTruthy();
+			expect(within(row).getByText("bucket unreadable")).toBeTruthy();
+		} finally {
+			answers.sources = [docs];
+		}
+	});
+
+	it("shows the files a source skipped for their extension", async () => {
+		const [docs] = answers.sources as Record<string, unknown>[];
+		answers.sources = [{ ...docs, unsupported_files: { ".rst": 366 } }];
+		try {
+			render(<IngestionPage />);
+			const badge = await screen.findByText("366 skipped: .rst");
+			expect(badge.getAttribute("title")).toBe(".rst: 366");
+		} finally {
+			answers.sources = [docs];
+		}
+	});
+
+	it("lists each configured database that is not running, with its error", async () => {
+		const health = answers.health as Record<string, unknown>;
+		answers.health = {
+			...health,
+			status: "degraded",
+			failed_databases: [
+				{ database: "wiki", error: "database 'wiki': requires migration" },
+			],
+		};
+		try {
+			render(<IngestionPage />);
+			expect(await screen.findByText("wiki not running")).toBeTruthy();
+			expect(screen.getByText("degraded")).toBeTruthy();
+			expect(
+				screen.getByText("wiki: database 'wiki': requires migration"),
+			).toBeTruthy();
+		} finally {
+			answers.health = health;
+		}
+	});
+
+	it("leaves out the database column when one database is ingested", async () => {
+		render(<IngestionPage />);
+		await screen.findByText("filesystem");
+		expect(screen.queryByRole("columnheader", { name: "Database" })).toBeNull();
+		expect(screen.queryByText("discovery failed")).toBeNull();
+		expect(screen.queryByText(/not running/)).toBeNull();
+	});
+
+	it("reads a database's info when its panel opens", async () => {
+		const user = userEvent.setup();
+		render(<IngestionPage />);
+		await screen.findByText("Writes docs");
+		await user.click(screen.getByRole("button", { name: "Database docs" }));
+		await screen.findByText(/\/data\/docs\.lancedb/);
+		expect(calls.some((call) => call.path === "databases/docs")).toBe(true);
+	});
+
+	it("keeps an open database panel through a failed sources poll", async () => {
+		const user = userEvent.setup();
+		render(<IngestionPage />);
+		await screen.findByText("Writes docs");
+		await user.click(screen.getByRole("button", { name: "Database docs" }));
+		await screen.findByText(/\/data\/docs\.lancedb/);
+		const sources = answers.sources;
+		answers.sources = new Response("down", { status: 502 });
+		try {
+			await user.click(screen.getByRole("button", { name: "Scan now" }));
+			await screen.findByText("The ingester answered 502.");
+			expect(screen.getByText(/\/data\/docs\.lancedb/)).toBeTruthy();
+		} finally {
+			answers.sources = sources;
+		}
+	});
+
+	it("scans a source, says so, and reads everything again", async () => {
+		const user = userEvent.setup();
+		render(<IngestionPage />);
+		await screen.findByText("filesystem");
+		const polls = calls.filter((call) => call.path === "health").length;
+		const browsed = browserReads();
+		await user.click(screen.getByRole("button", { name: "Scan now" }));
+		await screen.findByText("Scanned docs.");
+		expect(writes()).toEqual([
+			{ path: "sources/docs/refresh", method: "POST" },
+		]);
+		await waitFor(() =>
+			expect(calls.filter((call) => call.path === "health").length).toBe(
+				polls + 1,
+			),
+		);
+		await waitFor(() => expect(browserReads()).toBe(browsed + 1));
+	});
+
+	it("says it is loading until the first poll, not that nothing is configured", async () => {
+		render(<IngestionPage />);
+		expect(screen.getAllByText("Loading…").length).toBeGreaterThan(0);
+		expect(screen.queryByText("No sources are configured.")).toBeNull();
+		await screen.findByText("filesystem");
+	});
+
+	it("shows a scan in progress and holds the source's actions until it ends", async () => {
+		let finish: (value: unknown) => void = () => {};
+		actions["sources/docs/refresh"] = () =>
+			new Promise((resolve) => {
+				finish = resolve;
+			});
+		const user = userEvent.setup();
+		render(<IngestionPage />);
+		await screen.findByText("filesystem");
+		await user.click(screen.getByRole("button", { name: "Scan now" }));
+		const scanning = await screen.findByRole("button", { name: "Scanning…" });
+		expect(scanning.hasAttribute("disabled")).toBe(true);
+		expect(
+			screen
+				.getByRole("button", { name: "Retry failed" })
+				.hasAttribute("disabled"),
+		).toBe(true);
+		await act(async () => finish({ refreshed: true }));
+		await screen.findByText("Scanned docs.");
+		expect(
+			screen.getByRole("button", { name: "Scan now" }).hasAttribute("disabled"),
+		).toBe(false);
+	});
+
+	it("offers no retry to a source without dead jobs, and says it is ok", async () => {
+		const stats = answers.stats as Record<string, unknown>;
+		answers.stats = { ...stats, dlq_by_source: {} };
+		try {
+			render(<IngestionPage />);
+			await screen.findByText("filesystem");
+			const row = screen.getByRole("row", { name: /^docs/ });
+			expect(
+				within(row)
+					.getByRole("button", { name: "Retry failed" })
+					.hasAttribute("disabled"),
+			).toBe(true);
+			expect(within(row).getByText("ok")).toBeTruthy();
+		} finally {
+			answers.stats = stats;
+		}
+	});
+
+	it("says an empty section in one line, without a table", async () => {
+		const active = answers["jobs?status=claimed&limit=20"];
+		answers["jobs?status=claimed&limit=20"] = [];
+		try {
+			render(<IngestionPage />);
+			const line = await screen.findByText("Nothing is being ingested.");
+			expect(line.closest("table")).toBeNull();
+		} finally {
+			answers["jobs?status=claimed&limit=20"] = active;
+		}
+	});
+
+	it("retries a source's dead jobs", async () => {
+		const user = userEvent.setup();
+		render(<IngestionPage />);
+		await screen.findByText("filesystem");
+		await user.click(screen.getByRole("button", { name: "Retry failed" }));
+		await screen.findByText("Queued 2 dead jobs of docs again.");
+		expect(writes()).toEqual([
+			{ path: "sources/docs/retry?status=dead", method: "POST" },
+		]);
+	});
+
+	it("says when a source's retried jobs wait on its worker breaker", async () => {
+		actions["sources/docs/retry?status=dead"] = async () => ({
+			source_id: "docs",
+			retried: 1,
+			worker_breaker_open: true,
+		});
+		const user = userEvent.setup();
+		render(<IngestionPage />);
+		await screen.findByText("filesystem");
+		await user.click(screen.getByRole("button", { name: "Retry failed" }));
+		await screen.findByText(
+			"Queued 1 dead job of docs again. Its worker breaker is open, so it waits until the breaker closes.",
+		);
+	});
+
+	it("waits for a source retry behind a long sweep", async () => {
+		vi.useFakeTimers({ shouldAdvanceTime: true });
+		actions["sources/docs/retry?status=dead"] = () =>
+			new Promise((resolve) =>
+				setTimeout(
+					() =>
+						resolve({
+							source_id: "docs",
+							retried: 2,
+							worker_breaker_open: false,
+						}),
+					60_000,
+				),
+			);
+		const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+		render(<IngestionPage />);
+		await screen.findByText("filesystem");
+		await user.click(screen.getByRole("button", { name: "Retry failed" }));
+		await act(() => vi.advanceTimersByTimeAsync(60_000));
+		await screen.findByText("Queued 2 dead jobs of docs again.");
+	});
+
+	it("retries a dead letter", async () => {
+		const user = userEvent.setup();
+		render(<IngestionPage />);
+		await screen.findByText("conversion failed");
+		await user.click(screen.getByRole("button", { name: "Retry" }));
+		await screen.findByText("Queued file:///docs/broken.md again.");
+		expect(writes()).toEqual([{ path: "jobs/broken/retry", method: "POST" }]);
+	});
+
+	it("cancels a job only once confirmed", async () => {
+		const user = userEvent.setup();
+		render(<IngestionPage />);
+		await screen.findByText("file:///docs/running.md");
+		await user.click(screen.getByRole("button", { name: "Cancel" }));
+		let dialog = await screen.findByRole("dialog");
+		await user.click(within(dialog).getByRole("button", { name: "Keep it" }));
+		expect(writes()).toEqual([]);
+		await user.click(screen.getByRole("button", { name: "Cancel" }));
+		dialog = await screen.findByRole("dialog");
+		await user.click(
+			within(dialog).getByRole("button", { name: "Cancel the job" }),
+		);
+		await screen.findByText("Cancelled file:///docs/running.md.");
+		expect(writes()).toEqual([{ path: "jobs/running", method: "DELETE" }]);
+	});
+
+	it("polls every 3 s while visible, and pauses while hidden", async () => {
+		vi.useFakeTimers({ shouldAdvanceTime: true });
+		render(<IngestionPage />);
+		await screen.findByText("filesystem");
+		const polls = () => calls.filter((call) => call.path === "health").length;
+		await act(() => vi.advanceTimersByTimeAsync(3000));
+		expect(polls()).toBe(2);
+		page.hidden = true;
+		act(() => {
+			document.dispatchEvent(new Event("visibilitychange"));
+		});
+		await act(() => vi.advanceTimersByTimeAsync(9000));
+		expect(polls()).toBe(2);
+		page.hidden = false;
+		act(() => {
+			document.dispatchEvent(new Event("visibilitychange"));
+		});
+		await act(() => vi.advanceTimersByTimeAsync(0));
+		expect(polls()).toBe(3);
+	});
+});

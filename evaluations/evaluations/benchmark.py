@@ -1,0 +1,338 @@
+import asyncio
+import os
+from pathlib import Path
+
+import typer
+from dotenv import find_dotenv, load_dotenv
+from rich.console import Console
+
+from evaluations.artifacts import download_dataset_db, upload_dataset_db
+from evaluations.config import DatasetSpec
+from evaluations.datasets import DATASETS
+from evaluations.experiment import code_revision, config_hash
+from evaluations.pairing import pair_outcomes, render
+from evaluations.population import populate_db
+from evaluations.qa import run_live_qa_benchmark, run_qa_benchmark
+from evaluations.results import check_run_name, default_results_path, read_results
+from evaluations.retrieval import run_retrieval_benchmark
+from haiku.rag.config import AppConfig, find_config_file, load_yaml_config
+from haiku.rag.config.models import ModelConfig
+from haiku.rag.logging import configure_cli_logging
+from haiku.rag.telemetry import configure as configure_telemetry
+
+load_dotenv(find_dotenv(usecwd=True))
+
+configure_cli_logging()
+console = Console()
+
+
+async def evaluate_dataset(
+    spec: DatasetSpec,
+    config: AppConfig,
+    skip_db: bool,
+    skip_retrieval: bool,
+    skip_qa: bool,
+    limit: int | None,
+    name: str | None,
+    db_path: Path | None,
+    vacuum_interval: int = 100,
+    multimodal_only: bool = False,
+    judge_model: ModelConfig | None = None,
+    case_ids: set[str] | None = None,
+    document_filter: str | None = None,
+    results_dir: Path | None = None,
+) -> None:
+    if document_filter is not None:
+        console.print(f"Document filter: {document_filter}", style="dim")
+
+    if db_path is not None and config.lancedb.databases:
+        raise ValueError(
+            "--db PATH places the database where the configuration places none, "
+            f"and this configuration names {', '.join(config.lancedb.databases)} "
+            "in lancedb.databases. Drop --db to evaluate the configured set."
+        )
+
+    if not skip_db:
+        if spec.uses_configured_databases(config, db_path):
+            raise ValueError(
+                "lancedb.databases places the databases this run reads, and "
+                "population writes to one, so it would ingest into a database "
+                "the run does not read. Pass --skip-db to evaluate the "
+                "configured set, or --db PATH to populate and evaluate one."
+            )
+        console.print(f"Using dataset: {spec.key}", style="bold magenta")
+        await populate_db(
+            spec, config, db_path=db_path, vacuum_interval=vacuum_interval
+        )
+
+    if not skip_retrieval:
+        console.print("Running retrieval benchmarks...", style="bold blue")
+        await run_retrieval_benchmark(
+            spec,
+            config,
+            limit=limit,
+            name=name,
+            db_path=db_path,
+            multimodal_only=multimodal_only,
+            document_filter=document_filter,
+        )
+
+    if not skip_qa:
+        console.print("\nRunning QA benchmarks...", style="bold yellow")
+        if spec.live:
+            await run_live_qa_benchmark(
+                spec,
+                config,
+                limit=limit,
+                name=name,
+                db_path=db_path,
+                judge_model=judge_model,
+                case_ids=case_ids,
+                document_filter=document_filter,
+            )
+        else:
+            await run_qa_benchmark(
+                spec,
+                config,
+                limit=limit,
+                name=name,
+                db_path=db_path,
+                judge_model=judge_model,
+                case_ids=case_ids,
+                document_filter=document_filter,
+                results_dir=results_dir,
+            )
+
+
+app = typer.Typer(help="Run retrieval and QA benchmarks for configured datasets.")
+
+
+def _load_config(config_path: Path | None) -> AppConfig:
+    """Load AppConfig from a file path or standard search path."""
+    if config_path:
+        if not config_path.exists():
+            raise typer.BadParameter(f"Config file not found: {config_path}")
+        console.print(f"Loading config from: {config_path}", style="dim")
+        yaml_data = load_yaml_config(config_path)
+        return AppConfig.model_validate(yaml_data)
+
+    found = find_config_file(None)
+    if found:
+        console.print(f"Loading config from: {found}", style="dim")
+        yaml_data = load_yaml_config(found)
+        return AppConfig.model_validate(yaml_data)
+
+    console.print("No config file found, using defaults", style="dim")
+    return AppConfig()
+
+
+def require_telemetry() -> None:
+    """Exit 1 when the configured Logfire resolved no token, from the
+    environment or a credentials file alike."""
+    import logfire
+
+    if logfire.DEFAULT_LOGFIRE_INSTANCE.config.token:
+        return
+    console.print(
+        "Logfire found no token: this run would send no traces. Set "
+        "LOGFIRE_TOKEN or authenticate Logfire, or pass --no-telemetry to run "
+        "with the result file only.",
+        style="red",
+    )
+    raise typer.Exit(code=1)
+
+
+def _print_run_identity(config: AppConfig) -> None:
+    revision = code_revision()
+    sha = revision["git_sha"] or "unknown"
+    dirty = " (uncommitted changes)" if revision["git_dirty"] else ""
+    console.print(
+        f"Code: {sha}{dirty} | config hash: {config_hash(config)}",
+        style="dim",
+        soft_wrap=True,
+    )
+
+
+def _load_case_ids(path: Path | None) -> set[str] | None:
+    """Read a newline-delimited case-id file into a set (None when no path)."""
+    if path is None:
+        return None
+    return {line.strip() for line in path.read_text().splitlines() if line.strip()}
+
+
+def _resolve_dataset(dataset: str) -> DatasetSpec:
+    """Resolve a dataset key to a DatasetSpec or raise BadParameter."""
+    spec = DATASETS.get(dataset.lower())
+    if spec is None:
+        valid_datasets = ", ".join(sorted(DATASETS))
+        raise typer.BadParameter(
+            f"Unknown dataset '{dataset}'. Choose from: {valid_datasets}"
+        )
+    return spec
+
+
+def _resolve_datasets(dataset: str) -> list[DatasetSpec]:
+    """Resolve 'all' or a single dataset key to a list of DatasetSpecs.
+
+    'all' yields one spec per database: query variants sharing a db_filename
+    would otherwise be downloaded/uploaded twice.
+    """
+    if dataset.lower() == "all":
+        seen: set[str] = set()
+        specs: list[DatasetSpec] = []
+        for spec in DATASETS.values():
+            if spec.db_filename in seen:
+                continue
+            seen.add(spec.db_filename)
+            specs.append(spec)
+        return specs
+    return [_resolve_dataset(dataset)]
+
+
+@app.command()
+def run(
+    dataset: str = typer.Argument(..., help="Dataset key to evaluate."),
+    config: Path | None = typer.Option(
+        None, "--config", help="Path to haiku.rag YAML config file."
+    ),
+    db: Path | None = typer.Option(
+        None,
+        "--db",
+        help="Database path, where the configuration places no database.",
+    ),
+    skip_db: bool = typer.Option(
+        False, "--skip-db", help="Skip updating the evaluation db."
+    ),
+    skip_retrieval: bool = typer.Option(
+        False, "--skip-retrieval", help="Skip retrieval benchmark."
+    ),
+    skip_qa: bool = typer.Option(False, "--skip-qa", help="Skip QA benchmark."),
+    limit: int | None = typer.Option(
+        None, "--limit", help="Limit number of test cases for both retrieval and QA."
+    ),
+    name: str | None = typer.Option(None, "--name", help="Override evaluation name."),
+    vacuum_interval: int = typer.Option(
+        100, "--vacuum-interval", help="Vacuum every N documents during DB population."
+    ),
+    multimodal_only: bool = typer.Option(
+        False,
+        "--multimodal-only",
+        help="Only evaluate queries requiring image understanding.",
+    ),
+    document_filter: str | None = typer.Option(
+        None,
+        "--filter",
+        "-f",
+        help=(
+            "SQL WHERE clause over document columns (id, uri, title, "
+            "created_at, updated_at, metadata) restricting every benchmark "
+            "search, e.g. \"uri LIKE '%arxiv%'\". metadata is stored as a "
+            "string, so match it with LIKE."
+        ),
+    ),
+    filter_ids: Path | None = typer.Option(
+        None,
+        "--filter-ids",
+        help=(
+            "Path to a newline-delimited file of QA case ids to run "
+            "(failure-subset rerun). Filters QA only; retrieval is unaffected."
+        ),
+    ),
+    no_telemetry: bool = typer.Option(
+        False,
+        "--no-telemetry",
+        help=(
+            "Run without Logfire telemetry. Without this flag a run refuses to "
+            "start when Logfire finds no token."
+        ),
+    ),
+    results: Path | None = typer.Option(
+        None,
+        "--results",
+        help=(
+            "Directory for the per-case result file. Defaults to "
+            "evaluations/results/ in the haiku.rag data directory."
+        ),
+    ),
+) -> None:
+    if name is not None:
+        try:
+            check_run_name(name)
+        except ValueError as error:
+            console.print(str(error), style="red")
+            raise typer.Exit(code=1) from None
+    if no_telemetry:
+        # Unconfigured, logfire creates no span and warns once per process.
+        os.environ["LOGFIRE_IGNORE_NO_CONFIG"] = "1"
+    else:
+        # Scrubbing off: eval outputs are financial answers with words like
+        # "authorized" that trip Logfire's scrubber and redact the answer text.
+        configure_telemetry(service_name="evals", scrubbing=False)
+        require_telemetry()
+    spec = _resolve_dataset(dataset)
+    app_config = _load_config(config)
+    _print_run_identity(app_config)
+    judge_model_config = app_config.evaluations.judge
+
+    asyncio.run(
+        evaluate_dataset(
+            spec=spec,
+            config=app_config,
+            skip_db=skip_db,
+            skip_retrieval=skip_retrieval,
+            skip_qa=skip_qa,
+            limit=limit,
+            name=name,
+            db_path=db,
+            vacuum_interval=vacuum_interval,
+            multimodal_only=multimodal_only,
+            judge_model=judge_model_config,
+            case_ids=_load_case_ids(filter_ids),
+            document_filter=document_filter,
+            results_dir=results or default_results_path(),
+        )
+    )
+
+
+@app.command()
+def pair(
+    treated: Path = typer.Argument(..., help="Result file of the arm under test."),
+    baseline: Path = typer.Argument(..., help="Result file it is compared against."),
+) -> None:
+    """The paired table for two result files: McNemar on verdicts, sign test on
+    cited_map, joined on each case's pairing key."""
+    names = (treated.name.removesuffix(".jsonl"), baseline.name.removesuffix(".jsonl"))
+    try:
+        result = pair_outcomes(
+            names[0], read_results(treated), names[1], read_results(baseline)
+        )
+    except ValueError as error:
+        console.print(str(error), style="red", markup=False)
+        raise typer.Exit(code=1) from None
+    if result.paired == 0:
+        console.print(f"{names[0]} and {names[1]} have no case in common", style="red")
+        raise typer.Exit(code=1)
+    console.print(render(result), soft_wrap=True, highlight=False, markup=False)
+
+
+@app.command()
+def download(
+    dataset: str = typer.Argument(..., help="Dataset key or 'all' to download all."),
+    force: bool = typer.Option(False, "--force", help="Overwrite existing database."),
+) -> None:
+    """Download pre-built evaluation database from HuggingFace."""
+    for spec in _resolve_datasets(dataset):
+        download_dataset_db(spec, force=force)
+
+
+@app.command()
+def upload(
+    dataset: str = typer.Argument(..., help="Dataset key or 'all' to upload all."),
+) -> None:
+    """Upload evaluation database to HuggingFace (maintainer only)."""
+    for spec in _resolve_datasets(dataset):
+        upload_dataset_db(spec)
+
+
+if __name__ == "__main__":
+    app()

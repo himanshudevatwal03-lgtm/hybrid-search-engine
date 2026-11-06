@@ -1,0 +1,348 @@
+"""Resolving which databases an operation covers."""
+
+import pytest
+from pydantic import ValidationError
+
+from haiku.rag.client import HaikuRAG
+from haiku.rag.client.scope import DatabaseScope
+from haiku.rag.config.models import AppConfig, DatabaseEntry, LanceDBConfig
+from haiku.rag.store.exceptions import (
+    AmbiguousDatabaseError,
+    SourceUnavailableError,
+    UnknownDatabaseError,
+)
+from tests.multi_db.helpers import (
+    _config,
+    _seed,
+)
+
+
+class TestConfig:
+    def test_uri_is_refused_naming_the_replacement(self):
+        with pytest.raises(ValidationError, match="lancedb.databases"):
+            LanceDBConfig.model_validate({"uri": "s3://b/one.lancedb"})
+
+
+class TestNamingIsRequired:
+    def test_a_blank_name_is_rejected(self):
+        """An unnamed database is unreachable: every source check reads the
+        empty name as no name at all."""
+        with pytest.raises(ValidationError, match="entry with no name"):
+            LanceDBConfig(databases={"": "/tmp/a.lancedb"})
+        with pytest.raises(ValidationError, match="entry with no name"):
+            LanceDBConfig(databases={"   ": "/tmp/a.lancedb"})
+
+    def test_a_blank_location_is_rejected(self):
+        """A blank location resolves to the working directory."""
+        with pytest.raises(
+            ValidationError, match=r"databases\[alpha\] has no location"
+        ):
+            LanceDBConfig(databases={"alpha": ""})
+
+    def test_an_entry_names_its_location_and_tag(self):
+        config = LanceDBConfig.model_validate(
+            {"databases": {"old": {"location": "/data/a.lancedb", "tag": "v1"}}}
+        )
+        assert config.databases["old"] == DatabaseEntry(
+            location="/data/a.lancedb", tag="v1"
+        )
+
+    @pytest.mark.parametrize(
+        ("entry", "message"),
+        [
+            ({"location": "", "tag": "v1"}, r"databases\[old\] has no location"),
+            (
+                {"location": "/data/a.lancedb", "tag": " "},
+                r"databases\[old\] has a blank tag",
+            ),
+            ({"location": "/data/a.lancedb", "at": "v1"}, "Extra inputs"),
+            ({"tag": "v1"}, "location"),
+        ],
+    )
+    def test_an_incomplete_entry_is_rejected(self, entry, message):
+        with pytest.raises(ValidationError, match=message):
+            LanceDBConfig.model_validate({"databases": {"old": entry}})
+
+
+class TestNamingADatabaseDirectly:
+    @pytest.mark.parametrize(
+        "names", [["alpha", "beta"], ["alpha"]], ids=["multi", "single"]
+    )
+    async def test_a_db_path_beside_the_configured_set_is_refused(
+        self, tmp_path, temp_db_path, names
+    ):
+        """A path beside configured databases raises an error naming both
+        placements and creates nothing."""
+        config = _config(tmp_path, names)
+
+        with pytest.raises(AmbiguousDatabaseError, match="alpha") as raised:
+            async with HaikuRAG(temp_db_path, config=config, create=True):
+                pass
+        assert str(temp_db_path) in str(raised.value)
+        assert not temp_db_path.exists()
+        for name in names:
+            assert not (tmp_path / f"{name}.lancedb").exists()
+
+    async def test_one_configured_database_is_opened_by_name(self, tmp_path):
+        """A set of one is not federated, and the client resolves it."""
+        config = _config(tmp_path, ["alpha"])
+        await _seed(config, "alpha", ["alpha document about cats"])
+
+        async with HaikuRAG(config=config) as rag:
+            assert not rag.covers_multiple
+            assert rag.source == "alpha"
+            results = await rag.search("cats", search_type="fts", limit=10)
+
+        assert [r.source for r in results] == ["alpha"]
+
+
+class TestOneConfiguredLocation:
+    """One entry in `lancedb.databases` places one named database, at a URI or
+    at a local path."""
+
+    def _config(self, location) -> AppConfig:
+        return AppConfig(lancedb=LanceDBConfig(databases={"notes": str(location)}))
+
+    async def test_a_local_location_opens_the_configured_database(self, tmp_path):
+        located = tmp_path / "notes.lancedb"
+        config = self._config(located)
+
+        async with HaikuRAG(config=config, create=True) as rag:
+            assert rag.store.db_path == located
+            assert rag.source == "notes"
+        assert located.exists()
+
+    async def test_a_local_location_that_does_not_exist_is_refused(self, tmp_path):
+        """A schemeless location is a local path and must exist. The error names
+        the configured database, never its location."""
+        config = self._config(tmp_path / "typo.lancedb")
+
+        with pytest.raises(SourceUnavailableError, match="notes") as caught:
+            async with HaikuRAG(config=config):
+                pass
+        assert "typo.lancedb" not in str(caught.value)
+        assert not (tmp_path / "typo.lancedb").exists()
+
+
+class TestSessionsOwnTheRef:
+    """A session is built from the resolved reference and hands storage only
+    its location; the configuration it keeps is the one the caller named."""
+
+    async def test_a_session_opens_the_location_with_the_undivided_config(
+        self, tmp_path
+    ):
+        from haiku.rag.client.session import SingleDatabaseSession
+
+        config = _config(tmp_path, ["alpha", "beta"])
+        await _seed(config, "alpha", ["alpha document about cats"])
+        [ref] = DatabaseScope.resolve(config, database_name="alpha").databases
+
+        session = await SingleDatabaseSession(ref, config, read_only=True).open()
+        try:
+            assert session.source == "alpha"
+            assert session.location == ref.location
+            assert session.db_path == ref.location
+            assert session.store.location == ref.location
+            assert session.store._config is config
+        finally:
+            await session.aclose()
+
+    async def test_a_client_keeps_the_configuration_it_was_given(self, tmp_path):
+        config = _config(tmp_path, ["alpha", "beta"])
+        await _seed(config, "alpha", ["alpha document about cats"])
+
+        async with HaikuRAG(config=config, sources=["alpha"]) as rag:
+            assert rag._config is config
+            assert set(rag._config.lancedb.databases) == {"alpha", "beta"}
+            assert rag.store.location == tmp_path / "alpha.lancedb"
+
+
+class TestSelection:
+    async def test_unknown_source_at_construction_is_rejected(self, tmp_path):
+        config = _config(tmp_path, ["alpha", "beta"])
+
+        with pytest.raises(UnknownDatabaseError, match="nope"):
+            async with HaikuRAG(config=config, sources=["nope"]):
+                pass
+
+    async def test_no_matches_anywhere_returns_nothing(self, tmp_path):
+        config = _config(tmp_path, ["alpha", "beta"])
+        await _seed(config, "alpha", ["alpha document about cats"])
+        await _seed(config, "beta", ["beta document about cats"])
+
+        async with HaikuRAG(config=config) as rag:
+            assert await rag.search("aardvarks", search_type="fts") == []
+
+
+class TestPlacingADatabase:
+    """What a client says about the databases it covers, so nothing outside has
+    to read its private state to find out."""
+
+    async def test_a_set_names_every_database_it_covers(self, tmp_path):
+        config = _config(tmp_path, ["alpha", "beta"])
+        await _seed(config, "alpha", ["alpha one"])
+        await _seed(config, "beta", ["beta one"])
+
+        async with HaikuRAG(config=config, read_only=True) as rag:
+            assert rag.covers_multiple
+            assert rag.source_names == ("alpha", "beta")
+            assert rag.source is None
+
+    async def test_a_named_database_keeps_its_name_on_re_entry(self, tmp_path):
+        """The selected database keeps its name and single-database scope across
+        re-entry."""
+        config = _config(tmp_path, ["alpha", "beta"])
+        await _seed(config, "alpha", ["alpha document about cats"])
+
+        rag = HaikuRAG(config=config, read_only=True, sources=["alpha"])
+        async with rag:
+            assert not rag.covers_multiple
+            assert rag.source == "alpha"
+            assert rag.source_names == ("alpha",)
+        async with rag:
+            assert not rag.covers_multiple
+            assert rag.source == "alpha"
+            assert rag.source_names == ("alpha",)
+            results = await rag.search("cats", search_type="fts")
+
+        assert {r.source for r in results} == {"alpha"}
+
+    async def test_a_database_at_a_path_is_named_by_its_stem(self, temp_db_path):
+        async with HaikuRAG(temp_db_path, create=True) as rag:
+            assert rag.source_names == (temp_db_path.stem,)
+            assert rag.source == temp_db_path.stem
+
+    async def test_the_default_database_is_selectable_by_name(self, tmp_path):
+        """Nothing configured is the one entry `haiku.rag`, an ordinary
+        configured database that `sources` can name."""
+        from haiku.rag.config.models import StorageConfig
+
+        config = AppConfig(storage=StorageConfig(data_dir=tmp_path))
+
+        async with HaikuRAG(config=config, sources=["haiku.rag"], create=True) as rag:
+            assert rag.source == "haiku.rag"
+            assert rag.store.db_path == tmp_path / "haiku.rag.lancedb"
+
+    def test_coverage_is_known_before_the_client_opens(self, tmp_path):
+        """Coverage is a fact of the resolved scope, readable before entering,
+        and `source_names` and `covers_multiple` agree on it."""
+        config = _config(tmp_path, ["alpha", "beta"])
+
+        covering = HaikuRAG(config=config)
+        assert covering.source_names == ("alpha", "beta")
+        assert covering.covers_multiple
+
+        narrowed = HaikuRAG(config=config, sources=["beta"])
+        assert narrowed.source_names == ("beta",)
+        assert not narrowed.covers_multiple
+
+        at_path = HaikuRAG(tmp_path / "other.lancedb")
+        assert at_path.source_names == ("other",)
+        assert not at_path.covers_multiple
+
+    async def test_the_reader_for_a_database_is_the_client_holding_it(self, tmp_path):
+        config = _config(tmp_path, ["alpha", "beta"])
+        await _seed(config, "alpha", ["alpha one"])
+        await _seed(config, "beta", ["beta one"])
+
+        async with HaikuRAG(config=config, read_only=True) as rag:
+            reader = await rag.reader_for("beta")
+
+            assert reader is not None
+            assert reader.source == "beta"
+            # Asked twice, the same wrapper comes back.
+            assert await rag.reader_for("beta") is reader
+
+    async def test_a_client_reading_one_database_is_its_own_reader(self, temp_db_path):
+        async with HaikuRAG(temp_db_path, create=True) as rag:
+            assert await rag.reader_for(None) is rag
+
+    def test_one_type_answers_for_a_name_nothing_covers(self, tmp_path):
+        """Selecting by name is a lookup wherever it happens, so it fails the
+        same way at construction, per query, and when placing evidence."""
+        config = _config(tmp_path, ["alpha", "beta"])
+
+        with pytest.raises(UnknownDatabaseError):
+            DatabaseScope.resolve(config, database_name="typo")
+        with pytest.raises(UnknownDatabaseError):
+            DatabaseScope.resolve(config).select(["typo"])
+
+        # A KeyError, so a caller treating selection as a lookup still catches it.
+        assert issubclass(UnknownDatabaseError, KeyError)
+        # ...but the message reads as a sentence, not as a missing key.
+        assert str(UnknownDatabaseError("unknown database 'typo'")) == (
+            "unknown database 'typo'"
+        )
+
+    def test_a_path_and_sources_cannot_both_choose(self, tmp_path):
+        """A path names one database and `sources` names others; together they
+        are refused, whatever the selection."""
+        config = _config(tmp_path, ["alpha", "beta"])
+
+        for sources in ([], ["alpha"], ["nope"]):
+            with pytest.raises(AmbiguousDatabaseError, match="pass one of them"):
+                HaikuRAG(tmp_path / "alpha.lancedb", config=config, sources=sources)
+
+    async def test_one_database_refuses_a_name_it_does_not_cover(self, tmp_path):
+        """A citation naming another database must not get this database's
+        reader."""
+        config = _config(tmp_path, ["alpha", "beta"])
+        await _seed(config, "alpha", ["alpha one"])
+        await _seed(config, "beta", ["beta one"])
+
+        async with HaikuRAG(config=config, sources=["alpha"]) as alpha:
+            assert await alpha.reader_for("alpha") is alpha
+            with pytest.raises(UnknownDatabaseError, match="beta"):
+                await alpha.reader_for("beta")
+
+    async def test_a_database_at_a_path_answers_to_its_stem_alone(self, temp_db_path):
+        async with HaikuRAG(temp_db_path, create=True) as rag:
+            assert await rag.reader_for(temp_db_path.stem) is rag
+            with pytest.raises(UnknownDatabaseError, match=temp_db_path.stem):
+                await rag.reader_for("anything")
+
+    async def test_a_set_cannot_place_evidence_that_names_no_database(self, tmp_path):
+        """A sourceless citation names no database a set could place."""
+        config = _config(tmp_path, ["alpha", "beta"])
+        await _seed(config, "alpha", ["alpha one"])
+
+        async with HaikuRAG(config=config, read_only=True) as rag:
+            assert await rag.reader_for(None) is None
+
+
+class TestNamingOneOfTheSetOnTheCommandLine:
+    """`--db-name NAME` reaches the application layer as a name, and every
+    client it opens has to honour it — one that ignores it covers the set and
+    quietly answers from the wrong database."""
+
+    async def test_a_named_database_is_the_one_read(self, tmp_path, capsys):
+        from haiku.rag.app import HaikuRAGApp
+
+        config = _config(tmp_path, ["alpha", "beta"])
+        await _seed(config, "alpha", ["alpha document about cats"])
+        await _seed(config, "beta", ["beta document about cats"])
+
+        scope = DatabaseScope.resolve(config).select(["beta"])
+        app = HaikuRAGApp(scope=scope, config=config, read_only=True)
+        await app.list_documents()
+
+        # Rich wraps long lines, so match the unwrapped part of the URI.
+        printed = capsys.readouterr().out
+        assert "test://beta/" in printed
+        assert "test://alpha/" not in printed
+
+    async def test_naming_none_of_them_covers_the_set(self, tmp_path, capsys):
+        from haiku.rag.app import HaikuRAGApp
+
+        config = _config(tmp_path, ["alpha", "beta"])
+        await _seed(config, "alpha", ["alpha document about cats"])
+        await _seed(config, "beta", ["beta document about cats"])
+
+        app = HaikuRAGApp(
+            scope=DatabaseScope.resolve(config), config=config, read_only=True
+        )
+        await app.list_documents()
+
+        printed = capsys.readouterr().out
+        assert "test://alpha/" in printed
+        assert "test://beta/" in printed

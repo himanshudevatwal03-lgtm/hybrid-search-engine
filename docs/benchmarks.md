@@ -1,0 +1,362 @@
+# Benchmarks
+
+haiku.rag is evaluated on EnterpriseRAG-Bench, OpenRAG Bench (ORB), T²-RAGBench, HotpotQA, FRAMES and MTRAG. Retrieval, QA accuracy and citation retrieval are scored end to end through the RAG capability, see [Methodology](#methodology).
+
+Each footnote names the haiku.rag version and the judge a row was measured with. Rows are not re-run when either changes, so compare rows that share both. Rows before v0.87.0 ran the capability architecture that release replaced.
+
+Only the EnterpriseRAG-Bench database has a vector index. Every other number reflects exact brute-force kNN. For the effect of an index, see [Vector indexing](configuration/storage.md#vector-indexing).
+
+## EnterpriseRAG-Bench
+
+[EnterpriseRAG-Bench](https://github.com/onyx-dot-app/EnterpriseRAG-Bench) is Onyx's benchmark of one synthetic company's internal knowledge: 511,962 documents across Slack, Gmail, Jira, Confluence, Google Drive, Linear, HubSpot, Fireflies and GitHub, and 500 questions in 10 types, including near-duplicate documents whose facts conflict and questions with no answer in the corpus. Each question has a gold answer, a list of answer facts and its gold documents.
+
+Its headline score is the mean over questions of correctness × completeness: completeness is the fraction of answer facts supported by the answer, and counts only when the answer is judged correct. Our runs report it as `erb_score`, with completeness judged by Onyx's own fact prompt (`AnswerFactsJudge`).
+
+#### Retrieval (Recall@10)
+
+| Embedding Model | Reranker | Queries | Recall@10 |
+|-----------------|----------|--------:|----------:|
+| `google/embeddinggemma-2` | `nvidia/llama-nemotron-rerank-vl-1b-v2` | 470 | 0.7837 |
+
+*v0.101.0, the stack of the QA rows below: the reranker scores 200 candidates (`search.rerank_pool_factor` 20). 30 questions have no gold documents and are not scored.*
+
+#### QA accuracy, completeness and citation retrieval
+
+| Capability model | Cases | QA accuracy | Mean completeness | Mean `erb_score` | Mean `cited_map` |
+|------------------|------:|-------------|-------------------|------------------|------------------|
+| `Qwen3.8-27B-NVFP4` | 500 | 0.860 | 0.847 | 0.816 | 0.743 |
+| `Muse-Glimmer-30B-NVFP4-W4A4` | 500 | 0.828 | 0.827 | 0.791 | 0.699 |
+| `gemma-4-26B-A4B-it-FP8-Dynamic` | 500 | 0.642 | 0.667 | 0.588 | 0.489 |
+
+*v0.101.0, `google/embeddinggemma-2` (768, question-answering prefixes, served through sentence-transformers in fp32) with `nvidia/llama-nemotron-rerank-vl-1b-v2`, `search.limit` 10, `sandbox.code_timeout` 120, all judged by `Qwen3.8-27B` at `reasoning_effort: low`. Aborted cases count as failures, and completeness, `erb_score` and `cited_map` count them as 0. Qwen3.8: `max_tokens` 32768, `reasoning_effort: low`, 3 aborts, median 21 s per case, self-judged. Muse-Glimmer: `max_tokens` 16384, `reasoning_strength: high`, 14 aborts (6 past its 131,072-token context, 7 on tool calls that kept failing validation, 1 past `max_tokens`), median 37 s. Over the 486 cases it finished, its accuracy is 0.852. Gemma 4: `max_tokens` 8192, no thinking, 6 aborts, median 6 s, about one search per question against 2.6 for Qwen3.8. The database has an IVF_PQ vector index.*
+
+#### Leaderboard
+
+The leaderboard scores answers with Onyx's scorer (`metrics_based_eval`) judged by GPT-5.4. Its headline is the same correctness × completeness as `erb_score`, with completeness from the same fact prompt, but correctness comes from Onyx's own prompt, citation markers are stripped before judging, and questions without an answer are skipped. To score a run, convert its per-case results file into Onyx's `answers.jsonl` and score it from a checkout of [their repository](https://github.com/onyx-dot-app/EnterpriseRAG-Bench). The rows above ran `configs/enterprise_rag.yaml`, and the Muse-Glimmer and Gemma 4 rows change only its `qa.model` block:
+
+```bash
+cd evaluations
+evaluations download enterprise_rag
+evaluations run enterprise_rag --skip-db --config configs/enterprise_rag.yaml
+uv run python scripts/build_erb_submission.py \
+    ~/.local/share/haiku.rag/evaluations/results/<name>.<trace>.jsonl \
+    ../EnterpriseRAG-Bench/answers.jsonl \
+    --uuid-index ../EnterpriseRAG-Bench/generated_data/uuid_index.json
+
+cd ../EnterpriseRAG-Bench
+LLM_PROVIDER=openai LLM_MODEL_NAME=gpt-5.4 LLM_API_KEY=... \
+    python -m src.scripts.answer_evaluation.metrics_based_eval \
+    --answers-file answers.jsonl --results-file results.json \
+    --updated-questions-file questions_updated.jsonl --parallelism 16 < /dev/null
+```
+
+The scorer judges with OpenAI's Responses API. To judge with a local model, set `OPENAI_BASE_URL` to a server that serves that API (vLLM does) and name its model in `LLM_MODEL_NAME` and `CHEAP_LLM_MODEL_NAME`. It reuses an existing `--updated-questions-file`, so give each run its own. A cited document missing from its index opens an interactive prompt, which `< /dev/null` turns into an error. `build_erb_submission.py --uuid-index` checks for that first.
+
+## OpenRAG Bench (ORB)
+
+[OpenRAG Bench](https://huggingface.co/datasets/vectara/open_ragbench) is arXiv papers with multimodal question-answer pairs, text-based and image-based, over figures, charts and diagrams. Each query maps to one relevant document.
+
+Two approaches are measured:
+
+- **Multimodal embedder** (`Qwen/Qwen3-VL-Embedding-8B` or `nvidia/llama-nemotron-embed-vl-1b-v2`, served by vLLM): pictures and text share one vector space, and no VLM runs at ingest.
+- **Text embedder with VLM picture descriptions** (`qwen3-embedding:4b` with `ollama/ministral-3`): pictures are described at ingest and the descriptions join the chunk text. See [Picture handling](configuration/processing.md#picture-handling).
+
+### Multimodal embedder
+
+#### Retrieval (MAP)
+
+| Embedding Model                          | Reranker                                             | Cases | MAP    |
+|------------------------------------------|------------------------------------------------------|------:|-------:|
+| `Qwen/Qwen3-VL-Embedding-8B`             | none                                                 |  3045 | 0.9774 |
+| `nvidia/llama-nemotron-embed-vl-1b-v2`   | none                                                 |  3045 | 0.9798 |
+| `nvidia/llama-nemotron-embed-vl-1b-v2`   | `nvidia/llama-nemotron-rerank-vl-1b-v2` (multimodal) |  3045 | 0.9899 |
+
+*The reranked row: v0.88.0, `reranking.multimodal: true`, the stack of the QA rows below. The Qwen3-VL row: v0.52.0. The Nemotron row without a reranker was measured earlier.*
+
+#### QA accuracy and citation retrieval
+
+| Capability model | Cases | QA accuracy | Mean `cited_map` |
+|------------------|------:|-------------|------------------|
+| `vllm:Muse-Glimmer-30B-NVFP4-W4A4` | 3045 | 0.9620 | 0.9847 |
+| `vllm:Qwen3.8-27B-NVFP4` | 3045 | 0.9688 | 0.9907 |
+
+*v0.88.0, the reranked retrieval stack above, judged by `Qwen3.8-27B` at `reasoning_effort: low`. Accuracy is over judged cases, 3028 and 3043 of 3045, the rest lost to the search tool exhausting its retry limit. Counting the unjudged as failures gives 0.9566 and 0.9682. Mean 26.15 s and 13.95 s per case. Muse-Glimmer runs at `chat_template_kwargs.reasoning_strength: high`, Qwen3.8 at `reasoning_effort: low`.*
+
+*Paired on the 3023 cases judged in both, accuracy does not separate the models (McNemar exact p = 0.09). `cited_map` favours Qwen3.8, better on 44 cases and worse on 19 (sign test p = 0.0025). The Qwen3.8 row is self-judged. An independent judge agreed on 95% of a 120-case sample and was never stricter.*
+
+### Text embedder with VLM picture descriptions
+
+#### Retrieval (MAP)
+
+| Embedding Model                          | VLM                  | Reranker               | Cases | MAP    |
+|------------------------------------------|----------------------|------------------------|------:|-------:|
+| `qwen3-embedding:4b`                     | Ollama / ministral-3 | `mxbai-rerank-base-v2` |  3045 | 0.9834 |
+| `nvidia/llama-nemotron-embed-vl-1b-v2`   | Ollama / ministral-3 | `mxbai-rerank-base-v2` |  3045 | 0.9863 |
+
+*v0.50.0.*
+
+#### QA accuracy and citation retrieval
+
+| Embedding Model                          | VLM                  | Capability model                  | Cases | QA accuracy | Mean `cited_map` |
+|------------------------------------------|----------------------|------------------------------|------:|-------------|------------------|
+| `qwen3-embedding:4b`                     | Ollama / ministral-3 | `vllm:Gemma-4-26B-A4B-NVFP4` |  3045 | 0.92        | 0.80             |
+| `nvidia/llama-nemotron-embed-vl-1b-v2`   | Ollama / ministral-3 | `vllm:Gemma-4-26B-A4B-NVFP4` |  2836 | 0.96        | 0.81             |
+
+*v0.50.0 with `mxbai-rerank-base-v2`, judged by `vllm:Qwen3.6-35B-A3B-NVFP4`. The Nemotron row covers 2836 of 3045 cases.*
+
+## T²-RAGBench (FinQA)
+
+[T²-RAGBench](https://huggingface.co/datasets/G4KMU/t2-ragbench) turns financial-report QA into context-independent questions with short numeric answers and one gold document each. The FinQA subset is 2,789 single-page PDFs and 8,281 questions. QA is scored by exact numeric match (`NumberMatchEvaluator`, relative tolerance 0.01), not by a judge.
+
+#### QA accuracy and citation retrieval
+
+| Embedding Model      | Reranker               | Capability model             | Cases | QA accuracy | Mean `cited_map` |
+|----------------------|------------------------|------------------------------|------:|-------------|------------------|
+| `qwen3-embedding:4b` | `mxbai-rerank-base-v2` | `vllm:Qwen3.6-35B-A3B-NVFP4` |  7939 | 0.77        | 0.78             |
+
+*v0.55.0, `qwen3-embedding:4b` (vLLM, 2560) with `mxbai-rerank-base-v2`. 341 of 8281 cases produced no answer, and accuracy and `cited_map` are over the 7939 scored. Mean 16.0 s per case.*
+
+## HotpotQA
+
+[HotpotQA](https://huggingface.co/datasets/hotpotqa/hotpot_qa) is multi-hop QA over Wikipedia: each question combines facts from two paragraphs, among distractor paragraphs. The distractor validation split has 7,405 questions over about 66k paragraphs, two gold documents per question.
+
+#### Retrieval (MAP)
+
+| Embedding Model      | Reranker            | Cases | MAP    |
+|----------------------|---------------------|------:|-------:|
+| `qwen3-embedding:4b` | `Qwen3-Reranker-4B` |  7405 | 0.8202 |
+| `qwen3-embedding:4b` | none                |  7405 | 0.6995 |
+
+Hybrid search usually ranks the first-hop document first. The second-hop document often needs the reranker to reach the result window.
+
+#### QA accuracy and citation retrieval
+
+| Capability model             | Reranker            | QA accuracy | Mean `cited_map` |
+|------------------------------|---------------------|-------------|------------------|
+| `vllm:Gemma-4-26B-A4B-NVFP4` | `Qwen3-Reranker-4B` | 0.85        | 0.80             |
+| `vllm:Gemma-4-26B-A4B-NVFP4` | none                | 0.83        | 0.75             |
+
+*v0.66.0, `qwen3-embedding:4b` (vLLM, 2560), judged by `vllm:Qwen3.6-35B-A3B-NVFP4`, 7,405 cases. Without a reranker, `cited_map` (0.75) exceeds retrieval MAP (0.70): the capability searches several times and recovers second-hop documents one query misses.*
+
+## FRAMES
+
+[FRAMES](https://huggingface.co/datasets/google/frames-benchmark) is Google's multi-hop QA benchmark: 824 questions, each grounded in 2 to 23 Wikipedia articles, with temporal, numerical and tabular reasoning. 822 are evaluated, 2 being excluded because a linked article was deleted, over a fixed corpus of the 2,500 linked articles fetched at their current revision. FRAMES has no official evaluation setup. A fixed corpus with agentic retrieval and judged accuracy corresponds to the paper's multi-step retrieval setting, where [the paper](https://arxiv.org/abs/2409.12941) reports 0.66 with Gemini-Pro-1.5 (0.729 given the gold articles). Answers were written against 2024 revisions and may have drifted with the articles.
+
+Gold sets span 2 to 23 articles, more than a result window holds or an answer cites, so MAP and `cited_map` stay well below 1.
+
+#### Retrieval (MAP)
+
+| Embedding Model                        | Reranker                                 | Cases | MAP    |
+|----------------------------------------|------------------------------------------|------:|-------:|
+| `nvidia/llama-nemotron-embed-vl-1b-v2` | `nvidia/llama-nemotron-rerank-vl-1b-v2` |   822 | 0.5966 |
+
+*v0.88.0, the stack of the QA rows below. Single-query retrieval scores zero on 11 questions, those whose gold article's subject the question never names. The agentic run answers 6 of them correctly.*
+
+#### QA accuracy and citation retrieval
+
+| Capability model | Cases | QA accuracy | Mean `cited_map` |
+|------------------|------:|-------------|------------------|
+| `vllm:Muse-Glimmer-30B-NVFP4-W4A4` | 822 | 0.8938 | 0.7342 |
+| `vllm:Qwen3.8-27B-NVFP4` | 822 | 0.9077 | 0.7312 |
+
+*v0.88.0, `nvidia/llama-nemotron-embed-vl-1b-v2` (vLLM, 2048) with `nvidia/llama-nemotron-rerank-vl-1b-v2`, judged by `Qwen3.8-27B` at `reasoning_effort: low`. Accuracy is over judged cases, 810 and 802 of 822, the rest lost to the search tool exhausting its retry limit. Counting the unjudged as failures gives 0.8808 and 0.8856. Mean 62.56 s and 30.21 s per case. The Qwen3.8 row is self-judged.*
+
+*Paired on the 791 cases judged in both, neither metric separates the models (accuracy McNemar exact p = 0.80, `cited_map` sign test p = 0.16). Not comparable with FRAMES results before v0.87.0, which used a different corpus build, embedder, reranker and capability.*
+
+## MTRAG (ClapNQ)
+
+[MTRAG](https://github.com/IBM/mt-rag-benchmark) is IBM's multi-turn RAG benchmark: human-written conversations with per-turn answerability labels and binary relevance judgments. The ClapNQ (Wikipedia) domain has 183,408 passages, 29 conversations, 224 turns and 208 retrieval queries.
+
+Four dataset keys share one database:
+
+- `mtrag_clapnq` retrieves with the last user turn as written, and answers each turn after replaying the reference conversation before it.
+- `mtrag_clapnq_rewrite` retrieves with the human standalone rewrites.
+- `mtrag_clapnq_live` replays whole conversations through one capability session, carrying the model's own answers, tools and state, with `EvidenceCompactionCapability` registered.
+- `mtrag_clapnq_live_uncompacted` is the same replay without compaction. It is the only evaluation where compaction acts.
+
+#### Retrieval (Recall@k / nDCG@k)
+
+Comparable with [IBM's published results](https://github.com/IBM/mt-rag-benchmark/tree/main/mtrag-human/retrieval_tasks). Elser is IBM's strongest reported retriever.
+
+| Retriever | Queries | R@5 | R@10 | nDCG@5 | nDCG@10 |
+|-----------|---------|----:|-----:|-------:|--------:|
+| Elser (IBM) | lastturn | 0.49 | 0.58 | 0.45 | 0.49 |
+| `haiku.rag` | lastturn | 0.501 | 0.600 | 0.455 | 0.497 |
+| Elser (IBM) | rewrite | 0.52 | 0.64 | 0.48 | 0.54 |
+| `haiku.rag` | rewrite | 0.548 | 0.668 | 0.503 | 0.556 |
+
+#### QA accuracy and citation retrieval
+
+| Mode | Capability model | Turns | QA accuracy | Mean `cited_map` |
+|------|------------------|------:|-------------|------------------|
+| Gold-prefix (`mtrag_clapnq`) | `vllm:Muse-Glimmer-30B-NVFP4` | 224 | 0.76 | 0.35 |
+| Live compacted (`mtrag_clapnq_live`) | `vllm:Muse-Glimmer-30B-NVFP4` | 224/224 scored | 0.83 micro / 0.84 macro | 0.42 |
+| Live uncompacted (`mtrag_clapnq_live_uncompacted`) | `vllm:Muse-Glimmer-30B-NVFP4` | 224/224 scored | 0.78 micro / 0.79 macro | 0.42 |
+
+*v0.74.0, `qwen3-embedding:4b` (vLLM, 2560), `Qwen3-Reranker-4B`, `reasoning_strength: high`, judged by `vllm:Qwen3.6-35B-A3B-NVFP4` (temperature 0.6, thinking). QA uses our judge and rubric and is not comparable with IBM's generation metrics. Gold-prefix and live rates answer different judge questions and are not comparable with each other. `cited_map` is over the 208 turns with gold passages.*
+
+The two live arms replay the same 224 turns and differ only in compaction:
+
+| | Compacted | Uncompacted |
+|---|---:|---:|
+| Input tokens per model request | 7,461 | 13,539 |
+| Turns passed | 185 | 175 |
+| Citation MAP (macro, 208 eligible turns) | 0.4174 | 0.4230 |
+| Refusal precision / recall (16 unanswerable turns) | 0.33 / 0.44 | 0.23 / 0.31 |
+
+Compaction cut input tokens per request by 44.9%. Of the 18 turns where the arms disagree, 14 pass only compacted (McNemar exact p = 0.031, paired difference +4.5 points, 95% CI +0.8 to +8.1). The gold-prefix arm's refusal precision and recall are 0.24 and 0.44.
+
+## Methodology
+
+### Retrieval metrics
+
+The retrieval benchmark runs one search per question through the configured search stack, with the reranker when one is configured and without context expansion. It keeps the top 5 chunks, 10 for MTRAG, and scores the distinct documents they come from, in rank order.
+
+**Mean Average Precision (MAP)** scores those documents against the gold `expected_uris`:
+
+- At each relevant document's position k, precision@k is the relevant documents in the top k divided by k.
+- Average precision (AP) is the sum of those precisions divided by the number of relevant documents.
+- MAP is the mean AP over queries, from 0 to 1. For a single-document query it is `1/rank`.
+
+MTRAG also reports Recall@k and nDCG@k.
+
+### QA accuracy
+
+A `pydantic-evals` LLM judge decides whether each answer is correct, and accuracy is the fraction judged correct. The default judge is `ollama:qwen3.8`, pinned so that changing the capability model does not change the judge. `evaluations.judge` in `haiku.rag.yaml` overrides it, including any OpenAI-compatible endpoint. Against the previous judge on 120 ORB cases, `qwen3.8` agreed on 95% (Cohen's κ 0.90).
+
+A dataset with its own deterministic evaluator is scored by it, and no judge runs. T²-RAGBench is the only one, with `NumberMatchEvaluator`.
+
+A case that ends in an error gets no verdict, and accuracy is over judged cases. A floor in a footnote counts the unjudged as failures.
+
+### Citation retrieval
+
+`cited_map` scores the URIs the capability registered with `cite` against the gold `expected_uris`, with the same MAP arithmetic. It comes from the same run as QA accuracy. Where retrieval MAP measures whether the retriever returned the gold document, `cited_map` measures whether the answer was grounded on it. The console also reports the cite rate, the share of cases with at least one citation, and mean citations per case.
+
+### Comparing runs
+
+Two runs are compared on the same cases: exact McNemar on the verdicts, the sign test on `cited_map`. Two runs of identical code and config already answer some cases differently, because the capability model samples and vLLM batching reorders near-tied scores, so a small difference needs that test before it means anything. See [Comparing two runs](https://github.com/ggozad/haiku.rag/blob/main/evaluations/README.md#comparing-two-runs) in the evaluations README.
+
+## Running evaluations
+
+The `evaluations` CLI in the repository's `evaluations/` package runs the benchmarks, orchestrated with [`pydantic-evals`](https://github.com/pydantic/pydantic-ai/tree/main/libs/pydantic-evals). Its [README](https://github.com/ggozad/haiku.rag/blob/main/evaluations/README.md) covers installation, every dataset and option, per-case result files, comparing two runs and restricting a run to part of a database.
+
+### Pre-built databases
+
+Building an evaluation database takes long, especially for OpenRAG Bench. Pre-built ones are on HuggingFace:
+
+```bash
+uv run evaluations download hotpotqa
+uv run evaluations download all
+```
+
+| Dataset | Size |
+|---------|------|
+| `orb_text`: OpenRAG Bench, `qwen3-embedding:4b` with VLM picture descriptions in the chunk text | ~15.9 GB |
+| `orb_multimodal`: OpenRAG Bench, multimodal `qwen3-vl-embedding-8b` | ~16.7 GB |
+| `orb_multimodal_nemotron`: OpenRAG Bench, multimodal `nvidia/llama-nemotron-embed-vl-1b-v2` | ~15.2 GB |
+| `t2_finqa`: T²-RAGBench FinQA, `qwen3-embedding:4b` | ~2.0 GB |
+| `t2_tatdqa`: T²-RAGBench TAT-DQA, `qwen3-embedding:4b` | ~1.8 GB |
+| `hotpotqa`: HotpotQA, `qwen3-embedding:4b` | ~1.2 GB |
+| `frames`: FRAMES, `nvidia/llama-nemotron-embed-vl-1b-v2` | ~7.2 GB |
+| `mtrag_clapnq`: MTRAG ClapNQ, `qwen3-embedding:4b`, shared by the `_rewrite`, `_live` and `_live_uncompacted` keys | ~2.8 GB |
+| `enterprise_rag`: EnterpriseRAG-Bench, `google/embeddinggemma-2`, with an IVF_PQ vector index | ~18 GB |
+
+The hosted `frames` and `orb_multimodal_nemotron` databases are the corpora behind the current FRAMES and ORB rows.
+
+A database opens only against the embedder recorded in it, so run a downloaded one with `--skip-db` and its reference config from `evaluations/configs/`:
+
+```bash
+uv run evaluations run orb_multimodal_nemotron --skip-db --config evaluations/configs/orb_multimodal_nemotron.yaml
+```
+
+`t2_tatdqa` has no reference config of its own. `evaluations/configs/t2_finqa.yaml` uses the same embedder and opens it.
+
+The configs use vLLM endpoints. Point their `base_url` at your own OpenAI-compatible servers to run them.
+
+### Judge settings
+
+The capability runs on `qa.model` and the judge on `evaluations.judge`, both from the configuration. The recommended judge settings, pinned in every reference config of a judged dataset:
+
+```yaml
+evaluations:
+  judge:
+    provider: openai
+    name: Inferact/Qwen3.8-27B-NVFP4
+    base_url: http://localhost:8000/v1   # optional, for OpenAI-compatible servers
+    temperature: 0.6
+    max_tokens: 16384
+    extra_body:
+      top_p: 0.95
+      top_k: 20
+      min_p: 0
+      chat_template_kwargs:
+        reasoning_effort: low   # qwen3.8: low | medium | xhigh (default)
+```
+
+### Faster judging with a System One model
+
+`evaluations.system_one` puts a [System One](https://typesafe.ai/blog/introducing-system-one-models-and-jev) model in front of the judge. It is optional and off by default, and the benchmarks on this page are judged by Qwen3.8 alone. A System One model returns a probability instead of generated text.
+
+Each answer goes to the decision model first, with the question, the expected answer and the generated answer as its state and the rubric as its question. At a probability of 0.8 or more the answer passes, and below 0.2 it fails, with no call to the judge. The judge in `evaluations.judge` decides everything in between, every case the endpoint fails on, and gold-prefix conversation cases. Live conversation runs do not use the model, and say so when the block is set. The run asks the model the judge's question before the first case and stops if it does not answer.
+
+TypeSafe's hosted Jev is reached on its `/v1/systemone` API and reads the key from `TYPESAFE_API_KEY`:
+
+```yaml
+evaluations:
+  system_one:
+    model: jev-1.13.0
+```
+
+Set `model` explicitly: when it is unset, the TypeSafe SDK sends `jev-latest`.
+
+[Tev1 4B](https://huggingface.co/togethercomputer/Tev1-4B-experimental) is an open decision model from Together AI that runs on Ollama or vLLM. With `provider` set, the judge asks it on the OpenAI-compatible chat API in Tev1's own format, reads the probability from the answer letter's logprobs, and averages the two orders of the yes and no options. Two requests per answer, no key.
+
+On Ollama 0.35 or later, the measurements used digest `cef45ef93cf6`:
+
+```bash
+ollama pull tev1:4b
+```
+
+```yaml
+evaluations:
+  system_one:
+    provider: ollama
+    model: tev1:4b
+```
+
+On vLLM, the measurements used revision `0b7becf` with vLLM 0.29:
+
+```bash
+vllm serve togethercomputer/Tev1-4B-experimental \
+  --revision 0b7becf017daa0e5eb222f8ce7483c8c8259c52f \
+  --served-model-name tev1-4b --max-num-seqs 256
+```
+
+vLLM refuses to start when `--max-num-seqs` exceeds the cache blocks it can give the model's linear-attention layers. 256 fit at `--gpu-memory-utilization 0.22` on a 96 GB GPU, and the default of 1024 did not.
+
+```yaml
+evaluations:
+  system_one:
+    provider: vllm
+    base_url: http://localhost:8000
+    model: tev1-4b
+```
+
+Tev1 was trained on prompts of up to 2,048 tokens. Its Ollama model sets a context of 2,050 and rejects longer prompts, which the judge then decides: 8 of 3,043 ORB answers and 8 of 797 FRAMES answers. On vLLM the prompt limit is `--max-model-len`.
+
+Ollama's own `/v1/systemone` API also serves `tev1:4b`, but renders its own prompt and rejects the judge's list criteria, so use `provider: ollama` instead.
+
+Measured against Qwen3.8 alone, on fresh `orb_multimodal_nemotron` and `frames` runs of the current capability: Jev on 2026-09-24, Tev1 4B on 2026-09-30. Every case where the verdicts differed was adjudicated by three independent labellers (one reviewer and two fresh-context LLM labellers), blind to which judge produced which verdict. Tev1 on vLLM served bf16 weights on a CUDA GPU, and on Ollama its Q8_0 build on Apple silicon. The two gave the same verdict on 3,033 of 3,035 ORB answers and 788 of 789 FRAMES answers.
+
+| Endpoint | Dataset | Cases | Decided alone | Pass rate (Qwen3.8 → gated) | Changed verdicts | Qwen3.8 right / gated right |
+|---|---|---|---|---|---|---|
+| Jev 1.13.0 | ORB | 3,043 | 90.0% | 96.39% → 96.09% | 9 | 6 / 3 |
+| Jev 1.13.0 | FRAMES | 797 | 94.9% | 90.97% → 90.97% | 2 | 0 / 2 |
+| Tev1 4B, vLLM | ORB | 3,043 | 92.7% | 96.39% → 96.39% | 6 | 2 / 4 |
+| Tev1 4B, vLLM | FRAMES | 797 | 96.7% | 90.97% → 90.59% | 5 | 2 / 3 |
+| Tev1 4B, Ollama | ORB | 3,043 | 92.9% | 96.39% → 96.39% | 8 | 3 / 4 (one not adjudicated) |
+| Tev1 4B, Ollama | FRAMES | 797 | 96.6% | 90.97% → 90.72% | 6 | 2 / 4 |
+
+All 9 of Jev's ORB changes are fails below 0.2 on answers Qwen3.8 passed (McNemar exact p = 0.004), so a Jev-gated ORB run reads lower than Qwen3.8 alone. Tev1's changes go both ways. The splits of who was right rest on 2 to 9 cases per row and are too small to rank the endpoints. Neither model is deterministic between runs: replaying 390 labelled cases moved up to 11 across a band edge for Jev, and vLLM's batching moves Tev1's probabilities by up to 0.03, so a gated run does not reproduce verdict for verdict.
+
+Result rows record `judge_decided_by` (`system_one`, `fallback`, `fallback_on_error` or `fallback_conversation`), `judge_probability` and `system_one_model`, and the run prints the count of each. A gated run and an ungated run of the same system differ by the judge as well, so they do not form a null pair, and `evaluations pair` warns when only one of its two files was gated or when they were gated by different models.

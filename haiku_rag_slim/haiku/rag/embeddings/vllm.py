@@ -1,0 +1,161 @@
+"""Multimodal embedder backed by a vLLM OpenAI-compatible HTTP server.
+
+vLLM's ``/v1/embeddings`` endpoint is a superset of OpenAI's:
+
+- Text inputs use the standard ``input: list[str]`` field — one HTTP call
+  returns N embeddings.
+- Image inputs use a ``messages`` array carrying an ``image_url`` content
+  part with a base64 data URI. One image per HTTP call.
+
+Models like ``Qwen/Qwen3-VL-Embedding-8B`` and ``jinaai/jina-embeddings-v4``
+ship with chat templates that map both shapes into a shared vector space.
+"""
+
+from typing import TYPE_CHECKING, Any
+
+import httpx
+
+from haiku.rag.embeddings import EmbedderWrapper, _to_data_uri
+from haiku.rag.utils.http import (
+    DROPPED_CONNECTION_ERRORS,
+    pooled_client,
+    post_retrying_dropped_connection,
+)
+
+if TYPE_CHECKING:
+    from PIL import Image as PILImage
+
+
+class VLLMMultimodalEmbedder(EmbedderWrapper):
+    # Subclasses serving another endpoint override these; errors quote them.
+    _service_name = "vLLM"
+    _connect_hint = "Ensure the service is running."
+
+    def __init__(
+        self,
+        model_name: str,
+        vector_dim: int,
+        base_url: str,
+        api_key: str | None = None,
+        timeout: float = 60.0,
+        supports_images: bool = True,
+        query_prefix: str = "",
+        document_prefix: str = "",
+    ):
+        super().__init__(
+            embedder=None,
+            vector_dim=vector_dim,
+            supports_images=supports_images,
+            query_prefix=query_prefix,
+            document_prefix=document_prefix,
+        )
+        self._model_name = model_name
+        self._base_url = base_url.rstrip("/")
+        self._api_key = api_key
+        self._timeout = timeout
+        # One client reused across every request so the connection (and its
+        # name resolution) is established once and kept alive, rather than
+        # rebuilt per call.
+        self._client = pooled_client(timeout)
+
+    def _headers(self) -> dict[str, str]:
+        headers = {"Content-Type": "application/json"}
+        if self._api_key:
+            headers["Authorization"] = f"Bearer {self._api_key}"
+        return headers
+
+    async def aclose(self) -> None:
+        await self._client.aclose()
+
+    async def _post(self, body: dict[str, Any]) -> list[list[float]]:
+        try:
+            response = await post_retrying_dropped_connection(
+                self._client,
+                f"{self._base_url}/embeddings",
+                json=body,
+                headers=self._headers(),
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except DROPPED_CONNECTION_ERRORS as e:
+            raise ValueError(
+                f"{self._service_name} at {self._base_url} dropped the "
+                f"connection twice without a response. Error: {e}"
+            ) from e
+        except httpx.ConnectError as e:
+            raise ValueError(
+                f"Could not connect to {self._service_name} at {self._base_url}. "
+                f"{self._connect_hint} Error: {e}"
+            ) from e
+        except httpx.TimeoutException as e:
+            raise ValueError(
+                f"Request to {self._service_name} timed out after "
+                f"{self._timeout}s. Error: {e}"
+            ) from e
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 401:
+                raise ValueError(
+                    f"Authentication failed against {self._service_name}. "
+                    "Check the API key."
+                ) from e
+            raise ValueError(f"HTTP error from {self._service_name}: {e}") from e
+
+        data = payload.get("data") or []
+        if not data:
+            raise ValueError(f"{self._service_name} returned no embeddings: {payload}")
+        rows = [list(d["embedding"]) for d in data]
+        for row in rows:
+            if len(row) != self._vector_dim:
+                raise ValueError(
+                    f"{self._service_name} model '{self._model_name}' returned a "
+                    f"{len(row)}-dimensional embedding, but "
+                    f"embeddings.model.vector_dim is {self._vector_dim}. Set "
+                    "vector_dim to the model's own dimension."
+                )
+        return rows
+
+    async def _embed_query(self, text: str) -> list[float]:
+        rows = await self._post(
+            {
+                "model": self._model_name,
+                "input": [text],
+                "encoding_format": "float",
+            }
+        )
+        return rows[0]
+
+    async def _embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return await self._post(
+            {
+                "model": self._model_name,
+                "input": texts,
+                "encoding_format": "float",
+            }
+        )
+
+    def _image_request(self, image: "bytes | PILImage.Image") -> dict[str, Any]:
+        """Request body that embeds one picture."""
+        return {
+            "model": self._model_name,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": _to_data_uri(image)},
+                        }
+                    ],
+                }
+            ],
+            "encoding_format": "float",
+        }
+
+    async def embed_image(self, image: "bytes | PILImage.Image") -> list[float]:
+        if not self.supports_images:
+            raise NotImplementedError(
+                f"This {self._service_name} embedder is text-only. Set "
+                "embeddings.model.multimodal: true to embed images."
+            )
+        rows = await self._post(self._image_request(image))
+        return rows[0]

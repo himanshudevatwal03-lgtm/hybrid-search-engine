@@ -1,0 +1,1303 @@
+import asyncio
+import subprocess
+import sys
+from pathlib import Path
+from unittest.mock import AsyncMock, patch
+
+import pytest
+from click.exceptions import BadParameter
+from typer.testing import CliRunner
+
+from haiku.rag.cli import _cli as cli
+from haiku.rag.cli import _parse_meta_options, resolve_scope
+from haiku.rag.cli import cli as cli_wrapper
+from haiku.rag.client import HaikuRAG
+from haiku.rag.config import get_config, set_config
+from haiku.rag.config.models import AppConfig, LanceDBConfig
+from haiku.rag.store.exceptions import (
+    AmbiguousDatabaseError,
+    ConfigMismatchError,
+    MigrationRequiredError,
+    TagError,
+    UnknownDatabaseError,
+    UpgradeRequiredError,
+)
+from tests.conftest import TRACEPARENT, current_trace
+
+runner = CliRunner()
+
+
+def test_importing_cli_does_not_load_heavy_dependencies():
+    """Importing the CLI must not pull the heavy runtime dependencies; they cost
+    seconds of startup. Runs in a subprocess because another test in the same
+    session may already have imported them."""
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import haiku.rag.cli, sys; "
+            "loaded = {'lancedb', 'pyarrow', 'pydantic_ai'} & sys.modules.keys(); "
+            "assert not loaded, loaded",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+class TestParseMetaOptions:
+    def test_empty_input(self):
+        assert _parse_meta_options(None) == {}
+        assert _parse_meta_options([]) == {}
+
+    @pytest.mark.parametrize(
+        "options, expected",
+        [
+            (["author=alice", "topic=notes"], {"author": "alice", "topic": "notes"}),
+            (["version=3"], {"version": 3}),
+            (["score=3.14"], {"score": 3.14}),
+            (["published=true", "draft=false"], {"published": True, "draft": False}),
+            (["empty=null"], {"empty": None}),
+            (['tags=["a","b","c"]'], {"tags": ["a", "b", "c"]}),
+            (['nested={"x": 1}'], {"nested": {"x": 1}}),
+            (["name=hello world"], {"name": "hello world"}),
+            (["equation=a=b+c"], {"equation": "a=b+c"}),
+        ],
+    )
+    def test_a_value_is_json_or_text(self, options, expected):
+        result = _parse_meta_options(options)
+        assert result == expected
+        assert [type(v) for v in result.values()] == [
+            type(v) for v in expected.values()
+        ]
+
+    def test_missing_equals_raises(self):
+        with pytest.raises(BadParameter):
+            _parse_meta_options(["no_equals_here"])
+
+    def test_empty_key_raises(self):
+        with pytest.raises(BadParameter):
+            _parse_meta_options(["=value"])
+
+
+class TestRebuildValidation:
+    def test_embed_only_and_rechunk_mutually_exclusive(self):
+        result = runner.invoke(
+            cli, ["rebuild", "--embed-only", "--rechunk", "--db", "/tmp/fake.lancedb"]
+        )
+        assert result.exit_code == 1
+        assert "mutually exclusive" in result.output
+
+    def test_reindex_and_rechunk_mutually_exclusive(self):
+        result = runner.invoke(
+            cli, ["rebuild", "--reindex", "--rechunk", "--db", "/tmp/fake.lancedb"]
+        )
+        assert result.exit_code == 1
+        assert "mutually exclusive" in result.output
+
+
+class TestOneDatabaseCommands:
+    """`lancedb.databases` names a set; most commands work on one database."""
+
+    @staticmethod
+    def _install(monkeypatch, **databases):
+        import haiku.rag.config as config_module
+
+        monkeypatch.setattr(config_module, "_config", None)
+        monkeypatch.setattr("haiku.rag.cli._db_name", None)
+        set_config(AppConfig(lancedb=LanceDBConfig(databases=databases)))
+
+    def test_a_configured_set_refuses_a_one_database_command(self, monkeypatch):
+        """The refusal carries names only. A location in an error message
+        travels into logs and terminals."""
+        self._install(
+            monkeypatch,
+            alpha="s3://bucket/prefix/a.lancedb",
+            beta="s3://bucket/prefix/b.lancedb",
+        )
+
+        with pytest.raises(AmbiguousDatabaseError, match="alpha, beta") as raised:
+            resolve_scope(None)
+
+        # `--db-name` is global and `--db` is per-command, so the remedy says
+        # where each one goes.
+        assert "--db-name NAME before the command" in str(raised.value)
+        assert "--db PATH after it" in str(raised.value)
+        assert "s3://bucket/prefix/a.lancedb" not in str(raised.value)
+        assert "bucket" not in str(raised.value)
+
+    def test_a_command_covering_the_set_is_allowed(self, monkeypatch):
+        self._install(monkeypatch, alpha="/db/a.lancedb", beta="/db/b.lancedb")
+
+        assert resolve_scope(None, covers_set=True).names == ("alpha", "beta")
+
+    def test_naming_a_path_overrides_a_configured_set(self, monkeypatch):
+        """`--db` is the operator's explicit override: it constructs the scope
+        directly, where a Python caller passing a path beside `databases` is
+        refused."""
+        self._install(monkeypatch, alpha="/db/a.lancedb", beta="/db/b.lancedb")
+
+        scope = resolve_scope(Path("/db/other.lancedb"))
+
+        assert scope.names == ("other",)
+        assert not scope.covers_multiple
+        assert scope.databases[0].db_path == Path("/db/other.lancedb")
+
+    def test_a_path_without_a_stem_is_a_usage_error(self, monkeypatch):
+        """A path that names no database is the operator's mistake, reported as
+        one."""
+        import typer
+
+        self._install(monkeypatch)
+
+        with pytest.raises(typer.BadParameter, match="no name"):
+            resolve_scope(Path("/"))
+
+
+class TestSelectingADatabaseByName:
+    """`--db-name NAME` is the only way to reach a configured database whose
+    location is a URI, since `--db` takes a path."""
+
+    @staticmethod
+    def _install(monkeypatch, **databases):
+        import haiku.rag.config as config_module
+
+        monkeypatch.setattr(config_module, "_config", None)
+        set_config(AppConfig(lancedb=LanceDBConfig(databases=databases)))
+
+    def test_an_unknown_name_does_not_leak_locations(self, monkeypatch):
+        self._install(monkeypatch, papers="s3://bucket/prefix/papers.lancedb")
+        monkeypatch.setattr("haiku.rag.cli._db_name", "gamma")
+
+        with pytest.raises(UnknownDatabaseError) as raised:
+            resolve_scope(None)
+
+        assert "bucket" not in str(raised.value)
+
+    def test_the_callback_selects_before_a_command_runs(self, tmp_path, monkeypatch):
+        """`--db-name` is resolved once the config is loaded, so every command
+        and both TUIs see the selected database."""
+        import haiku.rag.config as config_module
+
+        monkeypatch.setattr(config_module, "_config", None)
+        config_file = tmp_path / "haiku.rag.yaml"
+        config_file.write_text("lancedb:\n  databases:\n    alpha: /data/a.lancedb\n")
+
+        result = runner.invoke(
+            cli, ["--config", str(config_file), "--db-name", "nope", "list"]
+        )
+
+        assert result.exit_code != 0
+        assert isinstance(result.exception, UnknownDatabaseError)
+        assert "nope" in str(result.exception)
+
+    def test_a_selection_does_not_outlive_its_invocation(self, tmp_path, monkeypatch):
+        """The selector is module state, and a second invocation without
+        `--db-name` starts from a freshly loaded configuration."""
+        import haiku.rag.cli as cli_module
+        import haiku.rag.config as config_module
+
+        monkeypatch.setattr(config_module, "_config", None)
+        monkeypatch.setattr(cli_module, "_db_name", None)
+        config_file = tmp_path / "haiku.rag.yaml"
+        config_file.write_text(
+            f"lancedb:\n  databases:\n    alpha: {tmp_path / 'alpha.lancedb'}\n"
+            f"    beta: {tmp_path / 'beta.lancedb'}\n"
+        )
+
+        runner.invoke(cli, ["--config", str(config_file), "--db-name", "alpha", "info"])
+        assert cli_module._db_name == "alpha"
+        # Naming one leaves the configuration naming both.
+        assert set(get_config().lancedb.databases) == {"alpha", "beta"}
+
+        runner.invoke(cli, ["--config", str(config_file), "settings"])
+
+        assert set(get_config().lancedb.databases) == {"alpha", "beta"}
+        assert cli_module._db_name is None
+
+    def test_a_selection_does_not_outlive_an_invocation_without_a_config_file(
+        self, tmp_path, monkeypatch
+    ):
+        """No config file is still a load: the previous invocation's database
+        must not be what the next one talks to."""
+        import haiku.rag.cli as cli_module
+        import haiku.rag.config as config_module
+
+        monkeypatch.setattr(config_module, "_config", None)
+        monkeypatch.setattr(cli_module, "_db_name", None)
+        monkeypatch.delenv("HAIKU_RAG_CONFIG_PATH", raising=False)
+        monkeypatch.chdir(tmp_path)
+        config_file = tmp_path / "selected.yaml"
+        config_file.write_text(
+            "lancedb:\n  databases:\n    papers: s3://bucket/papers.lancedb\n"
+        )
+
+        runner.invoke(
+            cli, ["--config", str(config_file), "--db-name", "papers", "settings"]
+        )
+        assert get_config().lancedb.databases == {
+            "papers": "s3://bucket/papers.lancedb"
+        }
+
+        runner.invoke(cli, ["settings"])
+
+        assert get_config().lancedb.databases == {}
+        assert cli_module._db_name is None
+
+
+class TestCommandsThatWorkOnNoDatabase:
+    """`settings` and `download-models` read the configuration. A name that
+    selects a database is nothing to them, including a wrong one."""
+
+    def test_settings_ignores_an_unknown_name(self, tmp_path, monkeypatch):
+        import haiku.rag.config as config_module
+
+        monkeypatch.setattr(config_module, "_config", None)
+        config_file = tmp_path / "haiku.rag.yaml"
+        config_file.write_text("lancedb:\n  databases:\n    alpha: /data/a.lancedb\n")
+
+        result = runner.invoke(
+            cli, ["--config", str(config_file), "--db-name", "nope", "settings"]
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "haiku.rag configuration" in result.output
+
+    def test_download_models_ignores_an_unknown_name(self, tmp_path, monkeypatch):
+        import haiku.rag.config as config_module
+
+        monkeypatch.setattr(config_module, "_config", None)
+        config_file = tmp_path / "haiku.rag.yaml"
+        config_file.write_text("lancedb:\n  databases:\n    alpha: /data/a.lancedb\n")
+        downloaded: list[object] = []
+
+        async def nothing_to_download(config):
+            downloaded.append(config)
+            return
+            yield  # pragma: no cover - an empty async generator needs one
+
+        monkeypatch.setattr(
+            "haiku.rag.client.downloads.download_models", nothing_to_download
+        )
+
+        result = runner.invoke(
+            cli,
+            ["--config", str(config_file), "--db-name", "nope", "download-models"],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert len(downloaded) == 1
+
+
+class TestResolvingTheDatabasePath:
+    def test_naming_a_database_twice_is_refused(self, monkeypatch):
+        monkeypatch.setattr("haiku.rag.cli._db_name", "notes")
+
+        with pytest.raises(AmbiguousDatabaseError, match="not both"):
+            resolve_scope(Path("/data/other.lancedb"))
+
+
+class TestConfiguredLocalDatabase:
+    """One entry in `lancedb.databases` with a local path."""
+
+    def _config_file(self, tmp_path, located: Path) -> Path:
+        config_file = tmp_path / "haiku.rag.yaml"
+        config_file.write_text(f"lancedb:\n  databases:\n    notes: {located}\n")
+        return config_file
+
+    def _fresh(self, monkeypatch) -> None:
+        import haiku.rag.cli as cli_module
+        import haiku.rag.config as config_module
+
+        monkeypatch.setattr(config_module, "_config", None)
+        monkeypatch.setattr(cli_module, "_db_name", None)
+
+    def _reports(self, result, located: Path) -> bool:
+        """Rich wraps a long path to the terminal width, so compare without it."""
+        return str(located) in "".join(result.output.split())
+
+    def test_init_creates_the_configured_local_database(self, tmp_path, monkeypatch):
+        self._fresh(monkeypatch)
+        located = tmp_path / "notes.lancedb"
+        config_file = self._config_file(tmp_path, located)
+
+        result = runner.invoke(cli, ["--config", str(config_file), "init"])
+
+        assert result.exit_code == 0, result.output
+        assert located.exists()
+
+        self._fresh(monkeypatch)
+        result = runner.invoke(cli, ["--config", str(config_file), "info"])
+        assert result.exit_code == 0, result.output
+        assert self._reports(result, located)
+
+    def test_a_missing_configured_path_is_refused(self, tmp_path, monkeypatch):
+        """A schemeless value is a local path and must exist."""
+        self._fresh(monkeypatch)
+        located = tmp_path / "typo.lancedb"
+        config_file = self._config_file(tmp_path, located)
+
+        result = runner.invoke(cli, ["--config", str(config_file), "info"])
+
+        assert "does not exist" in result.output
+        assert not located.exists()
+
+    def test_db_overrides_the_configured_database(self, tmp_path, monkeypatch):
+        self._fresh(monkeypatch)
+        configured = tmp_path / "configured.lancedb"
+        chosen = tmp_path / "chosen.lancedb"
+        config_file = self._config_file(tmp_path, configured)
+
+        result = runner.invoke(
+            cli, ["--config", str(config_file), "init", "--db", str(chosen)]
+        )
+
+        assert result.exit_code == 0, result.output
+        assert chosen.exists()
+        assert not configured.exists()
+
+        self._fresh(monkeypatch)
+        result = runner.invoke(
+            cli, ["--config", str(config_file), "info", "--db", str(chosen)]
+        )
+        assert result.exit_code == 0, result.output
+        assert self._reports(result, chosen)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        AmbiguousDatabaseError("names alpha, beta"),
+        ConfigMismatchError("database 'nemotron': vector dimension 2048 -> 2560"),
+        MigrationRequiredError(
+            "Database requires migration. Run 'haiku-rag migrate' to upgrade."
+        ),
+        UpgradeRequiredError("Upgrade haiku.rag."),
+        TagError("Tag 'nope' does not exist"),
+    ],
+)
+def test_a_domain_error_exits_with_its_message(capsys, error):
+    with patch("haiku.rag.cli._cli", side_effect=error):
+        with pytest.raises(SystemExit) as exc_info:
+            cli_wrapper()
+
+    assert exc_info.value.code == 1
+    assert capsys.readouterr().err == f"Error: {error}\n"
+
+
+class TestCliMissingDatabase:
+    def test_missing_database_path_is_an_error_not_a_traceback(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        async def current():
+            return True, "9.9.9", "9.9.9"
+
+        monkeypatch.setattr("haiku.rag.cli.is_up_to_date", current)
+        missing = tmp_path / "missing.lancedb"
+        monkeypatch.setattr(sys, "argv", ["haiku-rag", "list", "--db", str(missing)])
+
+        with pytest.raises(SystemExit) as exc_info:
+            cli_wrapper()
+
+        assert exc_info.value.code == 1
+        out, err = capsys.readouterr()
+        assert err.startswith("Error: Database does not exist")
+        assert str(missing) in err
+        assert "outdated" not in out + err
+
+
+class TestCliAttachmentDeletion:
+    def test_deleting_an_attachment_is_an_error_not_a_traceback(
+        self, temp_db_path, monkeypatch, capsys
+    ):
+        from haiku.rag.store.models.document import Document
+
+        parent_uri = "file:///path/to/parent.pdf"
+
+        async def seed() -> str:
+            async with HaikuRAG(temp_db_path, create=True) as client:
+                await client.document_repository.create(
+                    Document(content="parent", uri=parent_uri, metadata={})
+                )
+                child = await client.document_repository.create(
+                    Document(
+                        content="child",
+                        uri=f"{parent_uri}#attachment=a.txt",
+                        metadata={"parent_uri": parent_uri},
+                    )
+                )
+                assert child.id is not None
+                return child.id
+
+        child_id = asyncio.run(seed())
+
+        async def current():
+            return True, "9.9.9", "9.9.9"
+
+        monkeypatch.setattr("haiku.rag.cli.is_up_to_date", current)
+        monkeypatch.setattr(
+            sys, "argv", ["haiku-rag", "delete", child_id, "--db", str(temp_db_path)]
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            cli_wrapper()
+
+        assert exc_info.value.code == 1
+        err = capsys.readouterr().err
+        assert err.startswith("Error: ")
+        assert parent_uri in err
+
+
+class TestTagCommands:
+    def test_tag_round_trip(self, temp_db_path):
+        db = str(temp_db_path)
+
+        result = runner.invoke(cli, ["init", "--db", db])
+        assert result.exit_code == 0
+
+        result = runner.invoke(cli, ["tag", "create", "release-1", "--db", db])
+        assert result.exit_code == 0
+        assert "release-1" in result.output
+
+        result = runner.invoke(cli, ["tag", "list", "--db", db])
+        assert result.exit_code == 0
+        assert "release-1" in result.output
+        assert "partial" not in result.output
+
+        result = runner.invoke(cli, ["history", "--db", db, "-t", "documents"])
+        assert result.exit_code == 0
+        assert "release-1" in result.output
+
+        result = runner.invoke(cli, ["tag", "create", "release-1", "--db", db])
+        assert result.exit_code == 1
+        assert "already exists" in result.output
+
+        result = runner.invoke(cli, ["tag", "delete", "release-1", "--db", db])
+        assert result.exit_code == 0
+
+        result = runner.invoke(cli, ["tag", "list", "--db", db])
+        assert result.exit_code == 0
+        assert "No tags" in result.output
+
+        result = runner.invoke(cli, ["tag", "delete", "release-1", "--db", db])
+        assert result.exit_code == 1
+        assert "does not exist" in result.output
+
+    def test_tag_create_rejected_when_migrations_pending(self, temp_db_path):
+        """A writable tag operation must hit the migration gate and must not
+        mutate a legacy database (e.g. by creating missing tables)."""
+        import asyncio
+
+        import lancedb
+
+        from haiku.rag.store.engine import Store
+
+        async def _prepare_legacy_db():
+            async with Store(temp_db_path, create=True) as store:
+                await store.set_haiku_version("0.19.0")
+            db = await lancedb.connect_async(temp_db_path.absolute())
+            await db.drop_table("document_meta")
+            db.close()
+
+        asyncio.run(_prepare_legacy_db())
+
+        result = runner.invoke(
+            cli, ["tag", "create", "release-1", "--db", str(temp_db_path)]
+        )
+        assert result.exit_code == 1
+        assert isinstance(result.exception, MigrationRequiredError)
+
+        async def _table_names() -> list[str]:
+            db = await lancedb.connect_async(temp_db_path.absolute())
+            tables = (await db.list_tables()).tables
+            db.close()
+            return tables
+
+        assert "document_meta" not in asyncio.run(_table_names())
+
+    def test_tag_commands_missing_database_exit_nonzero(self, tmp_path):
+        missing = str(tmp_path / "does_not_exist.lancedb")
+        for args in (
+            ["tag", "create", "r1", "--db", missing],
+            ["tag", "delete", "r1", "--db", missing],
+            ["tag", "list", "--db", missing],
+        ):
+            result = runner.invoke(cli, args)
+            assert result.exit_code == 1, args
+            assert "does not exist" in result.output, args
+
+    def test_tag_create_invalid_name_fails_cleanly(self, temp_db_path):
+        """lance restricts ref names to alphanumeric, '.', '-', '_'; the CLI
+        surfaces that as a clean error instead of a traceback."""
+        db = str(temp_db_path)
+        result = runner.invoke(cli, ["init", "--db", db])
+        assert result.exit_code == 0
+
+        result = runner.invoke(cli, ["tag", "create", "[red]release[/red]", "--db", db])
+        assert result.exit_code == 1
+        assert "Error:" in result.output
+        assert "Ref characters" in result.output
+
+
+class TestTagRestore:
+    def test_restore_requires_confirmation_and_decline_changes_nothing(
+        self, temp_db_path
+    ):
+        db = str(temp_db_path)
+        assert runner.invoke(cli, ["init", "--db", db]).exit_code == 0
+        assert runner.invoke(cli, ["tag", "create", "r1", "--db", db]).exit_code == 0
+
+        result = runner.invoke(cli, ["tag", "restore", "r1", "--db", db], input="n\n")
+        assert result.exit_code == 1
+        assert "live database state" in result.output
+        assert "Stop all ingestion" in result.output
+        assert "not transactionally atomic" in result.output
+        assert "safety tag" in result.output
+
+        result = runner.invoke(cli, ["tag", "list", "--db", db])
+        assert "before-restore" not in result.output
+
+    def test_restore_confirmed_restores_the_tagged_state(self, temp_db_path):
+        from haiku.rag.store.engine import Store
+        from haiku.rag.store.models import Document
+        from haiku.rag.store.repositories.document import DocumentRepository
+
+        async def _tagged_then_written():
+            async with Store(temp_db_path, create=True) as store:
+                repo = DocumentRepository(store)
+                await repo.create(Document(content="First"))
+                await store.create_tag("r1")
+                await repo.create(Document(content="Second"))
+
+        async def _live_state():
+            async with Store(temp_db_path, read_only=True) as store:
+                docs = await DocumentRepository(store).list_all(include_content=True)
+                return {d.content for d in docs}, set(await store.list_tags())
+
+        asyncio.run(_tagged_then_written())
+
+        result = runner.invoke(
+            cli, ["tag", "restore", "r1", "--db", str(temp_db_path)], input="y\n"
+        )
+
+        assert result.exit_code == 0, result.output
+        contents, tags = asyncio.run(_live_state())
+        assert contents == {"First"}
+        [safety] = tags - {"r1"}
+        assert safety.startswith("before-restore-")
+
+    def test_restore_non_interactive_without_yes_fails(self, temp_db_path):
+        db = str(temp_db_path)
+        assert runner.invoke(cli, ["init", "--db", db]).exit_code == 0
+        assert runner.invoke(cli, ["tag", "create", "r1", "--db", db]).exit_code == 0
+
+        result = runner.invoke(cli, ["tag", "restore", "r1", "--db", db])
+        assert result.exit_code == 1
+
+        result = runner.invoke(cli, ["tag", "list", "--db", db])
+        assert "before-restore" not in result.output
+
+    def test_restore_with_yes(self, temp_db_path):
+        db = str(temp_db_path)
+        assert runner.invoke(cli, ["init", "--db", db]).exit_code == 0
+        assert runner.invoke(cli, ["tag", "create", "r1", "--db", db]).exit_code == 0
+
+        result = runner.invoke(cli, ["tag", "restore", "r1", "--yes", "--db", db])
+        assert result.exit_code == 0
+        assert "Restored database to tag 'r1'" in result.output
+        assert "before-restore-" in result.output
+        assert "now live" in result.output
+        assert "migrate" in result.output
+
+        result = runner.invoke(cli, ["tag", "list", "--db", db])
+        assert "before-restore-" in result.output
+
+    def test_restore_missing_tag_errors(self, temp_db_path):
+        db = str(temp_db_path)
+        assert runner.invoke(cli, ["init", "--db", db]).exit_code == 0
+
+        result = runner.invoke(cli, ["tag", "restore", "nope", "--yes", "--db", db])
+        assert result.exit_code == 1
+        assert "does not exist" in result.output
+
+    def test_restore_partial_tag_errors(self, temp_db_path):
+        import asyncio
+
+        from haiku.rag.store.engine import Store
+
+        async def _partial_tag():
+            async with Store(temp_db_path, create=True) as store:
+                version = await store.chunks_table.version()
+                await store.chunks_table.tags.create("stale", version)
+
+        asyncio.run(_partial_tag())
+
+        result = runner.invoke(
+            cli, ["tag", "restore", "stale", "--yes", "--db", str(temp_db_path)]
+        )
+        assert result.exit_code == 1
+        assert "partial" in result.output
+        assert "documents" in result.output
+
+    def test_restore_missing_database_exits_nonzero(self, tmp_path):
+        missing = tmp_path / "does_not_exist.lancedb"
+        result = runner.invoke(
+            cli, ["tag", "restore", "r1", "--yes", "--db", str(missing)]
+        )
+        assert result.exit_code == 1
+        assert "does not exist" in result.output
+
+        # Without --yes the missing database is reported before the
+        # confirmation prompt, not after the user confirms.
+        result = runner.invoke(cli, ["tag", "restore", "r1", "--db", str(missing)])
+        assert result.exit_code == 1
+        assert "does not exist" in result.output
+        assert "Continue?" not in result.output
+
+    def test_tag_help_includes_restore(self):
+        result = runner.invoke(cli, ["tag", "--help"])
+        assert result.exit_code == 0
+        assert "restore" in result.output
+
+        result = runner.invoke(cli, ["--help"])
+        assert "--before" not in result.output
+        assert "--at" not in result.output
+
+
+class TestChatCoversTheSet:
+    """Chat is a read verb: it answers with the same capabilities `ask` uses,
+    and covers the configured set."""
+
+    @staticmethod
+    def _config_file(tmp_path):
+        config_file = tmp_path / "haiku.rag.yaml"
+        config_file.write_text(
+            f"lancedb:\n  databases:\n    arxiv: {tmp_path / 'a.lancedb'}\n"
+            f"    wiki: {tmp_path / 'w.lancedb'}\n"
+        )
+        return config_file
+
+    def test_a_configured_set_is_covered_rather_than_refused(
+        self, tmp_path, monkeypatch
+    ):
+        import haiku.rag.cli as cli_module
+        import haiku.rag.config as config_module
+
+        monkeypatch.setattr(config_module, "_config", None)
+        monkeypatch.setattr(cli_module, "_db_name", None)
+
+        with patch("haiku.rag.chat.run_chat") as run_chat:
+            result = runner.invoke(
+                cli, ["--config", str(self._config_file(tmp_path)), "chat"]
+            )
+
+        assert result.exit_code == 0, result.output
+        # The scope covers both, which is what makes chat read the set.
+        assert run_chat.call_args.kwargs["scope"].names == ("arxiv", "wiki")
+
+    def test_naming_one_database_opens_that_one(self, tmp_path, monkeypatch):
+        import haiku.rag.cli as cli_module
+        import haiku.rag.config as config_module
+
+        monkeypatch.setattr(config_module, "_config", None)
+        monkeypatch.setattr(cli_module, "_db_name", None)
+
+        with patch("haiku.rag.chat.run_chat") as run_chat:
+            result = runner.invoke(
+                cli,
+                [
+                    "--config",
+                    str(self._config_file(tmp_path)),
+                    "--db-name",
+                    "wiki",
+                    "chat",
+                ],
+            )
+
+        assert result.exit_code == 0, result.output
+        # Passed on by name, so the database it opens keeps its identity.
+        assert run_chat.call_args.kwargs["scope"].names == ("wiki",)
+
+    def test_a_single_database_setup_is_unchanged(self, tmp_path, monkeypatch):
+        """Without a configured set, chat opens the path it always did."""
+        import haiku.rag.cli as cli_module
+        import haiku.rag.config as config_module
+
+        monkeypatch.setattr(config_module, "_config", None)
+        monkeypatch.setattr(cli_module, "_db_name", None)
+
+        with patch("haiku.rag.chat.run_chat") as run_chat:
+            result = runner.invoke(cli, ["chat", "--db", str(tmp_path / "one.lancedb")])
+
+        assert result.exit_code == 0, result.output
+        run_chat.assert_called_once()
+        [ref] = run_chat.call_args.kwargs["scope"].databases
+        assert ref.db_path == tmp_path / "one.lancedb"
+
+
+@pytest.fixture
+def app_stub(monkeypatch, tmp_path):
+    """Stand in for HaikuRAGApp so a command's wiring can be checked without a
+    database or a model. These tests pin argument parsing and dispatch, not what
+    the application layer renders."""
+    # AsyncMock so every command's `asyncio.run(app.x(...))` gets a coroutine.
+    stub = AsyncMock()
+    monkeypatch.setattr(
+        "haiku.rag.cli.create_app",
+        lambda db=None, *, covers_set=False, at=None, reads_tags=False: stub,
+    )
+    return stub
+
+
+DB_ARGS = ["--db", "/tmp/test.lancedb"]
+
+
+@pytest.mark.parametrize(
+    "argv, method, expected",
+    [
+        (["list"], "list_documents", {"filter": None}),
+        (
+            ["list", "--filter", "uri LIKE 'x%'"],
+            "list_documents",
+            {"filter": "uri LIKE 'x%'"},
+        ),
+        (
+            ["add", "some text", "--title", "T"],
+            "add_document_from_text",
+            {"text": "some text", "title": "T", "metadata": None},
+        ),
+        (["get", "doc-1"], "get_document", {"doc_id": "doc-1"}),
+        (["delete", "doc-1"], "delete_document", {"doc_id": "doc-1"}),
+        (
+            ["visualize", "chunk-1"],
+            "visualize_chunk",
+            {"chunk_id": "chunk-1", "expand": True},
+        ),
+        (
+            ["visualize", "chunk-1", "--no-expand"],
+            "visualize_chunk",
+            {"chunk_id": "chunk-1", "expand": False},
+        ),
+        (["vacuum"], "vacuum", {"retention_seconds": None}),
+        (["vacuum", "--retention-seconds", "0"], "vacuum", {"retention_seconds": 0}),
+        (["create-index"], "create_index", {}),
+        (["init"], "init", {}),
+        (["info"], "info", {}),
+        # limit/search_type default to None: the app layer resolves the config
+        # default, so the CLI must not invent one.
+        (
+            ["search", "q"],
+            "search",
+            {
+                "query": "q",
+                "limit": None,
+                "filter": None,
+                "search_type": None,
+                "image": None,
+            },
+        ),
+        (
+            ["search", "q", "--limit", "3", "--search-type", "vector"],
+            "search",
+            {
+                "query": "q",
+                "limit": 3,
+                "filter": None,
+                "search_type": "vector",
+                "image": None,
+            },
+        ),
+        (["history"], "history", {"table": None, "limit": None}),
+        (
+            ["history", "--table", "chunks", "--limit", "5"],
+            "history",
+            {"table": "chunks", "limit": 5},
+        ),
+        (
+            ["ask", "why?"],
+            "ask",
+            {
+                "question": "why?",
+                "filter": None,
+                "images": None,
+                "full_citations": False,
+            },
+        ),
+        (
+            ["ask", "why?", "--full-citations"],
+            "ask",
+            {
+                "question": "why?",
+                "filter": None,
+                "images": None,
+                "full_citations": True,
+            },
+        ),
+        (
+            ["ask", "q", "--image", "/tmp/a.png", "--image", "/tmp/b.jpg"],
+            "ask",
+            {
+                "question": "q",
+                "filter": None,
+                "images": [Path("/tmp/a.png"), Path("/tmp/b.jpg")],
+                "full_citations": False,
+            },
+        ),
+        (
+            ["mcp", "--stdio"],
+            "run_mcp",
+            {"transport": "stdio", "host": "127.0.0.1", "port": 8001},
+        ),
+        (
+            ["mcp"],
+            "run_mcp",
+            {"transport": None, "host": "127.0.0.1", "port": 8001},
+        ),
+    ],
+)
+def test_command_dispatches_to_the_app(app_stub, argv, method, expected):
+    result = runner.invoke(cli, argv + DB_ARGS)
+
+    assert result.exit_code == 0, result.output
+    getattr(app_stub, method).assert_called_once_with(**expected)
+
+
+@pytest.mark.parametrize("failed, exit_code", [(0, 0), (2, 1)])
+def test_add_src_exits_1_when_files_failed(app_stub, failed, exit_code):
+    app_stub.add_document_from_source.return_value = failed
+
+    result = runner.invoke(cli, ["add-src", "/tmp/doc.md", *DB_ARGS])
+
+    assert result.exit_code == exit_code, result.output
+    app_stub.add_document_from_source.assert_called_once_with(
+        source="/tmp/doc.md", title=None, metadata=None
+    )
+
+
+@pytest.mark.parametrize(
+    "flag, mode_name",
+    [
+        (None, "FULL"),
+        ("--embed-only", "EMBED_ONLY"),
+        ("--rechunk", "RECHUNK"),
+        ("--title-only", "TITLE_ONLY"),
+        ("--descriptions", "DESCRIPTIONS"),
+        ("--set-embedder", "SET_EMBEDDER"),
+        ("--reindex", "REINDEX"),
+    ],
+)
+def test_rebuild_flag_selects_the_mode(app_stub, flag, mode_name):
+    """Each flag picks one rebuild mode, and no flag means a full rebuild."""
+    result = runner.invoke(cli, ["rebuild"] + ([flag] if flag else []) + DB_ARGS)
+
+    assert result.exit_code == 0, result.output
+    (_, kwargs) = app_stub.rebuild.call_args
+    assert kwargs["mode"].name == mode_name
+
+
+def test_rebuild_refusal_fails_cleanly(app_stub):
+    app_stub.rebuild.side_effect = ValueError("Run 'haiku-rag rebuild --rechunk'.")
+
+    result = runner.invoke(cli, ["rebuild", "--embed-only"] + DB_ARGS)
+
+    assert result.exit_code == 1
+    assert "Error: Run 'haiku-rag rebuild --rechunk'." in result.output
+
+
+def test_migrate_reports_applied_migrations(app_stub):
+    app_stub.migrate.return_value = ["v0_40_0: add document_items"]
+
+    result = runner.invoke(cli, ["migrate"] + DB_ARGS)
+
+    assert result.exit_code == 0, result.output
+    assert "Applied 1 migration(s)" in result.output
+    assert "add document_items" in result.output
+
+
+def test_migrate_reports_an_up_to_date_database(app_stub):
+    app_stub.migrate.return_value = []
+
+    result = runner.invoke(cli, ["migrate"] + DB_ARGS)
+
+    assert result.exit_code == 0, result.output
+    assert "No migrations pending" in result.output
+
+
+def test_migrate_exits_nonzero_on_failure(app_stub):
+    app_stub.migrate.side_effect = RuntimeError("schema is from the future")
+
+    result = runner.invoke(cli, ["migrate"] + DB_ARGS)
+
+    assert result.exit_code == 1
+    assert "Migration failed: schema is from the future" in result.output
+
+
+def test_mcp_covers_the_configured_set(monkeypatch):
+    seen = {}
+
+    def create_app(db=None, *, covers_set=False, at=None, reads_tags=False):
+        seen["covers_set"] = covers_set
+        return AsyncMock()
+
+    monkeypatch.setattr("haiku.rag.cli.create_app", create_app)
+
+    result = runner.invoke(cli, ["mcp", "--stdio"])
+
+    assert result.exit_code == 0, result.output
+    assert seen["covers_set"] is True
+
+
+def test_version_flag_prints_the_version():
+    result = runner.invoke(cli, ["--version"])
+
+    assert result.exit_code == 0, result.output
+    assert "haiku.rag version" in result.output
+
+
+def test_outdated_install_warns(app_stub, monkeypatch):
+    """The startup check warns on stderr and does not block the command."""
+
+    async def outdated():
+        return False, "0.1.0", "9.9.9"
+
+    monkeypatch.setattr("haiku.rag.cli.is_up_to_date", outdated)
+
+    result = runner.invoke(cli, ["list"] + DB_ARGS)
+
+    assert result.exit_code == 0, result.output
+    assert "haiku.rag is outdated" in result.stderr
+    assert "Current: 0.1.0, Latest: 9.9.9" in result.stderr
+    assert "outdated" not in result.stdout
+    app_stub.list_documents.assert_called_once()
+
+
+def test_a_failing_version_check_does_not_block_the_cli(app_stub, monkeypatch):
+    """PyPI being unreachable must not stop a command from running."""
+
+    async def boom():
+        raise RuntimeError("no network")
+
+    monkeypatch.setattr("haiku.rag.cli.is_up_to_date", boom)
+
+    result = runner.invoke(cli, ["list"] + DB_ARGS)
+
+    assert result.exit_code == 0, result.output
+    app_stub.list_documents.assert_called_once()
+
+
+def test_settings_command_shows_the_configuration(monkeypatch):
+    shown = []
+
+    class StubApp:
+        def __init__(self, **kwargs):
+            shown.append(kwargs)
+
+        def show_settings(self):
+            shown.append("shown")
+
+    monkeypatch.setattr("haiku.rag.app.HaikuRAGApp", StubApp)
+
+    result = runner.invoke(cli, ["settings"])
+
+    assert result.exit_code == 0, result.output
+    assert "shown" in shown
+    assert shown[0]["read_only"] is True
+
+
+def test_download_models_reports_failure(monkeypatch):
+    class StubApp:
+        def __init__(self, **kwargs):
+            pass
+
+        async def download_models(self):
+            raise RuntimeError("hub unreachable")
+
+    monkeypatch.setattr("haiku.rag.app.HaikuRAGApp", StubApp)
+
+    result = runner.invoke(cli, ["download-models"])
+
+    assert result.exit_code == 1
+    assert "Error downloading models: hub unreachable" in result.output
+
+
+def test_chat_reports_a_missing_tui_extra(monkeypatch):
+    """run_chat imports the Textual app itself, so a missing tui extra surfaces
+    from the call, not from importing haiku.rag.chat. The CLI must report it and
+    exit nonzero rather than traceback."""
+    import sys
+
+    monkeypatch.setitem(sys.modules, "haiku.rag.chat.app", None)
+
+    result = runner.invoke(cli, ["chat"])
+
+    assert result.exit_code == 1
+    assert "textual is not installed" in result.output
+    assert "haiku.rag-slim[tui]" in result.output
+
+
+def test_inspect_reports_a_missing_tui_extra(monkeypatch):
+    """run_inspector raises at import instead, so the guard sits on the import."""
+    import sys
+
+    monkeypatch.delitem(sys.modules, "haiku.rag.inspector", raising=False)
+    monkeypatch.setitem(sys.modules, "haiku.rag.inspector.app", None)
+
+    result = runner.invoke(cli, ["inspect"])
+
+    assert result.exit_code == 1
+    assert "textual is not installed" in result.output
+    assert "haiku.rag-slim[tui]" in result.output
+
+
+def test_add_src_reports_a_missing_docling_extra(
+    monkeypatch, capsys, tmp_path, temp_db_path
+):
+    """`add-src` with `converter: docling-local` and no docling exits naming
+    the extra to install."""
+    source = tmp_path / "doc.md"
+    source.write_text("# Title\n\nBody.\n")
+
+    async def init():
+        async with HaikuRAG(temp_db_path, create=True):
+            pass
+
+    asyncio.run(init())
+
+    async def current():
+        return True, "9.9.9", "9.9.9"
+
+    monkeypatch.setattr("haiku.rag.cli.is_up_to_date", current)
+    monkeypatch.setitem(sys.modules, "docling", None)
+    monkeypatch.setattr(
+        sys, "argv", ["haiku-rag", "add-src", str(source), "--db", str(temp_db_path)]
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli_wrapper()
+
+    assert exc_info.value.code == 1
+    err = capsys.readouterr().err
+    assert err.startswith("Error: docling is not installed")
+    assert "haiku.rag-slim[docling]" in err
+
+
+@pytest.mark.parametrize("command, joins", [("vacuum", True), ("mcp", False)])
+def test_one_shot_commands_join_the_traceparent_trace(
+    app_stub, monkeypatch, command, joins
+):
+    seen: list[tuple[str, str]] = []
+
+    async def record(*_, **__):
+        seen.append(current_trace())
+
+    app_stub.vacuum = record
+    app_stub.run_mcp = record
+    monkeypatch.setenv("TRACEPARENT", TRACEPARENT)
+    monkeypatch.setenv("TRACESTATE", "vendor=value")
+    monkeypatch.setenv("LOGFIRE_DISTRIBUTED_TRACING", "false")
+
+    result = runner.invoke(cli, [command] + DB_ARGS)
+
+    assert result.exit_code == 0, result.output
+    if joins:
+        assert seen == [("4bf92f3577b34da6a3ce929d0e0e4736", "vendor=value")]
+    else:
+        assert seen == [("0" * 32, "")]
+    assert current_trace() == ("0" * 32, "")
+
+
+class TestReadingAtATag:
+    """`--at TAG` reads one database read-only at a tag."""
+
+    @staticmethod
+    def _install(monkeypatch, **databases):
+        import haiku.rag.config as config_module
+
+        monkeypatch.setattr(config_module, "_config", None)
+        monkeypatch.setattr("haiku.rag.cli._db_name", None)
+        set_config(AppConfig(lancedb=LanceDBConfig(databases=databases)))
+
+    def test_the_tag_travels_on_the_one_database(self, monkeypatch, tmp_path):
+        self._install(monkeypatch)
+
+        [ref] = resolve_scope(
+            tmp_path / "papers.lancedb", at="release-1", reads_tags=True
+        ).databases
+
+        assert ref.tag == "release-1"
+
+    @pytest.mark.parametrize("covers_set", [False, True])
+    def test_a_configured_set_refuses_a_tag(self, monkeypatch, covers_set):
+        self._install(monkeypatch, alpha="/db/a.lancedb", beta="/db/b.lancedb")
+
+        with pytest.raises(AmbiguousDatabaseError, match="--at") as raised:
+            resolve_scope(None, covers_set=covers_set, at="release-1")
+
+        assert "--db-name NAME before the command" in str(raised.value)
+
+    def test_a_named_database_takes_the_tag(self, monkeypatch):
+        self._install(monkeypatch, alpha="/db/a.lancedb", beta="/db/b.lancedb")
+        monkeypatch.setattr("haiku.rag.cli._db_name", "alpha")
+
+        [ref] = resolve_scope(
+            None, covers_set=True, at="release-1", reads_tags=True
+        ).databases
+
+        assert (ref.name, ref.tag) == ("alpha", "release-1")
+
+    def test_a_configured_tag_is_the_one_read(self, monkeypatch):
+        self._install(monkeypatch, old={"location": "/db/a.lancedb", "tag": "v1"})
+        monkeypatch.setattr("haiku.rag.cli._db_name", "old")
+
+        [ref] = resolve_scope(None, covers_set=True, reads_tags=True).databases
+
+        assert (ref.name, ref.tag) == ("old", "v1")
+
+    def test_at_on_a_configured_tag_is_refused(self, monkeypatch):
+        self._install(monkeypatch, old={"location": "/db/a.lancedb", "tag": "v1"})
+        monkeypatch.setattr("haiku.rag.cli._db_name", "old")
+
+        with pytest.raises(AmbiguousDatabaseError, match="'v1'.*'release-1'"):
+            resolve_scope(None, covers_set=True, at="release-1", reads_tags=True)
+
+    def test_a_command_without_at_refuses_a_configured_tag(self, monkeypatch):
+        self._install(monkeypatch, old={"location": "/db/a.lancedb", "tag": "v1"})
+        monkeypatch.setattr("haiku.rag.cli._db_name", "old")
+
+        with pytest.raises(TagError, match="'old' is configured at tag 'v1'"):
+            resolve_scope(None)
+
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            ["tag", "restore", "tagged", "--yes"],
+            ["tag", "create", "again"],
+            ["tag", "delete", "tagged"],
+            ["migrate"],
+            ["vacuum"],
+            ["doctor"],
+            ["history"],
+        ],
+    )
+    def test_live_state_commands_refuse_a_tagged_entry(
+        self, monkeypatch, tmp_path, argv
+    ):
+        from tests.multi_db.helpers import _config, _seed
+
+        config = _config(tmp_path, ["papers"])
+
+        async def tag_between():
+            await _seed(config, "papers", ["before"])
+            async with HaikuRAG(config=config, sources=["papers"]) as rag:
+                await rag.store.create_tag("tagged")
+            await _seed(config, "papers", ["after"])
+
+        asyncio.run(tag_between())
+        self._install(monkeypatch)
+        location = tmp_path / "papers.lancedb"
+        config_file = tmp_path / "haiku.rag.yaml"
+        config_file.write_text(
+            f"lancedb:\n  databases:\n    papers: {location}\n"
+            f"    old:\n      location: {location}\n      tag: tagged\n",
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(
+            cli, ["--config", str(config_file), "--db-name", "old", *argv]
+        )
+
+        assert isinstance(result.exception, TagError), result.output
+
+        async def live_state():
+            async with HaikuRAG(config=config, sources=["papers"]) as rag:
+                return (
+                    sorted(d.uri for d in await rag.list_documents()),
+                    sorted(await rag.store.list_tags()),
+                )
+
+        assert asyncio.run(live_state()) == (
+            ["test://papers/after", "test://papers/before"],
+            ["tagged"],
+        )
+
+    def test_list_shows_the_tagged_state(self, monkeypatch, tmp_path):
+        from tests.multi_db.helpers import _config, _seed
+
+        config = _config(tmp_path, ["papers"])
+
+        async def tag_between():
+            await _seed(config, "papers", ["before"])
+            async with HaikuRAG(config=config, sources=["papers"]) as rag:
+                await rag.store.create_tag("tagged")
+            await _seed(config, "papers", ["after"])
+
+        asyncio.run(tag_between())
+        self._install(monkeypatch)
+
+        db = str(tmp_path / "papers.lancedb")
+        result = runner.invoke(cli, ["list", "--db", db, "--at", "tagged"])
+
+        assert result.exit_code == 0, result.output
+        assert "test://papers/before" in result.output
+        assert "test://papers/after" not in result.output
+
+        result = runner.invoke(cli, ["info", "--db", db, "--at", "tagged"])
+
+        assert result.exit_code == 0, result.output
+        assert "documents: 1 " in result.output
+
+    def test_a_write_command_has_no_tag_option(self, tmp_path):
+        result = runner.invoke(
+            cli, ["add", "text", "--db", str(tmp_path / "x.lancedb"), "--at", "t"]
+        )
+
+        assert result.exit_code == 2
+        assert "No such option" in result.output
+
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            ["list"],
+            ["get", "doc-id"],
+            ["search", "query"],
+            ["visualize", "chunk-id"],
+            ["ask", "question"],
+            ["info"],
+            ["mcp"],
+        ],
+    )
+    def test_a_read_command_passes_the_tag_on(self, monkeypatch, argv):
+        seen: dict[str, str | bool | None] = {}
+
+        def create_app(db=None, *, covers_set=False, at=None, reads_tags=False):
+            seen.update(at=at, reads_tags=reads_tags)
+            return AsyncMock()
+
+        monkeypatch.setattr("haiku.rag.cli.create_app", create_app)
+        result = runner.invoke(cli, [*argv, "--at", "release-1"])
+
+        assert result.exit_code == 0, result.output
+        assert seen == {"at": "release-1", "reads_tags": True}
+
+    @pytest.mark.parametrize(
+        "argv, runner_path",
+        [
+            (["chat"], "haiku.rag.chat.run_chat"),
+            (["inspect"], "haiku.rag.inspector.run_inspector"),
+        ],
+    )
+    def test_a_tui_passes_the_tag_on(self, monkeypatch, argv, runner_path):
+        seen: dict[str, str | bool | None] = {}
+
+        def resolve(db=None, *, covers_set=False, at=None, reads_tags=False):
+            seen.update(at=at, reads_tags=reads_tags)
+            return "scope"
+
+        launched: list[dict] = []
+        monkeypatch.setattr("haiku.rag.cli.resolve_scope", resolve)
+        monkeypatch.setattr(runner_path, lambda **kwargs: launched.append(kwargs))
+        result = runner.invoke(cli, [*argv, "--at", "release-1"])
+
+        assert result.exit_code == 0, result.output
+        assert seen == {"at": "release-1", "reads_tags": True}
+        assert [call["scope"] for call in launched] == ["scope"]

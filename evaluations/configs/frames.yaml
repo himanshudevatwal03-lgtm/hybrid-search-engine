@@ -1,0 +1,59 @@
+# Reference config for the `frames` evaluation database.
+# FRAMES (google/frames-benchmark): 824 multi-hop questions over a corpus of
+# the ~2.5k Wikipedia articles linked per question, fetched at current
+# revision (revid + fetch date recorded in the article cache).
+# Run: evaluations run frames --config configs/frames.yaml
+# base_url uses the `vllm` host serving each model over an OpenAI-compatible API.
+
+environment: development
+
+storage:
+  auto_vacuum: false
+
+embeddings:
+  model:
+    provider: vllm
+    name: nvidia/llama-nemotron-embed-vl-1b-v2
+    vector_dim: 2048
+    multimodal: true
+    base_url: http://vllm:11438/v1
+
+reranking:
+  multimodal: true
+  model:
+    provider: vllm
+    name: nvidia/llama-nemotron-rerank-vl-1b-v2
+    base_url: http://vllm:11434
+
+sandbox:
+  # Bounds per-execution sandbox output so accumulated code returns cannot
+  # outgrow the model's input budget.
+  max_output_chars: 20000
+
+qa:
+  model:
+    provider: openai
+    name: Inferact/Qwen3.8-27B-NVFP4
+    base_url: http://vllm:11439/v1
+    vision: true
+    max_tokens: 16384
+    temperature: 0.6
+    extra_body:
+      chat_template_kwargs:
+        # qwen3.8 defaults to xhigh, which spends the output budget
+        # deliberating and truncates the answer. low | medium | xhigh.
+        reasoning_effort: low
+
+evaluations:
+  judge:
+    provider: openai
+    name: Inferact/Qwen3.8-27B-NVFP4
+    base_url: http://vllm:11439/v1
+    temperature: 0.6
+    max_tokens: 16384
+    extra_body:
+      top_p: 0.95
+      top_k: 20
+      min_p: 0
+      chat_template_kwargs:
+        reasoning_effort: low

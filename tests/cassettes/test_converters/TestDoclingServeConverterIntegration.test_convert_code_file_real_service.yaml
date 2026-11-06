@@ -1,0 +1,153 @@
+interactions:
+- request:
+    body: "--51af6f02a0554c07926196a42e300c7d\r\nContent-Disposition: form-data; name=\"to_formats\"\r\n\r\njson\r\n--51af6f02a0554c07926196a42e300c7d\r\nContent-Disposition:
+      form-data; name=\"target_type\"\r\n\r\nzip\r\n--51af6f02a0554c07926196a42e300c7d\r\nContent-Disposition: form-data;
+      name=\"do_ocr\"\r\n\r\ntrue\r\n--51af6f02a0554c07926196a42e300c7d\r\nContent-Disposition: form-data; name=\"force_ocr\"\r\n\r\nfalse\r\n--51af6f02a0554c07926196a42e300c7d\r\nContent-Disposition:
+      form-data; name=\"ocr_engine\"\r\n\r\nauto\r\n--51af6f02a0554c07926196a42e300c7d\r\nContent-Disposition: form-data;
+      name=\"do_table_structure\"\r\n\r\ntrue\r\n--51af6f02a0554c07926196a42e300c7d\r\nContent-Disposition: form-data; name=\"pdf_backend\"\r\n\r\ndocling_parse\r\n--51af6f02a0554c07926196a42e300c7d\r\nContent-Disposition:
+      form-data; name=\"table_mode\"\r\n\r\naccurate\r\n--51af6f02a0554c07926196a42e300c7d\r\nContent-Disposition: form-data;
+      name=\"table_cell_matching\"\r\n\r\ntrue\r\n--51af6f02a0554c07926196a42e300c7d\r\nContent-Disposition: form-data; name=\"images_scale\"\r\n\r\n2.0\r\n--51af6f02a0554c07926196a42e300c7d\r\nContent-Disposition:
+      form-data; name=\"image_export_mode\"\r\n\r\nreferenced\r\n--51af6f02a0554c07926196a42e300c7d\r\nContent-Disposition:
+      form-data; name=\"include_images\"\r\n\r\ntrue\r\n--51af6f02a0554c07926196a42e300c7d\r\nContent-Disposition: form-data;
+      name=\"include_page_images\"\r\n\r\ntrue\r\n--51af6f02a0554c07926196a42e300c7d\r\nContent-Disposition: form-data; name=\"do_picture_description\"\r\n\r\nfalse\r\n--51af6f02a0554c07926196a42e300c7d\r\nContent-Disposition:
+      form-data; name=\"files\"; filename=\"tmptv2vg3e6.md\"\r\nContent-Type: text/markdown\r\n\r\n```python\ndef test():\n
+      \   return 42\n```\r\n--51af6f02a0554c07926196a42e300c7d--\r\n"
+    headers:
+      accept:
+      - '*/*'
+      accept-encoding:
+      - gzip, deflate, zstd
+      connection:
+      - keep-alive
+      content-length:
+      - '1616'
+      content-type:
+      - multipart/form-data; boundary=51af6f02a0554c07926196a42e300c7d
+      host:
+      - localhost:5001
+    method: POST
+    uri: http://localhost:5001/v1/convert/file/async
+  response:
+    headers:
+      content-length:
+      - '167'
+      content-type:
+      - application/json
+      vary:
+      - Origin
+    parsed_body:
+      error_message: null
+      failure: null
+      task_id: bde8c531-5c49-422a-ba0b-b3bb96b171e0
+      task_meta: null
+      task_position: 1
+      task_status: pending
+      task_type: convert
+    status:
+      code: 200
+      message: OK
+- request:
+    body: ''
+    headers:
+      accept:
+      - '*/*'
+      accept-encoding:
+      - gzip, deflate, zstd
+      connection:
+      - keep-alive
+      host:
+      - localhost:5001
+    method: GET
+    uri: http://localhost:5001/v1/status/poll/bde8c531-5c49-422a-ba0b-b3bb96b171e0
+  response:
+    headers:
+      content-length:
+      - '170'
+      content-type:
+      - application/json
+      vary:
+      - Origin
+    parsed_body:
+      error_message: null
+      failure: null
+      task_id: bde8c531-5c49-422a-ba0b-b3bb96b171e0
+      task_meta: null
+      task_position: null
+      task_status: started
+      task_type: convert
+    status:
+      code: 200
+      message: OK
+- request:
+    body: ''
+    headers:
+      accept:
+      - '*/*'
+      accept-encoding:
+      - gzip, deflate, zstd
+      connection:
+      - keep-alive
+      host:
+      - localhost:5001
+    method: GET
+    uri: http://localhost:5001/v1/status/poll/bde8c531-5c49-422a-ba0b-b3bb96b171e0
+  response:
+    headers:
+      content-length:
+      - '170'
+      content-type:
+      - application/json
+      vary:
+      - Origin
+    parsed_body:
+      error_message: null
+      failure: null
+      task_id: bde8c531-5c49-422a-ba0b-b3bb96b171e0
+      task_meta: null
+      task_position: null
+      task_status: success
+      task_type: convert
+    status:
+      code: 200
+      message: OK
+- request:
+    body: ''
+    headers:
+      accept:
+      - '*/*'
+      accept-encoding:
+      - gzip, deflate, zstd
+      connection:
+      - keep-alive
+      host:
+      - localhost:5001
+    method: GET
+    uri: http://localhost:5001/v1/result/bde8c531-5c49-422a-ba0b-b3bb96b171e0
+  response:
+    body:
+      string: !!binary |
+        UEsDBBQAAAAAADNsZF0AAAAAAAAAAAAAAAAKAAAAYXJ0aWZhY3RzL1BLAwQUAAAACAAzbGRdFQ4l
+        kJcBAAAnBAAAEAAAAHRtcHR2MnZnM2U2Lmpzb26dU11PgzAUfd+vIOiDJsvGNre5PfsDfFdDClyg
+        WT9IW1Cy8N9tC2UMWTQmJE3vPaf3nJ5ynnmeL+McKAoZouAfPf+FxwSzTC8lBab8ucFUICTmzPRX
+        i1WwCNqy4yhaqGpdZRvYtQ0ucIYN/Kx3ek8xBVUXLRi+1JIicUr4J7NwDYgwQ6IOcyRzjTkEwfNh
+        v91vNsFuq7/9KuhwKSYwMXVBE18DGjs8LQXDqhRwmS+BpKGA1NDulhdAd2qcY5IIMILfPlyNM6X9
+        hwTVIAzvB8vpCAXnKnRVgiIgplwyWUCMUwwDbRFP6luybG9Cka14Hcd273uOuUy5DPyu19j1poXh
+        hP+ozwQvC9nfko1S9hKdwJEtJ3Hu2gUS5mEdpx1Zjc5Oz5lI6BeDQzMxT2AwX/Dq+hzzXA0ugdRT
+        INXD4/GdmY4AHTjzntYXtrHzV2yMCqV/G3k9TVsFbSWGUT3VQTCuxmUjXjtkWYkym9hrrXL9L85c
+        4G0WBY7N4xymgyIy3J+gDitESgixAjpopFzQca3Qw8z23Myab1BLAQIUAxQAAAAAADNsZF0AAAAA
+        AAAAAAAAAAAKAAAAAAAAAAAAEADtQQAAAABhcnRpZmFjdHMvUEsBAhQDFAAAAAgAM2xkXRUOJZCX
+        AQAAJwQAABAAAAAAAAAAAAAAAKSBKAAAAHRtcHR2MnZnM2U2Lmpzb25QSwUGAAAAAAIAAgB2AAAA
+        7QEAAAAA
+    headers:
+      content-disposition:
+      - attachment; filename="converted_docs.zip"
+      content-length:
+      - '633'
+      content-type:
+      - application/zip
+      vary:
+      - Origin
+    status:
+      code: 200
+      message: OK
+version: 1

@@ -1,0 +1,587 @@
+# Python API
+
+Use `haiku.rag` directly in your Python applications.
+
+## Basic usage
+
+```python
+from pathlib import Path
+from haiku.rag.client import HaikuRAG
+
+# Create a new database
+async with HaikuRAG("path/to/database.lancedb", create=True) as client:
+    # Your code here
+    pass
+
+# Open an existing database (will fail if database doesn't exist)
+async with HaikuRAG("path/to/database.lancedb") as client:
+    # Your code here
+    pass
+
+# Open in read-only mode (blocks writes)
+async with HaikuRAG("path/to/database.lancedb", read_only=True) as client:
+    results = await client.search("query")  # Read operations work
+    # await client.create_document(...)  # Would raise ReadOnlyError
+```
+
+`async with` is the lifecycle. A caller that owns the client some other way releases it with `await client.aclose()`, which does the same work for every client shape. `client.close()` closes the connection to one database and nothing else: it does not drain the background vacuum or release the embedder and reranker, which are awaitable. It refuses a client covering several.
+
+!!! note
+    Databases must be explicitly created with `create=True` or via `haiku-rag init` before use. Opening a nonexistent local database given as a path raises `FileNotFoundError`, naming the path. A configured or default database raises `SourceUnavailableError`, which names the database rather than its location. A path beside a configured `lancedb.databases` raises `AmbiguousDatabaseError`.
+
+!!! note
+    Read-only mode blocks every write, and downgrades an embedding provider or name mismatch to a warning (see [Operational constraints](configuration/storage.md#operational-constraints)).
+
+!!! warning "Database Migrations"
+    When upgrading haiku.rag to a version with schema changes, opening an existing database will raise `MigrationRequiredError`. Run `haiku-rag migrate` to apply pending migrations before using the database. A writable open of a database whose `schema_version` is newer than the release's schema raises `UpgradeRequiredError`, and a read-only open warns. See [migrate](cli.md#migrate) for details.
+
+## Document management
+
+### Creating documents
+
+From text:
+```python
+doc = await client.create_document(
+    content="Your document content here",
+    uri="doc://example",
+    title="My Example Document",  # optional human‑readable title
+    metadata={"source": "manual", "topic": "example"}
+)
+```
+
+From HTML content (preserves document structure):
+```python
+html_content = "<h1>Title</h1><p>Paragraph</p><ul><li>Item 1</li></ul>"
+doc = await client.create_document(
+    content=html_content,
+    uri="doc://html-example",
+    format="html"  # parse as HTML instead of markdown
+)
+```
+
+The `format` parameter controls how text content is parsed:
+
+- `"md"` (default) - Parse as Markdown
+- `"html"` - Parse as HTML, preserving semantic structure (headings, lists, tables)
+- `"plain"` - Plain text, no parsing (creates a simple text document)
+
+!!! note
+    The document's `content` field stores the markdown export of the parsed document for consistent display. The original DoclingDocument structure is preserved in the `docling_document` field (zstd-compressed, without page images). Page images are stored separately in `docling_pages`.
+
+From file:
+```python
+doc = await client.create_document_from_source(
+    "path/to/document.pdf", title="Project Brief"
+)
+```
+
+From URL:
+```python
+doc = await client.create_document_from_source(
+    "https://example.com/article.html", title="Example Article"
+)
+```
+
+PDFs that carry attachments via the `/EmbeddedFiles` table are split into one Document per attachment, linked to the wrapper through `metadata.parent_uri`. See [PDF Embedded Attachments](configuration/processing.md#pdf-embedded-attachments).
+
+### Retrieving documents
+
+By ID:
+```python
+doc = await client.get_document_by_id("document-id-string")
+doc = await client.get_document_by_id("document-id-string", "papers")
+chunk = await client.get_chunk_by_id("chunk-id-string", "papers")
+```
+
+By URI:
+```python
+doc = await client.get_document_by_uri("file:///path/to/document.pdf")
+```
+
+Both return content, uri, title and metadata. The multi-MB docling blobs are
+loaded separately:
+
+```python
+docling = await client.document_repository.get_docling_data(doc.id)
+pages = await client.document_repository.get_pages_data(doc.id)
+```
+
+By ID, title or URI, tried in that order:
+```python
+doc = await client.resolve_document("Q3 Financial Report")
+```
+
+A picture's bytes, by document and the picture's `self_ref`:
+```python
+png = await client.get_picture_bytes(doc.id, "#/pictures/0")
+```
+
+List all documents:
+```python
+docs = await client.list_documents(limit=10, offset=0)
+
+# Include the text content (not loaded by default). A listing never loads the
+# docling blobs.
+docs = await client.list_documents(include_content=True)
+```
+
+Filter documents by properties:
+```python
+# Filter by URI pattern
+docs = await client.list_documents(filter="uri LIKE '%arxiv%'")
+
+# Over several databases, list a subset
+docs = await client.list_documents(sources=["papers"])
+
+# Filter by exact title
+docs = await client.list_documents(filter="title = 'My Document'")
+
+# Combine multiple conditions
+docs = await client.list_documents(
+    limit=10,
+    filter="uri LIKE '%.pdf' AND title LIKE '%paper%'"
+)
+```
+
+Count documents:
+```python
+# Count all documents
+total = await client.count_documents()
+
+# Count with filter
+pdf_count = await client.count_documents(filter="uri LIKE '%.pdf'")
+```
+
+### Updating documents
+
+```python
+# Update content (triggers re-chunking)
+await client.update_document(document_id=doc.id, content="New content")
+
+# Update metadata only (no re-chunking)
+await client.update_document(
+    document_id=doc.id,
+    metadata={"version": "2.0", "updated_by": "admin"}
+)
+
+# Update title only (no re-chunking)
+await client.update_document(document_id=doc.id, title="New Title")
+
+# Update uri only (no re-chunking)
+await client.update_document(document_id=doc.id, uri="file:///new/path.txt")
+
+# Update multiple fields at once
+await client.update_document(
+    document_id=doc.id,
+    content="New content",
+    title="Updated Title",
+    metadata={"status": "final"}
+)
+
+# Use custom chunks (embeddings optional - will be generated if missing)
+from haiku.rag.store.models.chunk import Chunk
+
+custom_chunks = [
+    Chunk(content="Custom chunk 1"),
+    Chunk(content="Custom chunk 2", embedding=precomputed_vector),  # list[float] of vector_dim
+]
+await client.update_document(document_id=doc.id, chunks=custom_chunks)
+```
+
+- Updates to only `metadata` or `title` skip re-chunking
+- `metadata` replaces the stored metadata, except the keys ingestion owns: `content_type`, `md5`, `source_revision`, `source_id` and `parent_uri`. `update_document` keeps their stored values and ignores a caller's. `create_document`, `import_document`, `import_documents` and `create_document_from_source` drop a caller's value for them.
+- Updates to `content` trigger re-chunking and re-embedding
+- Custom `chunks` with embeddings are stored as-is. Missing embeddings are generated automatically
+
+### Deleting documents
+
+```python
+await client.delete_document(doc.id)
+```
+
+Deleting a document also removes any child Documents linked to it via `metadata.parent_uri` (PDF attachment children, primarily). The cascade is transitive.
+
+A PDF attachment cannot be deleted on its own while its parent is stored: `delete_document` raises `AttachmentDeletionError` (from `haiku.rag.client.exceptions`) naming the parent. Delete the parent, or remove the file from the PDF and re-ingest it. An attachment whose parent is gone can be deleted.
+
+`delete_document(doc_id, source_id="fs:handbook")` deletes the document only when that source owns it (`metadata.source_id`), checked under the write lock, and returns `False` otherwise.
+
+## Searching documents
+
+The search method performs native hybrid search (vector + full-text) using LanceDB with optional reranking for improved relevance:
+
+Basic hybrid search (default):
+```python
+results = await client.search("machine learning algorithms", limit=5)
+for result in results:
+    print(f"Score: {result.score:.3f}")
+    print(f"Content: {result.content}")
+    print(f"Document ID: {result.document_id}")
+```
+
+Each result carries the parent document's metadata in `result.document_meta` and the relevant chunk's verbatim metadata in `result.chunk_meta`. Neither is shown to the model during QA. Pictures matched by a result are attached in `result.image_data`. Pass `include_images=False` to skip loading them.
+
+Search with different search types:
+```python
+# Vector search only
+results = await client.search(
+    query="machine learning",
+    limit=5,
+    search_type="vector"
+)
+
+# Full-text search only
+results = await client.search(
+    query="machine learning",
+    limit=5,
+    search_type="fts"
+)
+
+# Hybrid search (default - combines vector + fts with native LanceDB RRF)
+results = await client.search(
+    query="machine learning",
+    limit=5,
+    search_type="hybrid"
+)
+
+# Process results
+for result in results:
+    print(f"Relevance: {result.score:.3f}")
+    print(f"Content: {result.content}")
+    print(f"From document: {result.document_id}")
+    print(f"Document URI: {result.document_uri}")
+    print(f"Document Title: {result.document_title}")  # when available
+```
+
+### Searching multiple databases
+
+With several databases in `lancedb.databases`, a client covers them all, and `search`, `ask` and `list_documents` take `sources` to select a subset. Each result and citation names its database in `source`:
+
+```python
+results = await client.search("machine learning", sources=["papers"])
+for result in results:
+    print(f"{result.source}: {result.content}")
+```
+
+`client.is_read_only` reports the mode every covered database is opened with. Selection rules, the client's coverage properties and ranking across databases are under [Multiple databases](configuration/multiple-databases.md#python).
+
+### Filtering search results
+
+Filter search results to only include chunks from documents matching specific criteria:
+
+```python
+# Filter by document URI pattern
+results = await client.search(
+    query="machine learning",
+    limit=5,
+    filter="uri LIKE '%arxiv%'"
+)
+
+# Filter by exact document title
+results = await client.search(
+    query="neural networks",
+    limit=5,
+    filter="title = 'Deep Learning Guide'"
+)
+
+# Combine multiple filter conditions
+results = await client.search(
+    query="AI research",
+    limit=5,
+    filter="uri LIKE '%.pdf' AND title LIKE '%paper%'"
+)
+
+# Filter with any search type
+results = await client.search(
+    query="transformers",
+    limit=5,
+    search_type="vector",
+    filter="uri LIKE '%huggingface%'"
+)
+```
+
+Filters apply to document columns only:
+- `id` - Document ID
+- `uri` - Document URI/URL
+- `title` - Document title (if set)
+- `created_at`, `updated_at` - Timestamps
+- `metadata` - Document metadata (as string, use LIKE for pattern matching)
+
+A filter restricts what a search retrieves. `ask` applies it to every search of the run, and the sandbox mounts only the documents it admits, each with its full text. It does not restrict citations: a chunk id the model already holds, from an earlier turn of a conversation for example, resolves within the databases the question covers whether or not its document passes the filter. The string reaches the query engine as written, so build it from trusted input only. To bound what a run can reach, cover fewer databases with `sources` (see [Searching Multiple Databases](#searching-multiple-databases) and [Database selection](capabilities/index.md#database-selection)).
+
+### Image queries
+
+`client.search()` accepts an image instead of a text query when the configured embedder is multimodal (`embeddings.model.multimodal: true` on a vLLM, OpenRouter, VoyageAI, or Cohere model). The image is embedded once and the chunks table is searched vector-only. Full-text search and reranking don't apply without a text query.
+
+```python
+from PIL import Image
+
+# Bytes
+results = await client.search(
+    open("figure.png", "rb").read(),
+    limit=5,
+)
+
+# PIL.Image works equivalently
+results = await client.search(
+    Image.open("figure.png"),
+    limit=5,
+)
+```
+
+Image queries return picture chunks (synthetic per-figure chunks emitted at ingest under a multimodal embedder) and any text chunks whose vectors are near the image vector in the shared embedding space. Calling `client.search(bytes)` against a text-only embedder raises a `ValueError`.
+
+### Expanding search context
+
+Expand search results with surrounding content from the document:
+
+```python
+# Get initial search results
+search_results = await client.search("machine learning", limit=3)
+
+# Expand with section-bounded context
+expanded_results = await client.expand_context(search_results)
+
+for result in expanded_results:
+    print(f"Expanded content: {result.content}")
+```
+
+Expansion is section-aware and capped by `search.max_context_chars`, see [Search settings](configuration/qa.md#search-settings). Results whose expanded ranges overlap within a document are merged into one result with the highest score.
+
+### Visual grounding
+
+`visualize_chunk` returns one PIL image per page, with the chunk's bounding boxes drawn on it. It needs the document's page images (`generate_page_images`, on by default for PDFs):
+
+```python
+chunk = await client.get_chunk_by_id(result.chunk_id, result.source)
+images = await client.visualize_chunk(chunk, source=result.source)
+for page_number, image in enumerate(images, start=1):
+    image.save(f"page-{page_number}.png")
+```
+
+`source` is required when the client covers several databases. `expand=False` draws only the chunk, without its expanded context.
+
+## Question answering
+
+Ask questions about your documents:
+
+```python
+answer, citations = await client.ask("Who is the author of haiku.rag?")
+print(answer)
+for cite in citations:
+    print(f"  [{cite.chunk_id}] {cite.document_title or cite.document_uri}")
+```
+
+Filter to specific documents:
+
+```python
+answer, citations = await client.ask(
+    "What are the main findings?",
+    filter="uri LIKE '%paper%'"
+)
+```
+
+Attach images to the question, for example to check an image against indexed documents:
+
+```python
+answer, citations = await client.ask(
+    "Does this image satisfy the requirements in the design spec?",
+    images=[Path("photo.jpg").read_bytes()],
+)
+```
+
+Images are passed to the model alongside the question. Retrieval stays text-based. The QA model must have `vision: true` in its configuration.
+
+`client.ask` runs the [RAG capability](capabilities/rag.md) and returns `(answer_text, list[Citation])`. The capability searches, and writes and runs Python over the documents when a question needs counting or aggregation. Citations carry page numbers, section headings, document references, the document's metadata (`document_meta`) and the cited chunk's stored metadata (`chunk_meta`), so a UI can render keys such as a public source URL beside the citation. The QA model is configured in `haiku.rag.yaml` or passed in the client's `config`.
+
+To build your own Pydantic AI agent, attach the RAG capability directly, see [Capabilities](capabilities/index.md).
+
+## Importing pre-processed documents
+
+If you process documents externally or need custom processing, use `import_document()`:
+
+```python
+from pathlib import Path
+
+from haiku.rag.store.models.chunk import Chunk
+
+# Convert your source to a DoclingDocument (a str that is not a URL is converted as text)
+docling_doc = await client.convert(Path("path/to/document.pdf"))
+
+# Create chunks (embeddings optional - will be generated if missing)
+chunks = [
+    Chunk(
+        content="This is the first chunk",
+        metadata={"section": "intro"},
+        order=0,
+    ),
+    Chunk(
+        content="This is the second chunk",
+        metadata={"section": "body"},
+        embedding=[0.1] * 1024,  # Optional: pre-computed embedding
+        order=1,
+    ),
+]
+
+# Import document with custom chunks
+doc = await client.import_document(
+    docling_document=docling_doc,
+    chunks=chunks,
+    uri="doc://custom",
+    title="Custom Document",
+    metadata={"source": "external-pipeline"},
+)
+```
+
+The `docling_document` provides metadata for visual grounding, page numbers, and section headings. Content is automatically extracted from the DoclingDocument.
+
+### Batch import
+
+Each `create_document*` / `import_document` call writes new versions of the `documents`, `document_meta`, `chunks`, and `document_items` tables. Ingesting many documents in a loop therefore creates a table version per document. Use `import_documents()` to write the whole batch in a single version per table:
+
+```python
+from haiku.rag.client import DocumentImport
+
+imports = []
+for path in paths:  # paths: list[Path]
+    docling_doc = await client.convert(path)
+    chunks = await client.chunk(docling_doc)
+    imports.append(
+        DocumentImport(
+            docling_document=docling_doc,
+            chunks=chunks,
+            uri=path.absolute().as_uri(),
+            metadata={"source": "external-pipeline"},
+        )
+    )
+
+docs = await client.import_documents(imports)
+```
+
+Chunks without embeddings are embedded automatically. The import is all-or-nothing: if any document fails, all tables are restored to their pre-batch state.
+
+`import_documents` looks up no URI and always creates new documents, so a URI that is already stored, or repeated in the batch, gets a second document. A caller that wants one document per URI keeps the URIs unique. `import_document` replaces a stored document with the same URI in place, keeping its id.
+
+See [Custom Processing Pipelines](custom-pipelines.md) for building pipelines with `convert()`, `chunk()`, and `embed_chunks()`.
+
+## Maintenance
+
+Run maintenance to optimize storage and prune old table versions:
+
+```python
+await client.vacuum()
+```
+
+This compacts tables and removes historical versions to reduce disk usage. It’s safe to run anytime, for example after bulk imports or periodically in long‑running apps.
+
+Build or retrain the IVF_PQ vector index, as `haiku-rag create-index` does:
+
+```python
+built = await client.create_vector_index()
+```
+
+It returns `False` without building below 256 chunks and on LanceDB Cloud, which indexes on its own. Every write through the client waits for the whole build, minutes on a large table. See [Vector indexing](configuration/storage.md#vector-indexing).
+
+### Tags
+
+Tag the current database state and restore it later, for example after an ingestion run. A tag covers all five tables and is created from a single version snapshot. Create tags with other writers stopped: the snapshot is coordinated within one process only, and a writer in another process can commit between the per-table reads.
+
+```python
+await client.store.create_tag("release-1")
+
+tags = await client.store.list_tags()
+for name, info in tags.items():
+    print(name, info.tables, info.complete)
+```
+
+`restore_tag` brings the live database back to a tagged state. It creates a complete safety tag for the current state before changing any table and returns its name:
+
+```python
+safety_tag = await client.store.restore_tag("release-1")
+```
+
+Restore is a maintenance operation: stop all other writers first. A tag present on only some tables is partial; `list_tags` reports it via `missing_tables`, and partial tags can be deleted but never restored.
+
+Read the database as it was at a tag, without changing it:
+
+```python
+async with HaikuRAG(db_path, tag="release-1") as client:
+    results = await client.search("query")
+```
+
+The client is read-only and covers one database. With several configured, name it with `sources=[name]`. A tag missing from any table raises `TagError`, and a tag that needs a migration raises `MigrationRequiredError`. A [configured tag](configuration/multiple-databases.md#reading-at-a-tag) is read the same way, `HaikuRAG(config=config, sources=["sp800-2026-06-30"])`, and `tag=` beside it raises `AmbiguousDatabaseError`.
+
+Delete tags you no longer need. Vacuum keeps every tagged version and the files it references:
+
+```python
+await client.store.delete_tag("release-1")
+```
+
+### Rebuilding the database
+
+```python
+from haiku.rag.client import RebuildMode
+
+# Full rebuild (default) - re-converts from source files, re-chunks, re-embeds
+async for doc_id in client.rebuild_database():
+    print(f"Processed document {doc_id}")
+
+# Re-chunk from stored content (no source file access)
+async for doc_id in client.rebuild_database(mode=RebuildMode.RECHUNK):
+    print(f"Processed document {doc_id}")
+
+# Only regenerate embeddings (fastest, keeps existing chunks)
+async for doc_id in client.rebuild_database(mode=RebuildMode.EMBED_ONLY):
+    print(f"Processed document {doc_id}")
+
+# Add VLM picture descriptions to an existing database. Runs the VLM
+# over already-stored picture bytes, patches descriptions into the
+# docling blob, then re-chunks + re-embeds. Requires
+# processing.pictures='description' in the config.
+async for doc_id in client.rebuild_database(mode=RebuildMode.DESCRIPTIONS):
+    print(f"Described pictures in {doc_id}")
+
+# Rebuild the full-text and scalar indexes, rewriting no rows. Yields no document ids.
+async for _ in client.rebuild_database(mode=RebuildMode.REINDEX):
+    pass
+```
+
+**Rebuild modes:**
+
+- `RebuildMode.FULL` - Re-convert from source files, re-chunk, re-embed (default). PDF attachments are re-converted from the bytes in their parent PDF. A document whose source is gone or fails to convert, and an attachment its parent did not rebuild, are rebuilt from stored content. Yields the id of each document rebuilt, which includes an attachment added to its PDF since ingestion. Re-converts documents stored by a version before inline groups were flattened
+- `RebuildMode.RECHUNK` - Re-chunk from the stored docling document, re-embed, recreate document items
+- `RebuildMode.EMBED_ONLY` - Keep existing chunks, only regenerate embeddings
+- `RebuildMode.TITLE_ONLY` - Generate titles for untitled documents (no re-chunking or re-embedding)
+- `RebuildMode.SET_EMBEDDER` - Adopt the configured embedder's provider and name without re-embedding, when the vector dimension is unchanged
+- `RebuildMode.REINDEX` - Rebuild the full-text and scalar indexes from scratch, rewriting no rows. Leaves the vector index alone
+- `RebuildMode.DESCRIPTIONS` - Run the VLM over picture bytes already stored on `document_items.picture_data`, patch descriptions into the docling blob, re-chunk + re-embed. Skips the docling parse entirely. Idempotent: pictures already carrying `meta.description.text` are not re-described, so the operation is safe to re-run.
+
+Every mode except `TITLE_ONLY` and `SET_EMBEDDER` ends by rebuilding the full-text and scalar indexes, whatever `storage.auto_vacuum` says. `FULL`, `RECHUNK`, `EMBED_ONLY` and `DESCRIPTIONS` also retrain the vector index if the database had one.
+
+### Generating titles
+
+Generate a title for an existing document on demand:
+
+```python
+title = await client.generate_title(doc)
+if title:
+    await client.update_document(document_id=doc.id, title=title)
+```
+
+Uses the same two-tier approach as automatic ingestion: structural extraction from DoclingDocument metadata first, with LLM fallback via `processing.title_model`. Unlike ingestion, this method does not catch exceptions. If the LLM call fails, the error propagates.
+
+To batch-generate titles for all untitled documents, use `RebuildMode.TITLE_ONLY`:
+
+```python
+async for doc_id in client.rebuild_database(mode=RebuildMode.TITLE_ONLY):
+    print(f"Generated title for {doc_id}")
+```
+
+See [Automatic Title Generation](configuration/processing.md#automatic-title-generation) for configuration details.
+
+### Atomic writes and rollback
+
+Document create, update, and delete operations take a snapshot of table versions before any write and automatically roll back to that snapshot if something fails (for example, during chunking or embedding). This restores the `documents`, `document_meta`, `chunks`, and `document_items` tables to their pre‑operation state using LanceDB’s table versioning. These writes are serialized under a single lock, so the rollback is safe under concurrent ingester workers.
+
+- Applies to: `create_document(...)`, `create_document_from_source(...)`, `update_document(...)`, `delete_document(...)` (including the `parent_uri` cascade), and internal rebuild/update flows.
+- Scope: Document rows, their mutable attributes, and all associated chunks and items are rolled back together.
+- Vacuum: Running `vacuum()` later prunes old versions for disk efficiency. Rollbacks occur immediately during the failing operation and are not impacted.

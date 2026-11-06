@@ -1,0 +1,1106 @@
+import asyncio
+from datetime import UTC, datetime
+
+import httpx
+import pytest
+from httpx import ASGITransport
+
+from haiku.rag.client.scope import DatabaseRef
+from haiku.rag.config import AppConfig
+from haiku.rag.ingester.api.server import APIState, build_app
+from haiku.rag.ingester.queue.models import JobOp, JobStatus
+from haiku.rag.ingester.queue.repository import JobRepo
+from haiku.rag.sources.base import (
+    FetchResult,
+    SourceEvent,
+    SourceEventKind,
+)
+from tests.ingester.conftest import finished_job, status_of
+
+
+@pytest.fixture
+def state(jobs, sync):
+    return APIState(
+        config=AppConfig(),
+        job_repo=jobs,
+        sync_repo=sync,
+        source_databases={"src": "haiku.rag"},
+    )
+
+
+def _client(
+    state, *, auth_token: str | None = None, root_path: str = ""
+) -> httpx.AsyncClient:
+    app = build_app(state, auth_token=auth_token, root_path=root_path)
+    return httpx.AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://testserver"
+    )
+
+
+# --- /health ---
+
+
+async def test_health_ok_with_counts(state, jobs):
+    # Enqueue j2 first so claim_next reaches it before u1; then transition
+    # via claim → mark_dead matches the production path.
+    j2 = await jobs.enqueue("src", "u2", JobOp.UPSERT)
+    assert j2 is not None
+    claimed = await jobs.claim_next("w")
+    assert claimed is not None and claimed.id == j2.id
+    await jobs.mark_dead(j2.id, "boom", "w")
+    await jobs.enqueue("src", "u1", JobOp.UPSERT)
+
+    async with _client(state) as client:
+        resp = await client.get("/health")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["queue_counts"] == {"queued": 1, "dead": 1}
+    assert body["worker_count"] == 0  # pool not attached in the test state
+    assert body["poller_count"] == 0
+    assert body["workers_alive"] == 0
+    assert body["pollers_alive"] == 0
+    assert body["failed_databases"] == []
+
+
+async def test_health_degraded_while_a_configured_database_is_not_running(jobs, sync):
+    failed = {"wiki": "database 'wiki': Database requires migration"}
+    state = APIState(
+        config=AppConfig(), job_repo=jobs, sync_repo=sync, failed_databases=failed
+    )
+
+    async with _client(state) as client:
+        body = (await client.get("/health")).json()
+
+    assert body["status"] == "degraded"
+    assert body["failed_databases"] == [
+        {"database": "wiki", "error": "database 'wiki': Database requires migration"}
+    ]
+
+
+async def test_health_degraded_when_worker_died(jobs, sync):
+    """If a worker task crashed (live_workers < worker_count), /health must
+    flip to status='degraded' so uptime monitors notice."""
+    from unittest.mock import MagicMock
+
+    from haiku.rag.config import AppConfig
+
+    config = AppConfig()
+    config.ingester.workers.worker_count = 4
+
+    pool = MagicMock()
+    pool.live_workers = 3  # one dead
+
+    state = APIState(config=config, job_repo=jobs, sync_repo=sync, pool=pool)
+    async with _client(state) as client:
+        resp = await client.get("/health")
+    body = resp.json()
+    assert body["status"] == "degraded"
+    assert body["worker_count"] == 4
+    assert body["workers_alive"] == 3
+
+
+async def test_health_degraded_when_worker_breaker_open(jobs, sync):
+    """The pool-wide breaker opens after a streak of transient job failures.
+    /health must surface that and flip status='degraded' even when worker
+    and poller task counts are healthy."""
+    from unittest.mock import MagicMock
+
+    from haiku.rag.config import AppConfig
+
+    config = AppConfig()
+    config.ingester.workers.worker_count = 4
+
+    pool = MagicMock()
+    pool.live_workers = 4
+    pool.breaker_open = True
+    pool.breaker_consecutive_failures = 7
+
+    state = APIState(config=config, job_repo=jobs, sync_repo=sync, pool=pool)
+    async with _client(state) as client:
+        resp = await client.get("/health")
+    body = resp.json()
+    assert body["status"] == "degraded"
+    assert body["worker_breaker_open"] is True
+    assert body["worker_breaker_consecutive_failures"] == 7
+
+
+async def test_health_skips_auth(state):
+    async with _client(state, auth_token="secret") as client:
+        resp = await client.get("/health")
+    assert resp.status_code == 200
+
+
+async def test_api_hides_another_namespace(state, engine):
+    """Another ingester's jobs are neither listed nor reachable by id."""
+    foreign = JobRepo(engine, namespace="other")
+    queued = await foreign.enqueue("src", "u1", JobOp.UPSERT)
+    dead = await foreign.enqueue("src", "u2", JobOp.UPSERT)
+    assert queued is not None and dead is not None
+    claimed = await foreign.claim_next("w")
+    assert claimed is not None and claimed.id == queued.id
+    assert await foreign.release_if_claimed(queued.id, "w")
+    claimed = await foreign.claim_next("w")
+    assert claimed is not None and claimed.id == dead.id
+    assert await foreign.mark_dead(dead.id, "boom", "w")
+
+    async with _client(state) as client:
+        assert (await client.get("/jobs")).json() == []
+        assert (await client.get("/dlq")).json() == []
+        assert (await client.get(f"/jobs/{queued.id}")).status_code == 404
+        assert (await client.delete(f"/jobs/{queued.id}")).status_code == 404
+        assert (await client.post(f"/jobs/{dead.id}/retry")).status_code == 404
+        assert (await client.post(f"/dlq/{dead.id}/retry")).status_code == 404
+
+    still_queued = await foreign.get_job(queued.id)
+    still_dead = await foreign.get_job(dead.id)
+    assert still_queued is not None and still_queued.status is JobStatus.QUEUED
+    assert still_dead is not None and still_dead.status is JobStatus.DEAD
+
+
+# --- auth ---
+
+
+@pytest.mark.parametrize(
+    "method, path",
+    [
+        ("GET", "/jobs"),
+        ("GET", "/stats"),
+        ("GET", "/providers"),
+        ("GET", "/config"),
+        ("GET", "/databases/docs"),
+        ("DELETE", "/jobs/j"),
+        ("POST", "/jobs/j/retry"),
+        ("POST", "/dlq/j/retry"),
+        ("POST", "/sources/anything/refresh"),
+    ],
+)
+async def test_protected_endpoint_rejects_without_token(state, method, path):
+    async with _client(state, auth_token="secret") as client:
+        resp = await client.request(method, path)
+    assert resp.status_code == 401
+
+
+async def test_protected_endpoint_rejects_wrong_token(state):
+    async with _client(state, auth_token="secret") as client:
+        resp = await client.get("/jobs", headers={"Authorization": "Bearer nope"})
+    assert resp.status_code == 401
+
+
+async def test_protected_endpoint_accepts_correct_token(state):
+    async with _client(state, auth_token="secret") as client:
+        resp = await client.get("/jobs", headers={"Authorization": "Bearer secret"})
+    assert resp.status_code == 200
+
+
+async def test_no_auth_token_allows_everything(state):
+    async with _client(state, auth_token=None) as client:
+        assert (await client.get("/jobs")).status_code == 200
+        assert (await client.get("/health")).status_code == 200
+
+
+# --- /jobs ---
+
+
+async def test_list_jobs_returns_recent_first(state, jobs):
+    j1 = await jobs.enqueue("a", "u1", JobOp.UPSERT)
+    j2 = await jobs.enqueue("b", "u2", JobOp.UPSERT)
+    assert j1 is not None and j2 is not None
+
+    async with _client(state) as client:
+        resp = await client.get("/jobs")
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert [j["id"] for j in payload] == [j2.id, j1.id]
+
+
+async def test_list_jobs_rejects_out_of_range_limit_and_offset(state):
+    """Limit is capped at 500 and >=1; offset is >=0. Without bounds a
+    malicious or careless ?limit=10000000 would block the event loop on
+    serialization."""
+    async with _client(state) as client:
+        for q in ("/jobs?limit=0", "/jobs?limit=501", "/jobs?offset=-1"):
+            resp = await client.get(q)
+            assert resp.status_code == 422, q
+        for q in ("/dlq?limit=0", "/dlq?limit=501", "/dlq?offset=-1"):
+            resp = await client.get(q)
+            assert resp.status_code == 422, q
+
+
+async def test_list_jobs_filters_by_source_and_status(state, jobs):
+    # Enqueue b first so claim_next reaches it before the a row.
+    j = await jobs.enqueue("b", "u", JobOp.UPSERT)
+    assert j is not None
+    claimed = await jobs.claim_next("w")
+    assert claimed is not None and claimed.id == j.id
+    await jobs.mark_dead(j.id, "err", "w")
+    await jobs.enqueue("a", "u", JobOp.UPSERT)
+
+    async with _client(state) as client:
+        resp = await client.get("/jobs?source_id=b&status=dead")
+    payload = resp.json()
+    assert len(payload) == 1
+    assert payload[0]["id"] == j.id
+
+
+async def test_get_job_returns_record(state, jobs):
+    job = await jobs.enqueue("src", "u", JobOp.UPSERT)
+    assert job is not None
+    async with _client(state) as client:
+        resp = await client.get(f"/jobs/{job.id}")
+    assert resp.status_code == 200
+    assert resp.json()["id"] == job.id
+
+
+async def test_get_job_404(state):
+    async with _client(state) as client:
+        resp = await client.get("/jobs/nope")
+    assert resp.status_code == 404
+
+
+@pytest.mark.parametrize("route", ["/jobs/{id}/retry", "/dlq/{id}/retry"])
+async def test_retry_revives_dead_job(state, jobs, route):
+    job = await finished_job(jobs, JobStatus.DEAD, source_id="src")
+
+    async with _client(state, auth_token="secret") as client:
+        resp = await client.post(
+            route.format(id=job.id), headers={"Authorization": "Bearer secret"}
+        )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == JobStatus.QUEUED.value
+    assert body["attempts"] == 0
+
+
+async def test_a_rejected_job_is_listed_and_retried(state, jobs):
+    job = await finished_job(
+        jobs, JobStatus.REJECTED, source_id="src", error="u rejected: draft"
+    )
+
+    async with _client(state) as client:
+        listed = await client.get("/jobs?status=rejected")
+        dlq = await client.get("/dlq")
+        retried = await client.post(f"/jobs/{job.id}/retry")
+
+    assert [j["id"] for j in listed.json()] == [job.id]
+    assert dlq.json() == []
+    assert retried.json()["status"] == JobStatus.QUEUED.value
+
+
+@pytest.mark.parametrize("route", ["/jobs/missing/retry", "/dlq/missing/retry"])
+async def test_retry_404(state, route):
+    async with _client(state) as client:
+        resp = await client.post(route)
+    assert resp.status_code == 404
+
+
+async def test_cancel_queued_job(state, jobs):
+    job = await jobs.enqueue("src", "u", JobOp.UPSERT)
+    assert job is not None
+
+    async with _client(state) as client:
+        resp = await client.delete(f"/jobs/{job.id}")
+    assert resp.status_code == 200
+    assert resp.json() == {"job_id": job.id, "cancelled": True}
+    assert await jobs.get_job(job.id) is None
+
+
+async def test_cancel_succeeded_returns_404(state, jobs):
+    job = await finished_job(jobs, JobStatus.SUCCEEDED, source_id="src")
+
+    async with _client(state) as client:
+        resp = await client.delete(f"/jobs/{job.id}")
+    assert resp.status_code == 404
+
+
+# --- /dlq ---
+
+
+async def test_dlq_lists_dead_jobs_only(state, jobs):
+    # Enqueue j2 first so claim_next picks it before j1.
+    j2 = await jobs.enqueue("src", "u2", JobOp.UPSERT)
+    assert j2 is not None
+    claimed = await jobs.claim_next("w")
+    assert claimed is not None and claimed.id == j2.id
+    await jobs.mark_dead(j2.id, "err", "w")
+    j1 = await jobs.enqueue("src", "u1", JobOp.UPSERT)
+    assert j1 is not None
+
+    async with _client(state) as client:
+        resp = await client.get("/dlq")
+    payload = resp.json()
+    assert len(payload) == 1
+    assert payload[0]["id"] == j2.id
+
+
+async def test_dlq_retry_with_live_sibling_returns_200(state, jobs):
+    """Retrying a dead job when a live job already exists for the same
+    (source_id, uri) returns 200 with the live job, not a 500."""
+    first = await finished_job(jobs, JobStatus.DEAD, source_id="src")
+    live = await jobs.enqueue("src", "u", JobOp.UPSERT)
+    assert live is not None
+
+    async with _client(state) as client:
+        resp = await client.post(f"/dlq/{first.id}/retry")
+    assert resp.status_code == 200
+    assert resp.json()["id"] == live.id
+
+
+# --- /sources ---
+
+
+class _StubSource:
+    def __init__(self, source_id, sweeps=()):
+        self.source_id = source_id
+        self._sweeps = list(sweeps)
+
+    def supports(self, _uri):  # pragma: no cover
+        return True
+
+    async def head(self, _uri):  # pragma: no cover
+        return None
+
+    async def fetch(self, _uri) -> FetchResult:  # pragma: no cover
+        raise NotImplementedError
+
+    async def discover(self, since=None, *, known_uris=None):
+        del since, known_uris  # interface-required, unused by this stub
+        events = self._sweeps.pop(0) if self._sweeps else []
+        for event in events:
+            yield event
+
+
+def _build_pollers_state(tmp_path, jobs, sync, source_id: str = "local"):
+    """Build an APIState with a real PollerManager containing one FS poller."""
+    from haiku.rag.config import FSSourceConfig
+    from haiku.rag.ingester.pollers.manager import PollerManager
+
+    cfg = FSSourceConfig(type="fs", id=source_id, root=tmp_path)
+    manager = PollerManager(configs=[cfg], job_repo=jobs, sync_repo=sync)
+    state = APIState(
+        config=AppConfig(),
+        job_repo=jobs,
+        sync_repo=sync,
+        pollers=manager,
+        source_databases={source_id: "docs"},
+    )
+    return state, manager
+
+
+async def test_sources_empty_when_no_pollers(state):
+    async with _client(state) as client:
+        resp = await client.get("/sources")
+    assert resp.status_code == 200
+    assert resp.json() == []
+
+
+async def test_sources_lists_configured(tmp_path, jobs, sync):
+    state, _ = _build_pollers_state(tmp_path, jobs, sync)
+    async with _client(state) as client:
+        resp = await client.get("/sources")
+    payload = resp.json()
+    assert len(payload) == 1
+    assert payload[0]["source_id"] == "local"
+    assert payload[0]["database"] == "docs"
+    assert payload[0]["type"] == "fs"
+    assert payload[0]["last_error"] is None
+    assert payload[0]["last_error_at"] is None
+    assert payload[0]["circuit_breaker_open"] is False
+    assert payload[0]["unsupported_files"] == {}
+
+
+async def test_sources_report_files_skipped_for_their_extension(tmp_path, jobs, sync):
+    root = tmp_path / "docs"
+    root.mkdir()
+    (root / "a.md").write_text("alpha")
+    (root / "b.xyz").write_text("beta")
+    state, manager = _build_pollers_state(root, jobs, sync)
+    async with _client(state) as client:
+        await client.post(f"/sources/{manager.pollers[0].source_id}/refresh")
+        resp = await client.get("/sources")
+    assert resp.json()[0]["unsupported_files"] == {".xyz": 1}
+
+
+async def test_source_refresh_triggers_sweep(tmp_path, jobs, sync):
+    state, manager = _build_pollers_state(tmp_path, jobs, sync)
+    # Replace the real source with a stub that records the sweep + emits an event.
+    poller = manager.pollers[0]
+    poller.source = _StubSource(
+        poller.source_id,
+        [
+            [
+                SourceEvent(
+                    source_id=poller.source_id,
+                    uri="file:///x.md",
+                    kind=SourceEventKind.UPSERT,
+                    revision="v1",
+                    discovered_at=datetime.now(UTC),
+                )
+            ]
+        ],
+    )
+
+    async with _client(state) as client:
+        resp = await client.post(f"/sources/{poller.source_id}/refresh")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["refreshed"] is True
+    assert body["source_id"] == poller.source_id
+
+    queued = await jobs.list_jobs(source_id=poller.source_id)
+    assert len(queued) == 1
+
+
+async def test_source_refresh_sweeps_a_source_with_pending_work(tmp_path, jobs, sync):
+    state, manager = _build_pollers_state(tmp_path, jobs, sync)
+    poller = manager.pollers[0]
+    await jobs.enqueue(poller.source_id, "file:///busy.md", JobOp.UPSERT)
+    poller.source = _StubSource(
+        poller.source_id,
+        [
+            [
+                SourceEvent(
+                    source_id=poller.source_id,
+                    uri="file:///new.md",
+                    kind=SourceEventKind.UPSERT,
+                    revision="v1",
+                    discovered_at=datetime.now(UTC),
+                )
+            ]
+        ],
+    )
+
+    async with _client(state) as client:
+        resp = await client.post(f"/sources/{poller.source_id}/refresh")
+    assert resp.json()["refreshed"] is True
+    queued = await jobs.list_jobs(source_id=poller.source_id)
+    assert {job.uri for job in queued} == {"file:///busy.md", "file:///new.md"}
+
+
+async def test_source_refresh_unknown_id_404(tmp_path, jobs, sync):
+    state, _ = _build_pollers_state(tmp_path, jobs, sync)
+    async with _client(state) as client:
+        resp = await client.post("/sources/missing/refresh")
+    assert resp.status_code == 404
+
+
+async def test_source_refresh_503_when_pollers_absent(state):
+    async with _client(state) as client:
+        resp = await client.post("/sources/anything/refresh")
+    assert resp.status_code == 503
+
+
+# --- POST /sources/{id}/retry ---
+
+
+async def test_source_retry_requeues_the_selected_failures_of_that_source(
+    tmp_path, jobs, sync
+):
+    state, _ = _build_pollers_state(tmp_path, jobs, sync)
+    dead = await finished_job(jobs, JobStatus.DEAD, "file:///a.md", source_id="local")
+    rejected = await finished_job(
+        jobs, JobStatus.REJECTED, "file:///b.md", source_id="local", error="refused"
+    )
+    other = await finished_job(jobs, JobStatus.DEAD, "file:///c.md", source_id="other")
+
+    async with _client(state) as client:
+        resp = await client.post("/sources/local/retry", params={"status": "dead"})
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "source_id": "local",
+            "retried": 1,
+            "worker_breaker_open": False,
+        }
+        assert await status_of(jobs, dead.id) is JobStatus.QUEUED
+        assert await status_of(jobs, rejected.id) is JobStatus.REJECTED
+
+        resp = await client.post("/sources/local/retry", params={"status": "all"})
+        assert resp.json()["retried"] == 1
+        assert await status_of(jobs, rejected.id) is JobStatus.QUEUED
+
+    assert await status_of(jobs, other.id) is JobStatus.DEAD
+
+
+@pytest.mark.parametrize("params", [{}, {"status": "queued"}])
+async def test_source_retry_requires_a_failed_status(tmp_path, jobs, sync, params):
+    state, _ = _build_pollers_state(tmp_path, jobs, sync)
+    async with _client(state) as client:
+        resp = await client.post("/sources/local/retry", params=params)
+    assert resp.status_code == 422
+
+
+async def test_source_actions_take_an_id_containing_slashes(tmp_path, jobs, sync):
+    from urllib.parse import quote
+
+    state, _ = _build_pollers_state(tmp_path, jobs, sync, source_id="fs:/tmp/docs")
+    dead = await finished_job(
+        jobs, JobStatus.DEAD, "file:///tmp/docs/a.md", source_id="fs:/tmp/docs"
+    )
+    path = f"/sources/{quote('fs:/tmp/docs', safe='')}"
+
+    async with _client(state) as client:
+        retried = await client.post(f"{path}/retry", params={"status": "dead"})
+        refreshed = await client.post(f"{path}/refresh")
+
+    assert retried.json()["retried"] == 1
+    assert await status_of(jobs, dead.id) is JobStatus.QUEUED
+    assert refreshed.status_code == 200
+
+
+async def test_source_retry_unknown_id_404(tmp_path, jobs, sync):
+    state, _ = _build_pollers_state(tmp_path, jobs, sync)
+    async with _client(state) as client:
+        resp = await client.post("/sources/missing/retry", params={"status": "dead"})
+    assert resp.status_code == 404
+
+
+async def test_source_retry_503_when_pollers_absent(state):
+    async with _client(state) as client:
+        resp = await client.post("/sources/src/retry", params={"status": "dead"})
+    assert resp.status_code == 503
+
+
+async def test_source_retry_of_an_unserved_source_answers_409(tmp_path, jobs, sync):
+    state, _ = _build_pollers_state(tmp_path, jobs, sync)
+    state.source_databases = {}
+    dead = await finished_job(jobs, JobStatus.DEAD, "file:///a.md", source_id="local")
+
+    async with _client(state) as client:
+        resp = await client.post("/sources/local/retry", params={"status": "dead"})
+
+    assert resp.status_code == 409
+    assert await status_of(jobs, dead.id) is JobStatus.DEAD
+
+
+async def test_source_retry_of_a_stopped_poller_answers_409(tmp_path, jobs, sync):
+    state, manager = _build_pollers_state(tmp_path, jobs, sync)
+    await manager.pollers[0].stop()
+    dead = await finished_job(jobs, JobStatus.DEAD, "file:///a.md", source_id="local")
+
+    async with _client(state) as client:
+        resp = await client.post("/sources/local/retry", params={"status": "dead"})
+
+    assert resp.status_code == 409
+    assert await status_of(jobs, dead.id) is JobStatus.DEAD
+
+
+async def test_source_retry_requeues_while_the_worker_breaker_is_open(
+    tmp_path, jobs, sync
+):
+    from haiku.rag.ingester.workers.pool import _WORKER_BREAKER_THRESHOLD, WorkerPool
+
+    state, _ = _build_pollers_state(tmp_path, jobs, sync)
+    pool = WorkerPool(clients={}, job_repo=jobs, sync_repo=sync)
+    for _ in range(_WORKER_BREAKER_THRESHOLD):
+        pool._breaker_for("local").record_failure()
+    state.pool = pool
+    dead = await finished_job(jobs, JobStatus.DEAD, "file:///a.md", source_id="local")
+
+    async with _client(state) as client:
+        resp = await client.post("/sources/local/retry", params={"status": "dead"})
+
+    assert resp.json()["worker_breaker_open"] is True
+    assert resp.json()["retried"] == 1
+    assert await status_of(jobs, dead.id) is JobStatus.QUEUED
+
+
+async def test_source_retry_waits_for_a_sweep_in_progress(tmp_path, jobs, sync):
+    state, manager = _build_pollers_state(tmp_path, jobs, sync)
+    dead = await finished_job(jobs, JobStatus.DEAD, "file:///a.md", source_id="local")
+
+    async with _client(state) as client:
+        async with manager.pollers[0]._sweep_lock:
+            request = asyncio.create_task(
+                client.post("/sources/local/retry", params={"status": "dead"})
+            )
+            await asyncio.sleep(0.05)
+            assert not request.done()
+            assert await status_of(jobs, dead.id) is JobStatus.DEAD
+        resp = await asyncio.wait_for(request, timeout=5.0)
+
+    assert resp.json()["retried"] == 1
+
+
+# --- /stats ---
+
+
+async def test_stats_returns_shape_on_empty_queue(state):
+    async with _client(state) as client:
+        resp = await client.get("/stats")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["throughput"] == {
+        "succeeded_5m": 0,
+        "succeeded_30m": 0,
+        "succeeded_1h": 0,
+    }
+    assert body["workers"] == {"busy": 0, "total": 0}
+    assert body["oldest_queued_age_s"] is None
+    assert body["dlq_by_source"] == {}
+    assert body["rejected_by_source"] == {}
+    assert body["queue_depth_by_source"] == {}
+
+
+async def test_stats_aggregates_real_queue(state, jobs):
+    j1 = await jobs.enqueue("s1", "u1", JobOp.UPSERT)
+    j2 = await jobs.enqueue("s1", "u2", JobOp.UPSERT)
+    j3 = await jobs.enqueue("s2", "u3", JobOp.UPSERT)
+    assert j1 and j2 and j3
+
+    claimed = await jobs.claim_next("w")
+    assert claimed is not None
+    await jobs.mark_succeeded(claimed.id, "w")
+    dead = await jobs.claim_next("w")
+    assert dead is not None
+    await jobs.mark_dead(dead.id, "boom", "w")
+    assert await jobs.enqueue("s2", "u4", JobOp.UPSERT)
+    rejected = await jobs.claim_next("w")
+    assert rejected is not None and rejected.source_id == "s2"
+    await jobs.mark_rejected(rejected.id, "refused", "w")
+
+    async with _client(state) as client:
+        resp = await client.get("/stats")
+    body = resp.json()
+    # One succeeded in the last 5m, 30m, 1h (we just marked it).
+    assert body["throughput"]["succeeded_5m"] == 1
+    assert body["throughput"]["succeeded_30m"] == 1
+    assert body["throughput"]["succeeded_1h"] == 1
+    # Last enqueued (s2/u3) remains queued.
+    assert body["queue_depth_by_source"] == {"s2": 1}
+    # The dead job was claim_next-ed from s1.
+    assert body["dlq_by_source"] == {"s1": 1}
+    assert body["rejected_by_source"] == {"s2": 1}
+
+
+# --- providers ---
+
+
+async def test_providers_probes_each_docling_serve_url(state, monkeypatch):
+    """Reachable URLs come back with status_code from the probe; unreachable
+    URLs come back with reachable=False and the httpx error message."""
+    from haiku.rag.ingester.api.routes import providers as providers_mod
+    from haiku.rag.ingester.api.schemas import ProviderEndpoint
+
+    async def _fake_probe(_client, base_url):
+        if "down" in base_url:
+            return ProviderEndpoint(
+                base_url=base_url,
+                reachable=False,
+                error="Name or service not known",
+            )
+        return ProviderEndpoint(base_url=base_url, reachable=True, status_code=200)
+
+    monkeypatch.setattr(providers_mod, "_probe", _fake_probe)
+    state.config.processing.converter = "docling-serve"
+    state.config.processing.chunker = "docling-serve"
+    state.config.providers.docling_serve.base_url = [
+        "http://docling-serve-up:5001",
+        "http://docling-serve-down:5001",
+    ]
+    async with _client(state) as client:
+        resp = await client.get("/providers")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert [d["base_url"] for d in body["docling_serve"]] == [
+        "http://docling-serve-up:5001",
+        "http://docling-serve-down:5001",
+    ]
+    assert body["docling_serve"][0]["reachable"] is True
+    assert body["docling_serve"][0]["status_code"] == 200
+    assert body["docling_serve"][1]["reachable"] is False
+    assert "Name or service not known" in body["docling_serve"][1]["error"]
+
+
+async def test_providers_skips_docling_serve_when_not_in_use(state, monkeypatch):
+    """With docling-local for both converter and chunker, /providers
+    returns an empty docling_serve list — and crucially does not probe."""
+    from haiku.rag.ingester.api.routes import providers as providers_mod
+
+    probed: list[str] = []
+
+    async def _spy_probe(_client, base_url):  # pragma: no cover - asserted not called
+        probed.append(base_url)
+        raise AssertionError("probe should not run when docling-serve is not in use")
+
+    monkeypatch.setattr(providers_mod, "_probe", _spy_probe)
+    state.config.processing.converter = "docling-local"
+    state.config.processing.chunker = "docling-local"
+    async with _client(state) as client:
+        resp = await client.get("/providers")
+    assert resp.status_code == 200
+    assert resp.json() == {"docling_serve": []}
+    assert probed == []
+
+
+async def test_providers_probes_when_only_chunker_uses_docling_serve(
+    state, monkeypatch
+):
+    """A mixed config (local converter + docling-serve chunker, or vice versa)
+    still counts as 'in use' and triggers the probe."""
+    from haiku.rag.ingester.api.routes import providers as providers_mod
+    from haiku.rag.ingester.api.schemas import ProviderEndpoint
+
+    async def _fake_probe(_client, base_url):
+        return ProviderEndpoint(base_url=base_url, reachable=True, status_code=200)
+
+    monkeypatch.setattr(providers_mod, "_probe", _fake_probe)
+    state.config.processing.converter = "docling-local"
+    state.config.processing.chunker = "docling-serve"
+    async with _client(state) as client:
+        resp = await client.get("/providers")
+    assert resp.status_code == 200
+    assert len(resp.json()["docling_serve"]) == 1
+
+
+async def test_providers_probe_with_real_httpx_transport():
+    """End-to-end through the actual _probe — MockTransport drives the
+    branches: 200, non-2xx, and a transport error all map to the right
+    ProviderEndpoint shape."""
+    import httpx
+
+    from haiku.rag.ingester.api.routes.providers import _probe
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        path = str(request.url)
+        if "ok" in path:
+            return httpx.Response(200, json={"status": "ok"})
+        if "bad" in path:
+            return httpx.Response(503)
+        raise httpx.ConnectError("boom")
+
+    transport = httpx.MockTransport(_handler)
+    async with httpx.AsyncClient(transport=transport) as client:
+        good = await _probe(client, "http://ok:5001")
+        assert good.reachable is True
+        assert good.status_code == 200
+        assert good.error is None
+
+        unhealthy = await _probe(client, "http://bad:5001")
+        assert unhealthy.reachable is False
+        assert unhealthy.status_code == 503
+
+        dead = await _probe(client, "http://dead:5001")
+        assert dead.reachable is False
+        assert dead.status_code is None
+        assert dead.error is not None and "boom" in dead.error
+
+
+# --- dashboard ---
+
+
+async def test_dashboard_served_unauthenticated(state):
+    """The dashboard is markup-only. The JS it serves attaches the bearer
+    token to its own JSON fetches, so the page itself must load without one
+    even when auth is enabled."""
+    async with _client(state, auth_token="secret") as client:
+        resp = await client.get("/")
+    assert resp.status_code == 200
+    assert "text/html" in resp.headers["content-type"]
+    body = resp.text
+    assert "haiku-ingester · status" in body
+    # The JS calls the JSON endpoints with base-href-relative paths (no leading
+    # slash) so the page works behind a sub-path; sanity-check it's wired up.
+    assert 'fetchJson("stats")' in body
+    assert 'fetchJson("sources")' in body
+    assert 'fetchJson("jobs?status=claimed&limit=20")' in body
+    # Op badge helper is present so DELETE rows render distinctly.
+    assert "opBadge" in body
+
+
+def test_api_access_log_gated_on_debug():
+    """uvicorn per-request access logging is off at the ingester's normal INFO
+    level (the dashboard polls every few seconds) and on at DEBUG."""
+    import logging
+
+    from haiku.rag.ingester.app import _api_access_log_enabled
+
+    haiku_logger = logging.getLogger("haiku.rag")
+    original = haiku_logger.level
+    try:
+        haiku_logger.setLevel(logging.INFO)
+        assert _api_access_log_enabled() is False
+        haiku_logger.setLevel(logging.DEBUG)
+        assert _api_access_log_enabled() is True
+    finally:
+        haiku_logger.setLevel(original)
+
+
+async def test_dashboard_wires_database_and_config_panels(state):
+    """The on-demand Database and Configuration panels are present and call
+    their endpoints lazily (not in the POLL_MS loop)."""
+    async with _client(state) as client:
+        resp = await client.get("/")
+    body = resp.text
+    assert 'id="db-panel"' in body
+    assert 'id="config-panel"' in body
+    assert "fetchJson(`databases/${encodeURIComponent(name)}`)" in body
+    assert 'id="db-select"' in body
+    assert 'fetchJson("config")' in body
+    assert "loadDatabase" in body
+    assert "loadConfig" in body
+
+
+async def test_dashboard_wires_source_refresh_and_retry(state):
+    async with _client(state) as client:
+        body = (await client.get("/")).text
+    assert 'onclick="refreshSource(this.dataset.source)"' in body
+    assert 'onclick="retrySource(this.dataset.source)"' in body
+    assert "`sources/${encodeURIComponent(sid)}/retry?status=dead`" in body
+    assert "result.worker_breaker_open" in body
+
+
+async def test_dashboard_base_href_defaults_to_root(state):
+    """With no root_path the dashboard's <base href> is the origin root, so its
+    relative fetches resolve at the top level exactly as before."""
+    async with _client(state) as client:
+        resp = await client.get("/")
+
+    assert resp.status_code == 200
+    assert '<base href="/" />' in resp.text
+
+
+async def test_dashboard_base_href_reflects_root_path(state):
+    """When served under a root_path (reverse-proxied sub-path), the injected
+    <base href> carries the prefix so the relative fetches hit /ingester/..."""
+    async with _client(state, root_path="/ingester") as client:
+        resp = await client.get("/")
+
+    assert resp.status_code == 200
+    assert '<base href="/ingester/" />' in resp.text
+
+
+async def test_api_routes_unchanged_under_root_path(state):
+    """root_path only affects URL generation/base-href; the routes themselves
+    still answer at their declared paths (the proxy strips the prefix)."""
+    async with _client(state, root_path="/ingester") as client:
+        resp = await client.get("/health")
+
+    assert resp.status_code == 200
+
+
+# --- config ---
+
+
+async def test_config_returns_full_yaml_with_redacted_secrets(jobs, sync):
+    from haiku.rag.config import APIConfig, IngesterConfig
+
+    config = AppConfig(ingester=IngesterConfig(api=APIConfig(auth_token="supersecret")))
+    state = APIState(config=config, job_repo=jobs, sync_repo=sync)
+    async with _client(state) as client:
+        resp = await client.get("/config")
+    assert resp.status_code == 200
+    text = resp.json()["yaml"]
+    # Full effective config: a default section the user never wrote is present.
+    assert "embeddings:" in text
+    assert "processing:" in text
+    # Secret is masked, not echoed.
+    assert "supersecret" not in text
+    assert "auth_token: '***'" in text
+
+
+async def test_config_masks_credentials_in_urls_and_headers(jobs, sync):
+    from tests.conftest import DOCUMENTED_SECRETS, documented_secret_shapes
+
+    state = APIState(config=documented_secret_shapes(), job_repo=jobs, sync_repo=sync)
+    async with _client(state) as client:
+        resp = await client.get("/config")
+
+    text = resp.json()["yaml"]
+    assert "db/queue" in text
+    for secret in DOCUMENTED_SECRETS:
+        assert secret not in text
+
+
+# --- database ---
+
+
+async def _seed_lancedb(path):
+    """Create a minimal LanceDB with settings/documents/chunks tables so
+    gather_database_info has something real to report."""
+    import json
+
+    import lancedb
+    from lancedb.pydantic import LanceModel, Vector
+    from pydantic import Field
+
+    class SettingsRecord(LanceModel):
+        id: str = Field(default="settings")
+        settings: str = Field(default="{}")
+
+    class DocumentRecord(LanceModel):
+        id: str
+        content: str
+
+    class ChunkRecord(LanceModel):
+        id: str
+        document_id: str
+        content: str
+        vector: Vector(3)  # type: ignore
+
+    db = await lancedb.connect_async(str(path))
+    settings_tbl = await db.create_table("settings", schema=SettingsRecord)
+    docs_tbl = await db.create_table("documents", schema=DocumentRecord)
+    chunks_tbl = await db.create_table("chunks", schema=ChunkRecord)
+    await settings_tbl.add(
+        [
+            SettingsRecord(
+                settings=json.dumps(
+                    {
+                        "version": "1.2.3",
+                        "embeddings": {
+                            "model": {
+                                "provider": "openai",
+                                "name": "text-embedding-3-small",
+                                "vector_dim": 3,
+                            }
+                        },
+                    }
+                )
+            )
+        ]
+    )
+    await docs_tbl.add([DocumentRecord(id="doc-1", content="hello")])
+    await chunks_tbl.add(
+        [ChunkRecord(id="c1", document_id="doc-1", content="c", vector=[0.1, 0.2, 0.3])]
+    )
+
+
+def _ingesting(name: str, location) -> dict[str, DatabaseRef]:
+    return {name: DatabaseRef.configured(name, str(location))}
+
+
+async def test_database_reports_info(tmp_path, jobs, sync):
+    db_path = tmp_path / "docs.lancedb"
+    await _seed_lancedb(db_path)
+    state = APIState(
+        config=AppConfig(),
+        job_repo=jobs,
+        sync_repo=sync,
+        databases=_ingesting("docs", db_path),
+    )
+    async with _client(state) as client:
+        resp = await client.get("/databases/docs")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["exists"] is True
+    assert body["stored_version"] == "1.2.3"
+    assert body["embeddings"]["provider"] == "openai"
+    assert body["embeddings"]["vector_dim"] == 3
+    tables = {t["name"]: t for t in body["tables"]}
+    assert tables["documents"]["num_rows"] == 1
+    assert tables["chunks"]["num_rows"] == 1
+    assert tables["document_items"]["exists"] is False
+    assert body["vector_index"]["exists"] is False
+
+
+async def test_each_ingested_database_answers_under_its_name(tmp_path, jobs, sync):
+    await _seed_lancedb(tmp_path / "a.lancedb")
+    state = APIState(
+        config=AppConfig(),
+        job_repo=jobs,
+        sync_repo=sync,
+        databases={
+            **_ingesting("a", tmp_path / "a.lancedb"),
+            **_ingesting("b", tmp_path / "b.lancedb"),
+        },
+    )
+
+    async with _client(state) as client:
+        a = await client.get("/databases/a")
+        b = await client.get("/databases/b")
+
+    assert (a.json()["exists"], b.json()["exists"]) == (True, False)
+
+
+async def test_a_database_name_with_a_slash_answers(tmp_path, jobs, sync):
+    await _seed_lancedb(tmp_path / "docs.lancedb")
+    state = APIState(
+        config=AppConfig(),
+        job_repo=jobs,
+        sync_repo=sync,
+        databases=_ingesting("team/docs", tmp_path / "docs.lancedb"),
+    )
+
+    async with _client(state) as client:
+        resp = await client.get("/databases/team%2Fdocs")
+
+    assert resp.status_code == 200
+    assert resp.json()["exists"] is True
+
+
+async def test_a_database_the_ingester_does_not_write_is_not_found(
+    tmp_path, jobs, sync
+):
+    state = APIState(
+        config=AppConfig(),
+        job_repo=jobs,
+        sync_repo=sync,
+        databases=_ingesting("docs", tmp_path / "docs.lancedb"),
+    )
+    async with _client(state) as client:
+        resp = await client.get("/databases/other")
+    assert resp.status_code == 404
+
+
+@pytest.mark.parametrize("route", ["/jobs/{id}/retry", "/dlq/{id}/retry"])
+async def test_retry_refuses_a_job_of_an_unconfigured_source(state, jobs, route):
+    job = await finished_job(jobs, JobStatus.DEAD, source_id="removed")
+
+    async with _client(state) as client:
+        resp = await client.post(route.format(id=job.id))
+
+    assert resp.status_code == 409
+    assert "'removed'" in resp.json()["detail"]
+    refused = await jobs.get_job(job.id)
+    assert refused is not None and refused.status is JobStatus.DEAD
+
+
+@pytest.mark.parametrize("route", ["/jobs/{id}/retry", "/dlq/{id}/retry"])
+async def test_retry_answers_409_and_names_the_blocking_tombstone(state, jobs, route):
+    """A blocking tombstone causes retry to return 409 with the tombstone ID."""
+    claimed = await finished_job(
+        jobs, JobStatus.DEAD, source_id="src", error="out of attempts"
+    )
+    claimed_second = await finished_job(
+        jobs, JobStatus.DEAD, source_id="src", error="stalled", conversion_stalled=True
+    )
+
+    async with _client(state) as client:
+        resp = await client.post(route.format(id=claimed.id))
+
+    assert resp.status_code == 409
+    assert claimed_second.id in resp.json()["detail"]
+
+
+# --- tracing ---
+
+
+def _traced_paths(exporter) -> list[str]:
+    return [
+        str((span.attributes or {}).get("http.target", ""))
+        for span in exporter.exported_spans
+        if (span.attributes or {}).get("logfire.span_type") == "span"
+        and "http.target" in (span.attributes or {})
+    ]
+
+
+@pytest.mark.parametrize(
+    ("root_path", "prefix"),
+    [("", ""), ("/ingester", ""), ("/ingester", "/ingester")],
+)
+async def test_polled_routes_are_not_traced(state, exporter, root_path, prefix):
+    async with _client(state, root_path=root_path) as client:
+        for path in ("/health", "/sources", "/providers", "/stats"):
+            await client.get(prefix + path)
+        await client.get(prefix + "/jobs", params={"status": "claimed"})
+        await client.post(prefix + "/sources/src/refresh")
+        await client.get(prefix + "/databases/jobs")
+        await client.get(prefix + "/jobs/1")
+
+    assert sorted(_traced_paths(exporter)) == sorted(
+        [
+            prefix + "/sources/src/refresh",
+            prefix + "/databases/jobs",
+            prefix + "/jobs/1",
+        ]
+    )

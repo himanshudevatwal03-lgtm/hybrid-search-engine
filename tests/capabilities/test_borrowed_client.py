@@ -1,0 +1,70 @@
+import pytest
+
+from haiku.rag.capabilities.rag import create_capability
+from haiku.rag.client import HaikuRAG
+from tests.capabilities.helpers import Deps, make_context
+
+
+async def test_closing_never_closes_a_borrowed_client(temp_db_path):
+    """`_close` owns only what it opened. Closing the caller's client would be a
+    use-after-close for the caller."""
+    async with HaikuRAG(temp_db_path, create=True) as client:
+        capability = create_capability(
+            db_path=client.store.db_path, config=client._config, rag=client
+        )
+        await capability._ensure_rag()
+
+        await capability._close()
+
+        # Still usable by its owner.
+        assert await client.list_documents() == []
+
+
+async def test_a_borrowed_client_survives_for_run(temp_db_path):
+    """for_run clears the owned connection per run; a borrowed one is the
+    caller's and carries into the run copy."""
+    async with HaikuRAG(temp_db_path, create=True) as client:
+        capability = create_capability(
+            db_path=client.store.db_path, config=client._config, rag=client
+        )
+
+        run_capability = await capability.for_run(make_context(Deps()))
+
+        assert run_capability is not capability
+        assert run_capability.rag is None
+        assert run_capability.borrowed_rag is client
+        assert await run_capability._ensure_rag() is client
+
+
+async def test_ask_hands_its_client_to_the_capability(temp_db_path, monkeypatch):
+    """`ask` built the capability from a db_path alone, so the capability opened
+    its own connection to a database the client already had open."""
+    from haiku.rag.capabilities import rag as rag_capability
+    from haiku.rag.store.engine import Store
+
+    real = rag_capability.create_capability
+    built = {}
+
+    def spy(**kwargs):
+        built["capability"] = real(**kwargs)
+        raise RuntimeError("stop before running the agent")
+
+    async with HaikuRAG(temp_db_path, create=True) as client:
+        monkeypatch.setattr(rag_capability, "create_capability", spy)
+
+        with pytest.raises(RuntimeError, match="stop before running the agent"):
+            await client.ask("anything")
+
+        capability = built["capability"]
+        opens = 0
+        initialize = Store._initialize
+
+        async def counted(self):
+            nonlocal opens
+            opens += 1
+            return await initialize(self)
+
+        monkeypatch.setattr(Store, "_initialize", counted)
+
+        assert await capability._ensure_rag() is client
+        assert opens == 0
